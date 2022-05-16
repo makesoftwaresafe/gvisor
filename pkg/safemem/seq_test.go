@@ -49,6 +49,7 @@ type blockSeqTest struct {
 	offset     uint64
 	haveLimit  bool
 	limit      uint64
+	length     int
 
 	want string
 }
@@ -103,16 +104,19 @@ var blockSeqTests = []blockSeqTest{
 		desc:   "Sequence of length 1",
 		pieces: []string{"foobar"},
 		want:   "foobar",
+		length: 6,
 	},
 	{
 		desc:   "Sequence of length 2",
 		pieces: []string{"foo", "bar"},
 		want:   "foobar",
+		length: 6,
 	},
 	{
 		desc:   "Empty Blocks",
 		pieces: []string{"", "foo", "", "", "bar", ""},
 		want:   "foobar",
+		length: 6,
 	},
 	{
 		desc:       "Sequence with non-zero offset",
@@ -120,6 +124,7 @@ var blockSeqTests = []blockSeqTest{
 		haveOffset: true,
 		offset:     2,
 		want:       "obar",
+		length:     4,
 	},
 	{
 		desc:      "Sequence with non-maximal limit",
@@ -127,6 +132,7 @@ var blockSeqTests = []blockSeqTest{
 		haveLimit: true,
 		limit:     5,
 		want:      "fooba",
+		length:    5,
 	},
 	{
 		desc:       "Sequence with offset and limit",
@@ -136,6 +142,7 @@ var blockSeqTests = []blockSeqTest{
 		haveLimit:  true,
 		limit:      3,
 		want:       "oba",
+		length:     3,
 	},
 }
 
@@ -213,5 +220,16 @@ func TestBlockSeqDropBeyondLimit(t *testing.T) {
 	bs = bs.DropFirst(2)
 	if got, want := bs.NumBytes(), uint64(0); got != want {
 		t.Errorf("%v.NumBytes(): got %d, wanted %d", bs, got, want)
+	}
+}
+
+func TestBlockSeqLen(t *testing.T) {
+	for _, test := range blockSeqTests {
+		t.Run(test.desc, func(t *testing.T) {
+			bs := test.BlockSeq()
+			if got, want := bs.Len(), test.length; got != want {
+				t.Errorf("BlockSeq.Len(): got %d, wanted %d bytes", got, want)
+			}
+		})
 	}
 }

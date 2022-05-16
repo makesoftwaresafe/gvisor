@@ -319,3 +319,15 @@ func IovecsFromBlockSeq(bs BlockSeq) []unix.Iovec {
 	}
 	return iovs
 }
+
+// Len returns the length of the given BlockSeq.
+func (bs BlockSeq) Len() int {
+	ns := 0
+	for !bs.IsEmpty() {
+		b := bs.Head()
+		n := b.Len()
+		ns += n
+		bs = bs.DropFirst(n)
+	}
+	return ns
+}
