@@ -43,13 +43,14 @@ var (
 	debug              = flag.Bool("debug", false, "enable debug logs")
 	strace             = flag.Bool("strace", false, "enable strace logs")
 	platform           = flag.String("platform", "ptrace", "platform to run on")
+	platformSupport    = flag.String("platform-support", "", "String passed to the test as GVISOR_PLATFORM_SUPPORT environment variable. Used to determine which syscall tests are expected to work with the current platform.")
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
 	overlay            = flag.Bool("overlay", false, "wrap filesystem mounts with writable tmpfs overlay")
 	fuse               = flag.Bool("fuse", false, "enable FUSE")
 	lisafs             = flag.Bool("lisafs", false, "enable lisafs protocol if vfs2 is also enabled")
-	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root")
+	container          = flag.Bool("container", false, "run tests in their own namespaces (user ns, network ns, etc), pretending to be root. Implicitly enabled if network=host, or if using network namespaces")
 	setupContainerPath = flag.String("setup-container", "", "path to setup_container binary (for use with --container)")
 
 	addUDSTree = flag.Bool("add-uds-tree", false, "expose a tree of UDS utilities for use in tests")
@@ -57,6 +58,18 @@ var (
 	// set to true as the default for the test runner.
 	leakCheck = flag.Bool("leak-check", false, "check for reference leaks")
 )
+
+// getSetupContainerPath returns the path to the setup_container binary.
+func getSetupContainerPath() string {
+	if *setupContainerPath != "" {
+		return *setupContainerPath
+	}
+	setupContainer, err := testutil.FindFile("test/runner/setup_container/setup_container")
+	if err != nil {
+		fatalf("cannot find setup_container: %v", err)
+	}
+	return setupContainer
+}
 
 // runTestCaseNative runs the test case directly on the host machine.
 func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
@@ -106,33 +119,31 @@ func runTestCaseNative(testBin string, tc gtest.TestCase, t *testing.T) {
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &unix.SysProcAttr{}
 
-	if *container {
-		// setup_container takes in its target argv as positional arguments.
-		cmd.Path = *setupContainerPath
-		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
-		cmd.SysProcAttr = &unix.SysProcAttr{
-			Cloneflags: unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS,
-			// Set current user/group as root inside the namespace.
-			UidMappings: []syscall.SysProcIDMap{
-				{ContainerID: 0, HostID: os.Getuid(), Size: 1},
-			},
-			GidMappings: []syscall.SysProcIDMap{
-				{ContainerID: 0, HostID: os.Getgid(), Size: 1},
-			},
-			GidMappingsEnableSetgroups: false,
-			Credential: &syscall.Credential{
-				Uid: 0,
-				Gid: 0,
-			},
-		}
-	}
-
 	if specutils.HasCapabilities(capability.CAP_SYS_ADMIN) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUTS
 	}
 
 	if specutils.HasCapabilities(capability.CAP_NET_ADMIN) {
 		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+	}
+
+	if *container || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
+		// setup_container takes in its target argv as positional arguments.
+		cmd.Path = getSetupContainerPath()
+		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWUSER | unix.CLONE_NEWNET | unix.CLONE_NEWIPC | unix.CLONE_NEWUTS
+		// Set current user/group as root inside the namespace.
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getuid(), Size: 1},
+		}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
+			{ContainerID: 0, HostID: os.Getgid(), Size: 1},
+		}
+		cmd.SysProcAttr.GidMappingsEnableSetgroups = false
+		cmd.SysProcAttr.Credential = &syscall.Credential{
+			Uid: 0,
+			Gid: 0,
+		}
 	}
 
 	if err := cmd.Run(); err != nil {
@@ -238,6 +249,11 @@ func runRunsc(tc gtest.TestCase, spec *specs.Spec) error {
 			Uid: 0,
 			Gid: 0,
 		},
+	}
+	if *container || *network == "host" || (cmd.SysProcAttr.Cloneflags&unix.CLONE_NEWNET != 0) {
+		cmd.SysProcAttr.Cloneflags |= unix.CLONE_NEWNET
+		cmd.Path = getSetupContainerPath()
+		cmd.Args = append([]string{cmd.Path}, cmd.Args...)
 	}
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -393,12 +409,16 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 	// Set environment variables that indicate we are running in gVisor with
 	// the given platform, network, and filesystem stack.
 	const (
-		platformVar = "TEST_ON_GVISOR"
-		networkVar  = "GVISOR_NETWORK"
-		fuseVar     = "FUSE_ENABLED"
-		lisafsVar   = "LISAFS_ENABLED"
+		platformVar        = "TEST_ON_GVISOR"
+		platformSupportVar = "GVISOR_PLATFORM_SUPPORT"
+		networkVar         = "GVISOR_NETWORK"
+		fuseVar            = "FUSE_ENABLED"
+		lisafsVar          = "LISAFS_ENABLED"
 	)
 	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
+	if *platformSupport != "" {
+		env = append(env, fmt.Sprintf("%s=%s", platformSupportVar, *platformSupport))
+	}
 	if *fuse {
 		env = append(env, fuseVar+"=TRUE")
 	} else {
@@ -477,13 +497,6 @@ func main() {
 		if err := testutil.ConfigureExePath(); err != nil {
 			panic(err.Error())
 		}
-	}
-	if *container && *setupContainerPath == "" {
-		setupContainer, err := testutil.FindFile("test/runner/setup_container/setup_container")
-		if err != nil {
-			fatalf("cannot find setup_container: %v", err)
-		}
-		*setupContainerPath = setupContainer
 	}
 
 	// Make sure stdout and stderr are opened with O_APPEND, otherwise logs
