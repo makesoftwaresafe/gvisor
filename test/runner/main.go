@@ -43,6 +43,7 @@ var (
 	debug              = flag.Bool("debug", false, "enable debug logs")
 	strace             = flag.Bool("strace", false, "enable strace logs")
 	platform           = flag.String("platform", "ptrace", "platform to run on")
+	platformSupport    = flag.String("platform-support", "", "String passed to the test as GVISOR_PLATFORM_SUPPORT environment variable. Used to determine which syscall tests are expected to work with the current platform.")
 	network            = flag.String("network", "none", "network stack to run on (sandbox, host, none)")
 	useTmpfs           = flag.Bool("use-tmpfs", false, "mounts tmpfs for /tmp")
 	fileAccess         = flag.String("file-access", "exclusive", "mounts root in exclusive or shared mode")
@@ -393,12 +394,16 @@ func runTestCaseRunsc(testBin string, tc gtest.TestCase, t *testing.T) {
 	// Set environment variables that indicate we are running in gVisor with
 	// the given platform, network, and filesystem stack.
 	const (
-		platformVar = "TEST_ON_GVISOR"
-		networkVar  = "GVISOR_NETWORK"
-		fuseVar     = "FUSE_ENABLED"
-		lisafsVar   = "LISAFS_ENABLED"
+		platformVar        = "TEST_ON_GVISOR"
+		platformSupportVar = "GVISOR_PLATFORM_SUPPORT"
+		networkVar         = "GVISOR_NETWORK"
+		fuseVar            = "FUSE_ENABLED"
+		lisafsVar          = "LISAFS_ENABLED"
 	)
 	env := append(os.Environ(), platformVar+"="+*platform, networkVar+"="+*network)
+	if *platformSupport != "" {
+		env = append(env, fmt.Sprintf("%s=%s", platformSupportVar, *platformSupport))
+	}
 	if *fuse {
 		env = append(env, fuseVar+"=TRUE")
 	} else {
