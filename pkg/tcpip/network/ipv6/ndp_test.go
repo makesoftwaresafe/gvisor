@@ -15,7 +15,6 @@
 package ipv6
 
 import (
-	"bytes"
 	"math/rand"
 	"strings"
 	"testing"
@@ -25,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -57,7 +57,8 @@ func (*testNDPDispatcher) OnOnLinkPrefixDiscovered(tcpip.NICID, tcpip.Subnet) {
 func (*testNDPDispatcher) OnOnLinkPrefixInvalidated(tcpip.NICID, tcpip.Subnet) {
 }
 
-func (*testNDPDispatcher) OnAutoGenAddress(tcpip.NICID, tcpip.AddressWithPrefix) {
+func (*testNDPDispatcher) OnAutoGenAddress(tcpip.NICID, tcpip.AddressWithPrefix) stack.AddressDispatcher {
+	return nil
 }
 
 func (*testNDPDispatcher) OnAutoGenAddressDeprecated(tcpip.NICID, tcpip.AddressWithPrefix) {
@@ -102,7 +103,7 @@ func TestStackNDPEndpointInvalidateDefaultRouter(t *testing.T) {
 		t.Fatalf("got ndpDisp.addr = %s, want = %s", ndpDisp.addr, lladdr1)
 	}
 
-	ndpDisp.addr = ""
+	ndpDisp.addr = tcpip.Address{}
 	ndpEP := ep.(stack.NDPEndpoint)
 	ndpEP.InvalidateDefaultRouter(lladdr1)
 	if ndpDisp.addr != lladdr1 {
@@ -187,7 +188,7 @@ func TestNeighborSolicitationWithSourceLinkLayerOption(t *testing.T) {
 			}
 
 			pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(hdr.View()),
+				Payload: buffer.MakeWithData(hdr.View()),
 			})
 			e.InjectInbound(ProtocolNumber, pktBuf)
 			pktBuf.DecRef()
@@ -257,6 +258,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 		naSrc                  tcpip.Address
 		naDst                  tcpip.Address
 		performsLinkResolution bool
+		forwardingEnabled      bool
 	}{
 		{
 			name:          "Unspecified source to solicited-node multicast destination",
@@ -389,6 +391,20 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 			nsDst:     nicAddr,
 			nsInvalid: true,
 		},
+		{
+			name: "Specified source with 1 source ll to multicast destination with forwarding enabled",
+			nsOpts: header.NDPOptionsSerializer{
+				header.NDPSourceLinkLayerAddressOption(remoteLinkAddr0[:]),
+			},
+			nsSrc:             remoteAddr,
+			nsDst:             nicAddrSNMC,
+			nsInvalid:         false,
+			naDstLinkAddr:     remoteLinkAddr0,
+			naSolicited:       true,
+			naSrc:             nicAddr,
+			naDst:             remoteAddr,
+			forwardingEnabled: true,
+		},
 	}
 
 	for _, test := range tests {
@@ -396,6 +412,10 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 			c := newTestContext()
 			defer c.cleanup()
 			s := c.s
+
+			if err := s.SetForwardingDefaultAndAllNICs(header.IPv6ProtocolNumber, test.forwardingEnabled); err != nil {
+				t.Fatalf("SetForwardingDefaultAndAllNICs(%t): %s", test.forwardingEnabled, err)
+			}
 
 			e := channel.New(1, 1280, nicLinkAddr)
 			defer e.Close()
@@ -449,7 +469,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 			}
 
 			pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(hdr.View()),
+				Payload: buffer.MakeWithData(hdr.View()),
 			})
 			e.InjectInbound(ProtocolNumber, pktBuf)
 			pktBuf.DecRef()
@@ -487,7 +507,9 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 					t.Errorf("route info mismatch (-want +got):\n%s", diff)
 				}
 
-				checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
 					checker.SrcAddr(nicAddr),
 					checker.DstAddr(respNSDst),
 					checker.TTL(header.NDPHopLimit),
@@ -509,6 +531,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 				na := header.NDPNeighborAdvert(pkt.MessageBody())
 				na.SetSolicitedFlag(true)
 				na.SetOverrideFlag(true)
+				na.SetRouterFlag(test.forwardingEnabled)
 				na.SetTargetAddress(test.nsSrc)
 				na.Options().Serialize(ser)
 				pkt.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
@@ -526,7 +549,7 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 					DstAddr:           nicAddr,
 				})
 				pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(hdr.View()),
+					Payload: buffer.MakeWithData(hdr.View()),
 				})
 				e.InjectInbound(ProtocolNumber, pktBuf)
 				pktBuf.DecRef()
@@ -552,7 +575,9 @@ func TestNeighborSolicitationResponse(t *testing.T) {
 				t.Errorf("got p.EgressRoute.RemoteLinkAddress = %s, want = %s", p.EgressRoute.RemoteLinkAddress, test.naDstLinkAddr)
 			}
 
-			checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+			payload := stack.PayloadSince(p.NetworkHeader())
+			defer payload.Release()
+			checker.IPv6(t, payload,
 				checker.SrcAddr(test.naSrc),
 				checker.DstAddr(test.naDst),
 				checker.TTL(header.NDPHopLimit),
@@ -650,7 +675,7 @@ func TestNeighborAdvertisementWithTargetLinkLayerOption(t *testing.T) {
 				t.Fatalf("got invalid = %d, want = 0", got)
 			}
 			pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(hdr.View()),
+				Payload: buffer.MakeWithData(hdr.View()),
 			})
 			e.InjectInbound(ProtocolNumber, pktBuf)
 			pktBuf.DecRef()
@@ -709,8 +734,8 @@ func TestNDPValidation(t *testing.T) {
 			DstAddr:           lladdr0,
 			ExtensionHeaders:  extHdrs,
 		})
-		buf := buffer.NewWithData(ip)
-		buf.Append(payload)
+		buf := buffer.MakeWithData(ip)
+		buf.Append(buffer.NewViewWithData(payload))
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			Payload: buf,
 		})
@@ -818,7 +843,7 @@ func TestNDPValidation(t *testing.T) {
 		},
 	}
 
-	subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr0))))
+	subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr0.Len())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +903,7 @@ func TestNDPValidation(t *testing.T) {
 							Header:      icmpH[:typ.size],
 							Src:         lladdr0,
 							Dst:         lladdr1,
-							PayloadCsum: header.Checksum(typ.extraData /* initial */, 0),
+							PayloadCsum: checksum.Checksum(typ.extraData /* initial */, 0),
 							PayloadLen:  len(typ.extraData),
 						}))
 
@@ -1026,7 +1051,7 @@ func TestNeighborAdvertisementValidation(t *testing.T) {
 			}
 
 			pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(hdr.View()),
+				Payload: buffer.MakeWithData(hdr.View()),
 			})
 			e.InjectInbound(header.IPv6ProtocolNumber, pktBuf)
 			pktBuf.DecRef()
@@ -1227,7 +1252,7 @@ func TestRouterAdvertValidation(t *testing.T) {
 			}
 
 			pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-				Payload: buffer.NewWithData(hdr.View()),
+				Payload: buffer.MakeWithData(hdr.View()),
 			})
 			e.InjectInbound(header.IPv6ProtocolNumber, pktBuf)
 			pktBuf.DecRef()
@@ -1260,21 +1285,9 @@ func TestCheckDuplicateAddress(t *testing.T) {
 		RetransmitTimer:        time.Second,
 	}
 
-	nonces := [...][]byte{
-		{1, 2, 3, 4, 5, 6},
-		{7, 8, 9, 10, 11, 12},
-	}
-
-	var secureRNGBytes []byte
-	for _, n := range nonces {
-		secureRNGBytes = append(secureRNGBytes, n...)
-	}
-	var secureRNG bytes.Reader
-	secureRNG.Reset(secureRNGBytes[:])
 	s := stack.New(stack.Options{
 		Clock:      clock,
 		RandSource: rand.NewSource(time.Now().UnixNano()),
-		SecureRNG:  &secureRNG,
 		NetworkProtocols: []stack.NetworkProtocolFactory{NewProtocolWithOptions(Options{
 			DADConfigs: dadConfigs,
 		})},
@@ -1312,13 +1325,14 @@ func TestCheckDuplicateAddress(t *testing.T) {
 			t.Errorf("(i=%d) got p.EgressRoute.RemoteLinkAddress = %s, want = %s", dadPacketsSent, p.EgressRoute.RemoteLinkAddress, remoteLinkAddr)
 		}
 
-		checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+		payload := stack.PayloadSince(p.NetworkHeader())
+		defer payload.Release()
+		checker.IPv6(t, payload,
 			checker.SrcAddr(header.IPv6Any),
 			checker.DstAddr(snmc),
 			checker.TTL(header.NDPHopLimit),
 			checker.NDPNS(
 				checker.NDPNSTargetAddress(lladdr0),
-				checker.NDPNSOptions([]header.NDPOption{header.NDPNonceOption(nonces[dadPacketsSent])}),
 			))
 	}
 	protocolAddr := tcpip.ProtocolAddress{

@@ -635,6 +635,8 @@ TEST(SimpleStatTest, AnonDeviceAllocatesUniqueInodesAcrossSaveRestore) {
 #define SYS_statx 332
 #elif defined(__aarch64__)
 #define SYS_statx 291
+#elif defined(__riscv)
+#define SYS_statx 291
 #else
 #error "Unknown architecture"
 #endif
@@ -781,6 +783,22 @@ TEST_F(StatTest, StatxInvalidFlags) {
   EXPECT_THAT(statx(AT_FDCWD, test_file_name_.c_str(),
                     AT_STATX_FORCE_SYNC | AT_STATX_DONT_SYNC, 0, &stx),
               SyscallFailsWithErrno(EINVAL));
+}
+
+// TODO(b/270247637): AT_NO_AUTOMOUNT flag has no effect because gVisor does
+// not support automount yet.
+TEST_F(StatTest, StatIgnoreNoAutomount) {
+  if (IsRunningOnGvisor() || statx(-1, nullptr, 0, 0, nullptr) == 0 ||
+      errno != ENOSYS) {
+    struct kernel_statx stx;
+    EXPECT_THAT(
+        statx(-1, test_file_name_.c_str(), AT_NO_AUTOMOUNT, STATX_ALL, &stx),
+        SyscallSucceeds());
+  }
+
+  struct stat st;
+  EXPECT_THAT(fstatat(AT_FDCWD, test_file_name_.c_str(), &st, AT_NO_AUTOMOUNT),
+              SyscallSucceeds());
 }
 
 }  // namespace

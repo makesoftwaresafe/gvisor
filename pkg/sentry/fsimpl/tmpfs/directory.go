@@ -60,8 +60,7 @@ func (fs *filesystem) newDirectory(kuid auth.KUID, kgid auth.KGID, mode linux.Fi
 //   - filesystem.mu must be locked for writing.
 //   - dir must not already contain a child with the given name.
 func (dir *directory) insertChildLocked(child *dentry, name string) {
-	child.parent = &dir.dentry
-	child.name = name
+	genericSetParentAndName(dir.dentry.inode.fs, child, &dir.dentry, name)
 	if dir.childMap == nil {
 		dir.childMap = make(map[string]*dentry)
 	}
@@ -116,8 +115,6 @@ func (fd *directoryFD) Release(ctx context.Context) {
 func (fd *directoryFD) IterDirents(ctx context.Context, cb vfs.IterDirentsCallback) error {
 	fs := fd.filesystem()
 	dir := fd.inode().impl.(*directory)
-
-	defer fd.dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, vfs.PathEvent)
 
 	// fs.mu is required to read d.parent and dentry.name.
 	fs.mu.RLock()

@@ -108,6 +108,13 @@ func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) 
 		return limits.Limit{}, linuxerr.EPERM
 	}
 
+	switch resource {
+	case limits.NumberOfFiles:
+		if newLim.Max > uint64(t.Kernel().MaxFDLimit.Load()) {
+			return limits.Limit{}, linuxerr.EPERM
+		}
+	}
+
 	// "A privileged process (under Linux: one with the CAP_SYS_RESOURCE
 	// capability in the initial user namespace) may make arbitrary changes
 	// to either limit value."
@@ -125,7 +132,7 @@ func prlimit64(t *kernel.Task, resource limits.LimitType, newLim *limits.Limit) 
 }
 
 // Getrlimit implements linux syscall getrlimit(2).
-func Getrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Getrlimit(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	resource, ok := limits.FromLinuxResource[int(args[0].Int())]
 	if !ok {
 		// Return err; unknown limit.
@@ -146,7 +153,7 @@ func Getrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 }
 
 // Setrlimit implements linux syscall setrlimit(2).
-func Setrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Setrlimit(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	resource, ok := limits.FromLinuxResource[int(args[0].Int())]
 	if !ok {
 		// Return err; unknown limit.
@@ -165,7 +172,7 @@ func Setrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 }
 
 // Prlimit64 implements linux syscall prlimit64(2).
-func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Prlimit64(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	tid := kernel.ThreadID(args[0].Int())
 	resource, ok := limits.FromLinuxResource[int(args[1].Int())]
 	if !ok {

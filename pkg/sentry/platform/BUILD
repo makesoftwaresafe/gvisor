@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "platform",
@@ -16,11 +19,14 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/cpuid",
+        "//pkg/fd",
         "//pkg/hostarch",
         "//pkg/seccomp",
+        "//pkg/seccomp/precompiledseccomp",
         "//pkg/sentry/arch",
         "//pkg/sentry/hostmm",
         "//pkg/sentry/memmap",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )

@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"path"
@@ -53,8 +52,7 @@ func (*Install) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Install) Usage() string {
-	return `install [flags] <name> [-- [args...]] -- if provided, args are passed to the runtime
-`
+	return "install [--runtime=<name>] [flags] [-- [args...]] -- if provided, args are passed to the runtime\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -67,7 +65,7 @@ func (i *Install) SetFlags(fs *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (i *Install) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+func (i *Install) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	// Grab the name and arguments.
 	i.runtimeArgs = f.Args()
 	testFlags := flag.NewFlagSet("test", flag.ContinueOnError)
@@ -120,7 +118,7 @@ func doInstallConfig(i *Install, rw configReaderWriter) error {
 		return fmt.Errorf("error reading config file %q: %v", i.ConfigFile, err)
 	}
 	// Unmarshal the configuration.
-	c := make(map[string]interface{})
+	c := make(map[string]any)
 	if len(configBytes) > 0 {
 		if err := json.Unmarshal(configBytes, &c); err != nil {
 			return err
@@ -128,11 +126,11 @@ func doInstallConfig(i *Install, rw configReaderWriter) error {
 	}
 
 	// Add the given runtime.
-	var rts map[string]interface{}
+	var rts map[string]any
 	if i, ok := c["runtimes"]; ok {
-		rts = i.(map[string]interface{})
+		rts = i.(map[string]any)
 	} else {
-		rts = make(map[string]interface{})
+		rts = make(map[string]any)
 		c["runtimes"] = rts
 	}
 	updateRuntime := func() {
@@ -168,8 +166,8 @@ func doInstallConfig(i *Install, rw configReaderWriter) error {
 		if !ok {
 			c["exec-opts"] = []string{fmt.Sprintf("native.cgroupdriver=%s", i.CgroupDriver)}
 		} else {
-			opts := v.([]interface{})
-			newOpts := []interface{}{}
+			opts := v.([]any)
+			newOpts := []any{}
 			for _, opt := range opts {
 				if !i.Clobber {
 					newOpts = opts
@@ -213,8 +211,7 @@ func (*Uninstall) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Uninstall) Usage() string {
-	return `uninstall [flags] <name>
-`
+	return "uninstall [flags] <name>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -224,7 +221,7 @@ func (u *Uninstall) SetFlags(fs *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (u *Uninstall) Execute(context.Context, *flag.FlagSet, ...interface{}) subcommands.ExitStatus {
+func (u *Uninstall) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
 	log.Printf("Removing runtime %q from %q.", u.Runtime, u.ConfigFile)
 	if err := doUninstallConfig(u, configReaderWriter{
 		read:  defaultReadConfig,
@@ -242,16 +239,16 @@ func doUninstallConfig(u *Uninstall, rw configReaderWriter) error {
 	}
 
 	// Unmarshal the configuration.
-	c := make(map[string]interface{})
+	c := make(map[string]any)
 	if len(configBytes) > 0 {
 		if err := json.Unmarshal(configBytes, &c); err != nil {
 			return err
 		}
 	}
 
-	var rts map[string]interface{}
+	var rts map[string]any
 	if i, ok := c["runtimes"]; ok {
-		rts = i.(map[string]interface{})
+		rts = i.(map[string]any)
 	} else {
 		return fmt.Errorf("runtime %q not found", u.Runtime)
 	}
@@ -268,19 +265,19 @@ func doUninstallConfig(u *Uninstall, rw configReaderWriter) error {
 
 type configReaderWriter struct {
 	read  func(string) ([]byte, error)
-	write func(map[string]interface{}, string) error
+	write func(map[string]any, string) error
 }
 
 func defaultReadConfig(path string) ([]byte, error) {
 	// Read the configuration data.
-	configBytes, err := ioutil.ReadFile(path)
+	configBytes, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
 	return configBytes, nil
 }
 
-func defaultWriteConfig(c map[string]interface{}, filename string) error {
+func defaultWriteConfig(c map[string]any, filename string) error {
 	// Marshal the configuration.
 	b, err := json.MarshalIndent(c, "", "    ")
 	if err != nil {
@@ -288,13 +285,13 @@ func defaultWriteConfig(c map[string]interface{}, filename string) error {
 	}
 
 	// Copy the old configuration.
-	old, err := ioutil.ReadFile(filename)
+	old, err := os.ReadFile(filename)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("error reading config file %q: %v", filename, err)
 		}
 	} else {
-		if err := ioutil.WriteFile(filename+"~", old, 0644); err != nil {
+		if err := os.WriteFile(filename+"~", old, 0644); err != nil {
 			return fmt.Errorf("error backing up config file %q: %v", filename, err)
 		}
 	}
@@ -305,7 +302,7 @@ func defaultWriteConfig(c map[string]interface{}, filename string) error {
 	}
 
 	// Write the new configuration.
-	if err := ioutil.WriteFile(filename, b, 0644); err != nil {
+	if err := os.WriteFile(filename, b, 0644); err != nil {
 		return fmt.Errorf("error writing config file %q: %v", filename, err)
 	}
 

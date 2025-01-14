@@ -22,7 +22,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
@@ -50,16 +49,16 @@ func TestEndpointStateTransitions(t *testing.T) {
 	const nicID = 1
 
 	data := []byte{1, 2, 4, 5}
-	v4Checker := func(t *testing.T, b []byte) {
-		checker.IPv4(t, b,
+	v4Checker := func(t *testing.T, v *buffer.View) {
+		checker.IPv4(t, v,
 			checker.SrcAddr(ipv4NICAddr),
 			checker.DstAddr(ipv4RemoteAddr),
 			checker.IPPayload(data),
 		)
 	}
 
-	v6Checker := func(t *testing.T, b []byte) {
-		checker.IPv6(t, b,
+	v6Checker := func(t *testing.T, v *buffer.View) {
+		checker.IPv6(t, v,
 			checker.SrcAddr(ipv6NICAddr),
 			checker.DstAddr(ipv6RemoteAddr),
 			checker.IPPayload(data),
@@ -76,7 +75,7 @@ func TestEndpointStateTransitions(t *testing.T) {
 		expectedBoundAddr       tcpip.Address
 		remoteAddr              tcpip.Address
 		expectedRemoteAddr      tcpip.Address
-		checker                 func(*testing.T, []byte)
+		checker                 func(*testing.T, *buffer.View)
 	}{
 		{
 			name:                    "IPv4",
@@ -123,6 +122,7 @@ func TestEndpointStateTransitions(t *testing.T) {
 				TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				Clock:              &faketime.NullClock{},
 			})
+			defer s.Destroy()
 			e := channel.New(1, header.IPv6MinimumMTU, "")
 			if err := s.CreateNIC(nicID, e); err != nil {
 				t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
@@ -205,7 +205,7 @@ func TestEndpointStateTransitions(t *testing.T) {
 			}
 			injectPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: int(info.MaxHeaderLength),
-				Payload:            buffer.NewWithData(data),
+				Payload:            buffer.MakeWithData(data),
 			})
 			defer injectPkt.DecRef()
 			if err := ctx.WritePacket(injectPkt, false /* headerIncluded */); err != nil {
@@ -214,7 +214,9 @@ func TestEndpointStateTransitions(t *testing.T) {
 			if pkt := e.Read(); pkt == nil {
 				t.Fatalf("expected packet to be read from link endpoint")
 			} else {
-				test.checker(t, stack.PayloadSince(pkt.NetworkHeader()))
+				payload := stack.PayloadSince(pkt.NetworkHeader())
+				defer payload.Release()
+				test.checker(t, payload)
 				pkt.DecRef()
 			}
 
@@ -270,6 +272,7 @@ func TestBindNICID(t *testing.T) {
 						TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 						Clock:              &faketime.NullClock{},
 					})
+					defer s.Destroy()
 					if err := s.CreateNIC(nicID, loopback.New()); err != nil {
 						t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 					}
@@ -329,6 +332,6 @@ func TestBindNICID(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

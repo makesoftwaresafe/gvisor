@@ -17,12 +17,13 @@ package fuse
 import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/syserr"
 )
 
 // fuseInitRes is a variable-length wrapper of linux.FUSEInitOut. The FUSE
@@ -108,9 +109,8 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 	defer conn.fd.mu.Unlock()
 	conn.fd.nextOpID += linux.FUSEOpID(reqIDStep)
 
-	hdrLen := (*linux.FUSEHeaderIn)(nil).SizeBytes()
 	hdr := linux.FUSEHeaderIn{
-		Len:    uint32(hdrLen + payload.SizeBytes()),
+		Len:    linux.SizeOfFUSEHeaderIn + uint32(payload.SizeBytes()),
 		Opcode: opcode,
 		Unique: conn.fd.nextOpID,
 		NodeID: ino,
@@ -121,8 +121,8 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 
 	buf := make([]byte, hdr.Len)
 
-	hdr.MarshalUnsafe(buf[:hdrLen])
-	payload.MarshalUnsafe(buf[hdrLen:])
+	hdr.MarshalUnsafe(buf[:linux.SizeOfFUSEHeaderIn])
+	payload.MarshalUnsafe(buf[linux.SizeOfFUSEHeaderIn:])
 
 	return &Request{
 		id:   hdr.Unique,
@@ -138,7 +138,7 @@ func (conn *connection) NewRequest(creds *auth.Credentials, pid uint32, ino uint
 // +stateify savable
 type futureResponse struct {
 	opcode linux.FUSEOpcode
-	ch     chan struct{}
+	ch     chan struct{} `state:"nosave"`
 	hdr    *linux.FUSEHeaderOut
 	data   []byte
 
@@ -157,13 +157,13 @@ func newFutureResponse(req *Request) *futureResponse {
 
 // resolve blocks the task until the server responds to its corresponding request,
 // then returns a resolved response.
-func (f *futureResponse) resolve(t *kernel.Task) (*Response, error) {
+func (f *futureResponse) resolve(b context.Blocker) (*Response, error) {
 	// Return directly for async requests.
 	if f.async {
 		return nil, nil
 	}
 
-	if err := t.Block(f.ch); err != nil {
+	if err := b.Block(f.ch); err != nil {
 		return nil, err
 	}
 
@@ -196,7 +196,12 @@ func (r *Response) Error() error {
 		return nil
 	}
 
+	// If we get a bad error in the response, warn and convert it to EINVAL.
 	sysErrNo := unix.Errno(-errno)
+	if !syserr.IsValid(sysErrNo) {
+		log.Warningf("fusefs: invalid response error %d does not correspond to a Linux error", sysErrNo)
+		sysErrNo = unix.Errno(unix.EINVAL)
+	}
 	return error(sysErrNo)
 }
 
@@ -214,7 +219,6 @@ func (r *Response) UnmarshalPayload(m marshal.Marshallable) error {
 	if haveDataLen < wantDataLen {
 		log.Warningf("fusefs: Payload too small. Minimum data length required: %d, but got data length %d", wantDataLen, haveDataLen)
 		return linuxerr.EINVAL
-
 	}
 
 	// The response data is empty unless there is some payload. And so, doesn't

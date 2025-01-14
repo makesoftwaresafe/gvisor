@@ -13,7 +13,7 @@
 // limitations under the License.
 
 // Package watchdog is responsible for monitoring the sentry for tasks that may
-// potentially be stuck or looping inderterminally causing hard to debug hungs in
+// potentially be stuck or looping inderterminally causing hard to debug hangs in
 // the untrusted app.
 //
 // It works by periodically querying all tasks to check whether they are in user
@@ -33,11 +33,10 @@ import (
 	"fmt"
 	"time"
 
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -104,7 +103,7 @@ func (a *Action) Set(v string) error {
 }
 
 // Get implements flag.Value.
-func (a *Action) Get() interface{} {
+func (a *Action) Get() any {
 	return *a
 }
 
@@ -180,7 +179,7 @@ func New(k *kernel.Kernel, opts Opts) *Watchdog {
 	// Handle StartupTimeout if it exists.
 	if w.StartupTimeout > 0 {
 		log.Infof("Watchdog waiting %v for startup", w.StartupTimeout)
-		go w.waitForStart() // S/R-SAFE: watchdog is stopped buring save and restarted after restore.
+		go w.waitForStart() // S/R-SAFE: watchdog is stopped during save and restarted after restore.
 	}
 
 	return w
@@ -236,7 +235,7 @@ func (w *Watchdog) waitForStart() {
 		return
 	}
 
-	metric.WeirdnessMetric.Increment("watchdog_stuck_startup")
+	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeWatchdogStuckStartup)
 
 	var buf bytes.Buffer
 	buf.WriteString(fmt.Sprintf("Watchdog.Start() not called within %s", w.StartupTimeout))
@@ -280,7 +279,7 @@ func (w *Watchdog) runTurn() {
 
 	newOffenders := make(map[*kernel.Task]*offender)
 	newTaskFound := false
-	now := ktime.FromNanoseconds(int64(w.k.CPUClockNow() * uint64(linux.ClockTick)))
+	now := w.k.CPUClockNow()
 
 	// The process may be running with low CPU limit making tasks appear stuck because
 	// are starved of CPU cycles. An estimate is that Tasks could have been starved
@@ -294,11 +293,9 @@ func (w *Watchdog) runTurn() {
 
 	log.Infof("Watchdog starting loop, tasks: %d, discount: %v", len(tasks), discount)
 	for _, t := range tasks {
-		tsched := t.TaskGoroutineSchedInfo()
-
 		// An offender is a task running inside the kernel for longer than the specified timeout.
-		if tsched.State == kernel.TaskGoroutineRunningSys {
-			lastUpdateTime := ktime.FromNanoseconds(int64(tsched.Timestamp * uint64(linux.ClockTick)))
+		tstate, lastUpdateTime := t.TaskGoroutineStateTime()
+		if tstate == kernel.TaskGoroutineRunningSys {
 			elapsed := now.Sub(lastUpdateTime) - discount
 			if elapsed > w.TaskTimeout {
 				tc, ok := w.offenders[t]
@@ -309,7 +306,7 @@ func (w *Watchdog) runTurn() {
 					// unless they are surrounded by
 					// Task.UninterruptibleSleepStart/Finish.
 					tc = &offender{lastUpdateTime: lastUpdateTime}
-					metric.WeirdnessMetric.Increment("watchdog_stuck_tasks")
+					metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeWatchdogStuckTasks)
 					newTaskFound = true
 				}
 				newOffenders[t] = tc

@@ -24,7 +24,7 @@ import (
 )
 
 func TestSimpleMasterToReplica(t *testing.T) {
-	ld := newLineDiscipline(linux.DefaultReplicaTermios)
+	ld := newLineDiscipline(linux.DefaultReplicaTermios, nil)
 	ctx := contexttest.Context(t)
 	inBytes := []byte("hello, tty\n")
 	src := usermem.BytesIOSequence(inBytes)
@@ -60,7 +60,7 @@ func TestEchoDeadlock(t *testing.T) {
 	ctx := contexttest.Context(t)
 	termios := linux.DefaultReplicaTermios
 	termios.LocalFlags |= linux.ECHO
-	ld := newLineDiscipline(termios)
+	ld := newLineDiscipline(termios, nil)
 	outBytes := make([]byte, 32)
 	dst := usermem.BytesIOSequence(outBytes)
 	entry := waiter.NewFunctionEntry(waiter.ReadableEvents, func(waiter.EventMask) {
@@ -80,5 +80,56 @@ func TestEchoDeadlock(t *testing.T) {
 	inStr := string(inBytes)
 	if outStr != inStr {
 		t.Fatalf("written and read strings do not match: got %q, want %q", outStr, inStr)
+	}
+}
+
+func TestEndOfFileHandling(t *testing.T) {
+	ctx := contexttest.Context(t)
+	termios := linux.DefaultReplicaTermios
+	ld := newLineDiscipline(termios, nil)
+
+	// EOF with non-empty read buffer.
+	inBytes := []byte("hello, tty")
+	inBytes = append(inBytes, termios.ControlCharacters[linux.VEOF])
+	outBytes := make([]byte, 32)
+	dst := usermem.BytesIOSequence(outBytes)
+	// Write to the input queue.
+	nw, err := ld.inputQueueWrite(ctx, usermem.BytesIOSequence(inBytes))
+	if err != nil {
+		t.Fatalf("error writing to input queue: %v", err)
+	}
+	if nw != int64(len(inBytes)) {
+		t.Fatalf("wrote wrong length: got %d, want %d", nw, len(inBytes))
+	}
+
+	// Read from the input queue.
+	nr, err := ld.inputQueueRead(ctx, dst)
+	if err != nil {
+		t.Fatalf("error reading from input queue: %v", err)
+	}
+	if nr != int64(len(inBytes)-1) {
+		t.Fatalf("read wrong length: got %d, want %d", nr, len(inBytes)-1)
+	}
+
+	// EOF with empty read buffer.
+	inBytes = []byte{termios.ControlCharacters[linux.VEOF]}
+	outBytes = make([]byte, 32)
+	dst = usermem.BytesIOSequence(outBytes)
+	// Write to the input queue.
+	nw, err = ld.inputQueueWrite(ctx, usermem.BytesIOSequence(inBytes))
+	if err != nil {
+		t.Fatalf("error writing to input queue: %v", err)
+	}
+	if nw != int64(len(inBytes)) {
+		t.Fatalf("wrote wrong length: got %d, want %d", nw, len(inBytes))
+	}
+
+	// Read from the input queue.
+	nr, err = ld.inputQueueRead(ctx, dst)
+	if err != nil {
+		t.Fatalf("error reading from input queue: %v", err)
+	}
+	if nr != 0 {
+		t.Fatalf("read length should be zero: got %d", nr)
 	}
 }

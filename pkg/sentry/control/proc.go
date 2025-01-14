@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -25,14 +26,13 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/fdimport"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/host"
-	"gvisor.dev/gvisor/pkg/sentry/fs/user"
-	hostvfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/user"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
@@ -40,10 +40,54 @@ import (
 )
 
 // Proc includes task-related functions.
-//
-// At the moment, this is limited to exec support.
 type Proc struct {
 	Kernel *kernel.Kernel
+}
+
+// FilePayload aids to ensure that payload files and guest file descriptors are
+// consistent when instantiated through the NewFilePayload helper method.
+type FilePayload struct {
+	// FilePayload is the file payload that is transferred via RPC.
+	urpc.FilePayload
+
+	// GuestFDs are the file descriptors in the file descriptor map of the
+	// executed application. They correspond 1:1 to the files in the
+	// urpc.FilePayload. If a program is executed from a host file descriptor,
+	// the file payload may contain one additional file. In that case, the file
+	// used for program execution is the last file in the Files array.
+	GuestFDs []int
+}
+
+// NewFilePayload returns a FilePayload that maps file descriptors to files inside
+// the executed process and provides a file for execution.
+func NewFilePayload(fdMap map[int]*os.File, execFile *os.File) FilePayload {
+	fileCount := len(fdMap)
+	if execFile != nil {
+		fileCount++
+	}
+	files := make([]*os.File, 0, fileCount)
+	guestFDs := make([]int, 0, len(fdMap))
+
+	// Make the map iteration order deterministic for the sake of testing.
+	// Otherwise, the order is randomized and tests relying on the comparison
+	// of equality will fail.
+	for key := range fdMap {
+		guestFDs = append(guestFDs, key)
+	}
+	sort.Ints(guestFDs)
+
+	for _, guestFD := range guestFDs {
+		files = append(files, fdMap[guestFD])
+	}
+
+	if execFile != nil {
+		files = append(files, execFile)
+	}
+
+	return FilePayload{
+		FilePayload: urpc.FilePayload{Files: files},
+		GuestFDs:    guestFDs,
+	}
 }
 
 // ExecArgs is the set of arguments to exec.
@@ -63,13 +107,7 @@ type ExecArgs struct {
 	// A reference on MountNamespace must be held for the lifetime of the
 	// ExecArgs. If MountNamespace is nil, it will default to the init
 	// process's MountNamespace.
-	MountNamespace *fs.MountNamespace
-
-	// MountNamespaceVFS2 is the mount namespace to execute the new process in.
-	// A reference on MountNamespace must be held for the lifetime of the
-	// ExecArgs. If MountNamespace is nil, it will default to the init
-	// process's MountNamespace.
-	MountNamespaceVFS2 *vfs.MountNamespace
+	MountNamespace *vfs.MountNamespace
 
 	// WorkingDirectory defines the working directory for the new process.
 	WorkingDirectory string `json:"wd"`
@@ -92,7 +130,7 @@ type ExecArgs struct {
 	StdioIsPty bool
 
 	// FilePayload determines the files to give to the new process.
-	urpc.FilePayload
+	FilePayload
 
 	// ContainerID is the container for the process being executed.
 	ContainerID string
@@ -105,7 +143,7 @@ type ExecArgs struct {
 }
 
 // String prints the arguments as a string.
-func (args ExecArgs) String() string {
+func (args *ExecArgs) String() string {
 	if len(args.Argv) == 0 {
 		return args.Filename
 	}
@@ -119,7 +157,7 @@ func (args ExecArgs) String() string {
 
 // Exec runs a new task.
 func (proc *Proc) Exec(args *ExecArgs, waitStatus *uint32) error {
-	newTG, _, _, _, err := proc.execAsync(args)
+	newTG, _, _, err := proc.execAsync(args)
 	if err != nil {
 		return err
 	}
@@ -132,14 +170,14 @@ func (proc *Proc) Exec(args *ExecArgs, waitStatus *uint32) error {
 
 // ExecAsync runs a new task, but doesn't wait for it to finish. It is defined
 // as a function rather than a method to avoid exposing execAsync as an RPC.
-func ExecAsync(proc *Proc, args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func ExecAsync(proc *Proc, args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
 	return proc.execAsync(args)
 }
 
 // execAsync runs a new task, but doesn't wait for it to finish. It returns the
 // newly created thread group and its PID. If the stdio FDs are TTYs, then a
 // TTYFileOperations that wraps the TTY is also returned.
-func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
+func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadID, *host.TTYFileDescription, error) {
 	// Import file descriptors.
 	fdTable := proc.Kernel.NewFDTable()
 
@@ -159,92 +197,109 @@ func (proc *Proc) execAsync(args *ExecArgs) (*kernel.ThreadGroup, kernel.ThreadI
 		limitSet = limits.NewLimitSet()
 	}
 	initArgs := kernel.CreateProcessArgs{
-		Filename:                args.Filename,
-		Argv:                    args.Argv,
-		Envv:                    args.Envv,
-		WorkingDirectory:        args.WorkingDirectory,
-		MountNamespace:          args.MountNamespace,
-		MountNamespaceVFS2:      args.MountNamespaceVFS2,
-		Credentials:             creds,
-		FDTable:                 fdTable,
-		Umask:                   0022,
-		Limits:                  limitSet,
-		MaxSymlinkTraversals:    linux.MaxSymlinkTraversals,
-		UTSNamespace:            proc.Kernel.RootUTSNamespace(),
-		IPCNamespace:            proc.Kernel.RootIPCNamespace(),
-		AbstractSocketNamespace: proc.Kernel.RootAbstractSocketNamespace(),
-		ContainerID:             args.ContainerID,
-		PIDNamespace:            pidns,
+		Filename:             args.Filename,
+		Argv:                 args.Argv,
+		Envv:                 args.Envv,
+		WorkingDirectory:     args.WorkingDirectory,
+		MountNamespace:       args.MountNamespace,
+		Credentials:          creds,
+		FDTable:              fdTable,
+		Umask:                0022,
+		Limits:               limitSet,
+		MaxSymlinkTraversals: linux.MaxSymlinkTraversals,
+		UTSNamespace:         proc.Kernel.RootUTSNamespace(),
+		IPCNamespace:         proc.Kernel.RootIPCNamespace(),
+		ContainerID:          args.ContainerID,
+		PIDNamespace:         pidns,
+		Origin:               kernel.OriginExec,
 	}
 	if initArgs.MountNamespace != nil {
 		// initArgs must hold a reference on MountNamespace, which will
 		// be donated to the new process in CreateProcess.
 		initArgs.MountNamespace.IncRef()
 	}
-	if initArgs.MountNamespaceVFS2 != nil {
-		// initArgs must hold a reference on MountNamespaceVFS2, which will
-		// be donated to the new process in CreateProcess.
-		initArgs.MountNamespaceVFS2.IncRef()
-	}
 	ctx := initArgs.NewContext(proc.Kernel)
 	defer fdTable.DecRef(ctx)
 
-	if kernel.VFS2Enabled {
-		// Get the full path to the filename from the PATH env variable.
-		if initArgs.MountNamespaceVFS2 == nil {
-			// Set initArgs so that 'ctx' returns the namespace.
-			//
-			// Add a reference to the namespace, which is transferred to the new process.
-			initArgs.MountNamespaceVFS2 = proc.Kernel.GlobalInit().Leader().MountNamespaceVFS2()
-			initArgs.MountNamespaceVFS2.IncRef()
-		}
-	} else {
-		if initArgs.MountNamespace == nil {
-			// Set initArgs so that 'ctx' returns the namespace.
-			initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
-
-			// initArgs must hold a reference on MountNamespace, which will
-			// be donated to the new process in CreateProcess.
-			initArgs.MountNamespace.IncRef()
-		}
+	// Get the full path to the filename from the PATH env variable.
+	if initArgs.MountNamespace == nil {
+		// Set initArgs so that 'ctx' returns the namespace.
+		//
+		// Add a reference to the namespace, which is transferred to the new process.
+		initArgs.MountNamespace = proc.Kernel.GlobalInit().Leader().MountNamespace()
+		initArgs.MountNamespace.IncRef()
 	}
-	resolved, err := user.ResolveExecutablePath(ctx, &initArgs)
-	if err != nil {
-		return nil, 0, nil, nil, err
-	}
-	initArgs.Filename = resolved
 
-	fds, err := fd.NewFromFiles(args.Files)
+	fdMap, execFD, err := args.unpackFiles()
 	if err != nil {
-		return nil, 0, nil, nil, fmt.Errorf("duplicating payload files: %w", err)
+		return nil, 0, nil, fmt.Errorf("creating fd map: %w", err)
 	}
 	defer func() {
-		for _, fd := range fds {
-			_ = fd.Close()
+		for _, hostFD := range fdMap {
+			_ = hostFD.Close()
 		}
 	}()
-	ttyFile, ttyFileVFS2, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fds)
+
+	if execFD != nil {
+		if initArgs.Filename != "" {
+			return nil, 0, nil, fmt.Errorf("process must either be started from a file or a filename, not both")
+		}
+		file, err := host.NewFD(ctx, proc.Kernel.HostMount(), execFD.FD(), &host.NewFDOptions{
+			Readonly:     true,
+			Savable:      true,
+			VirtualOwner: true,
+			UID:          args.KUID,
+			GID:          args.KGID,
+		})
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		defer file.DecRef(ctx)
+		execFD.Release()
+		initArgs.File = file
+	} else {
+		resolved, err := user.ResolveExecutablePath(ctx, &initArgs)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		initArgs.Filename = resolved
+	}
+
+	// TODO(gvisor.dev/issue/1956): Container name is not really needed because
+	// exec processes are not restored, but add it for completeness.
+	ttyFile, err := fdimport.Import(ctx, fdTable, args.StdioIsPty, args.KUID, args.KGID, fdMap, "")
 	if err != nil {
-		return nil, 0, nil, nil, err
+		return nil, 0, nil, err
+	}
+
+	if ttyFile != nil {
+		initArgs.TTY = ttyFile.TTY()
+	}
+
+	// Set cgroups to the new exec task if cgroups are mounted.
+	cgroupRegistry := proc.Kernel.CgroupRegistry()
+	initialCgrps := map[kernel.Cgroup]struct{}{}
+	for _, ctrl := range kernel.CgroupCtrls {
+		cg, err := cgroupRegistry.FindCgroup(ctx, ctrl, "/"+args.ContainerID)
+		if err != nil {
+			log.Warningf("cgroup mount for controller %v not found", ctrl)
+			continue
+		}
+		initialCgrps[cg] = struct{}{}
+	}
+	if len(initialCgrps) > 0 {
+		initArgs.InitialCgroups = initialCgrps
 	}
 
 	tg, tid, err := proc.Kernel.CreateProcess(initArgs)
 	if err != nil {
-		return nil, 0, nil, nil, err
-	}
-
-	// Set the foreground process group on the TTY before starting the process.
-	switch {
-	case ttyFile != nil:
-		ttyFile.InitForegroundProcessGroup(tg.ProcessGroup())
-	case ttyFileVFS2 != nil:
-		ttyFileVFS2.InitForegroundProcessGroup(tg.ProcessGroup())
+		return nil, 0, nil, err
 	}
 
 	// Start the newly created process.
 	proc.Kernel.StartProcess(tg)
 
-	return tg, tid, ttyFile, ttyFileVFS2, nil
+	return tg, tid, ttyFile, nil
 }
 
 // PsArgs is the set of arguments to ps.
@@ -413,7 +468,7 @@ func ttyName(tty *kernel.TTY) string {
 	if tty == nil {
 		return "?"
 	}
-	return fmt.Sprintf("pts/%d", tty.Index)
+	return fmt.Sprintf("pts/%d", tty.Index())
 }
 
 // ContainerUsage retrieves per-container CPU usage.
@@ -427,4 +482,55 @@ func ContainerUsage(kr *kernel.Kernel) map[string]uint64 {
 		cusage[cid] += uint64(stats.UserTime.Nanoseconds()) + uint64(stats.SysTime.Nanoseconds())
 	}
 	return cusage
+}
+
+// unpackFiles unpacks the file descriptor map and, if applicable, the file
+// descriptor to be used for execution from the unmarshalled ExecArgs.
+func (args *ExecArgs) unpackFiles() (map[int]*fd.FD, *fd.FD, error) {
+	var execFD *fd.FD
+	var err error
+
+	// If there is one additional file, the last file is used for program
+	// execution.
+	if len(args.Files) == len(args.GuestFDs)+1 {
+		execFD, err = fd.NewFromFile(args.Files[len(args.Files)-1])
+		if err != nil {
+			return nil, nil, fmt.Errorf("duplicating exec file: %w", err)
+		}
+	} else if len(args.Files) != len(args.GuestFDs) {
+		return nil, nil, fmt.Errorf("length of payload files does not match length of file descriptor array")
+	}
+
+	// GuestFDs are the indexes of our FD map.
+	fdMap := make(map[int]*fd.FD, len(args.GuestFDs))
+	for i, appFD := range args.GuestFDs {
+		file := args.Files[i]
+		if appFD < 0 {
+			return nil, nil, fmt.Errorf("guest file descriptors must be 0 or greater")
+		}
+		hostFD, err := fd.NewFromFile(file)
+		if err != nil {
+			return nil, nil, fmt.Errorf("duplicating payload files: %w", err)
+		}
+		fdMap[appFD] = hostFD
+	}
+	return fdMap, execFD, nil
+}
+
+// SignalProcessArgs is the arguments to SignalProcess.
+type SignalProcessArgs struct {
+	// Signal number to send.
+	Signo int `json:"signo"`
+
+	// Process ID (in the root PID namespace) to signal.
+	PID int `json:"pid"`
+}
+
+// SignalProcess sends a signal to the process with the given PID.
+func (proc *Proc) SignalProcess(args *SignalProcessArgs, _ *struct{}) error {
+	tg := proc.Kernel.RootPIDNamespace().ThreadGroupWithID(kernel.ThreadID(args.PID))
+	if tg == nil {
+		return fmt.Errorf("no such process with PID %d", args.PID)
+	}
+	return proc.Kernel.SendExternalSignalThreadGroup(tg, &linux.SignalInfo{Signo: int32(args.Signo)})
 }

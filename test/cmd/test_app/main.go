@@ -20,18 +20,21 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	sys "syscall"
 	"time"
 
 	"github.com/google/subcommands"
 	"github.com/kr/pty"
+	gvisorrand "gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/flag"
 )
@@ -43,16 +46,86 @@ func main() {
 	subcommands.Register(new(fdReceiver), "")
 	subcommands.Register(new(fdSender), "")
 	subcommands.Register(new(forkBomb), "")
+	subcommands.Register(new(fsTreeCreator), "")
 	subcommands.Register(new(ptyRunner), "")
 	subcommands.Register(new(reaper), "")
 	subcommands.Register(new(syscall), "")
 	subcommands.Register(new(taskTree), "")
 	subcommands.Register(new(uds), "")
+	subcommands.Register(new(zombieTest), "")
 
 	flag.Parse()
 
 	exitCode := subcommands.Execute(context.Background())
 	os.Exit(int(exitCode))
+}
+
+type fsTreeCreator struct {
+	depth            uint
+	numFilesPerLevel uint
+	fileSize         uint
+	targetDir        string
+	createSymlink    bool
+}
+
+// Name implements subcommands.Command.Name.
+func (*fsTreeCreator) Name() string {
+	return "fsTreeCreate"
+}
+
+// Synopsis implements subcommands.Command.Synopsys.
+func (*fsTreeCreator) Synopsis() string {
+	return "creates a filesystem tree of a certain depth, with a certain number of files on each level and each file with a certain size and type, under a certain directory. Some randomization is added on top of this"
+}
+
+// Usage implements subcommands.Command.Usage.
+func (*fsTreeCreator) Usage() string {
+	return "fsTreeCreate <flags>"
+}
+
+// SetFlags implements subcommands.Command.SetFlags.
+func (c *fsTreeCreator) SetFlags(f *flag.FlagSet) {
+	f.UintVar(&c.depth, "depth", 10, "number of levels to create")
+	f.UintVar(&c.numFilesPerLevel, "file-per-level", 10, "number of files to create per level")
+	f.UintVar(&c.fileSize, "file-size", 4096, "size of each file")
+	f.StringVar(&c.targetDir, "target-dir", "/", "directory under which to create the filesystem tree")
+	f.BoolVar(&c.createSymlink, "create-symlink", false, "create symlinks other than the first file per level")
+}
+
+// Execute implements subcommands.Command.Execute.
+func (c *fsTreeCreator) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
+	depth := c.depth + uint(rand.Uint32())%c.depth
+	numFilesPerLevel := c.numFilesPerLevel + uint(rand.Uint32())%c.numFilesPerLevel
+	fileSize := c.fileSize + uint(rand.Uint32())%c.fileSize
+	curDir := c.targetDir
+	if _, err := os.Stat(curDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(curDir, 0777); err != nil {
+			log.Fatalf("error creating directory %q: %v", curDir, err)
+		}
+	}
+
+	data := make([]byte, fileSize)
+	gvisorrand.Read(data)
+	for i := uint(0); i < depth; i++ {
+		for j := uint(0); j < numFilesPerLevel; j++ {
+			filePath := filepath.Join(curDir, fmt.Sprintf("file%d", j))
+			if c.createSymlink && j > 0 {
+				if err := os.Symlink("file0", filePath); err != nil {
+					log.Fatalf("error creating symlink %q: %v", filePath, err)
+				}
+			} else {
+				if err := os.WriteFile(filePath, data, 0666); err != nil {
+					log.Fatalf("error writing file %q: %v", filePath, err)
+				}
+			}
+		}
+		nextDir := filepath.Join(curDir, "dir")
+		if err := os.Mkdir(nextDir, 0777); err != nil {
+			log.Fatalf("error creating directory %q: %v", nextDir, err)
+		}
+		curDir = nextDir
+	}
+	return subcommands.ExitSuccess
 }
 
 type uds struct {
@@ -82,7 +155,7 @@ func (c *uds) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *uds) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *uds) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if c.fileName == "" || c.socketPath == "" {
 		log.Fatalf("Flags cannot be empty, given: fileName: %q, socketPath: %q", c.fileName, c.socketPath)
 		return subcommands.ExitFailure
@@ -159,7 +232,7 @@ func (c *taskTree) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (c *taskTree) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *taskTree) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if c.depth == 0 {
 		log.Printf("Child sleeping, PID: %d\n", os.Getpid())
 		for {
@@ -227,7 +300,7 @@ func (c *forkBomb) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (c *forkBomb) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *forkBomb) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	time.Sleep(c.delay)
 
 	cmd := exec.Command("/proc/self/exe", c.Name())
@@ -260,7 +333,7 @@ func (*reaper) Usage() string {
 func (*reaper) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (c *reaper) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *reaper) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	stop := testutil.StartReaper()
 	defer stop()
 	select {}
@@ -282,7 +355,7 @@ func (*syscall) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*syscall) Usage() string {
-	return "syscall <flags>"
+	return "syscall <flags> [arg1 arg2...]"
 }
 
 // SetFlags implements subcommands.Command.
@@ -291,11 +364,38 @@ func (s *syscall) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (s *syscall) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-	if _, _, errno := sys.Syscall(uintptr(s.sysno), 0, 0, 0); errno != 0 {
-		fmt.Printf("syscall(%d, 0, 0...) failed: %v\n", s.sysno, errno)
+func (s *syscall) Execute(ctx context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	const maxSyscallArgs = 6
+	numArgs := f.NArg()
+	if numArgs > maxSyscallArgs {
+		fmt.Printf("number of sycall arguments not supported: %d (max is %d)\n", numArgs, maxSyscallArgs)
+		return subcommands.ExitUsageError
+	}
+	var syscallArgs [maxSyscallArgs]uintptr
+	for i := 0; i < numArgs; i++ {
+		uintArg, err := strconv.ParseUint(f.Arg(i), 10, 64)
+		if err != nil {
+			fmt.Printf("not an integer: %q\n", f.Arg(i))
+			return subcommands.ExitUsageError
+		}
+		syscallArgs[i] = uintptr(uintArg)
+	}
+	var errno sys.Errno
+	switch numArgs {
+	case 0:
+		_, _, errno = sys.Syscall(uintptr(s.sysno), 0, 0, 0)
+	case 3:
+		_, _, errno = sys.Syscall(uintptr(s.sysno), syscallArgs[0], syscallArgs[1], syscallArgs[2])
+	case 6:
+		_, _, errno = sys.Syscall6(uintptr(s.sysno), syscallArgs[0], syscallArgs[1], syscallArgs[2], syscallArgs[3], syscallArgs[4], syscallArgs[5])
+	default:
+		fmt.Printf("number of sycall arguments not supported: %d\n", numArgs)
+		return subcommands.ExitUsageError
+	}
+	if errno != 0 {
+		fmt.Printf("syscall(%d, %s) failed: %v\n", s.sysno, strings.Join(f.Args(), ", "), errno)
 	} else {
-		fmt.Printf("syscall(%d, 0, 0...) success\n", s.sysno)
+		fmt.Printf("syscall(%d, %s) success\n", s.sysno, strings.Join(f.Args(), ", "))
 	}
 	return subcommands.ExitSuccess
 }
@@ -327,13 +427,13 @@ func (c *capability) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (c *capability) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *capability) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if c.enabled == 0 && c.disabled == 0 {
 		fmt.Println("One of the flags must be set")
 		return subcommands.ExitUsageError
 	}
 
-	status, err := ioutil.ReadFile("/proc/self/status")
+	status, err := os.ReadFile("/proc/self/status")
 	if err != nil {
 		fmt.Printf("Error reading %q: %v\n", "proc/self/status", err)
 		return subcommands.ExitFailure
@@ -383,7 +483,7 @@ func (*ptyRunner) Usage() string {
 func (*ptyRunner) SetFlags(f *flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (*ptyRunner) Execute(_ context.Context, fs *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+func (*ptyRunner) Execute(_ context.Context, fs *flag.FlagSet, _ ...any) subcommands.ExitStatus {
 	c := exec.Command(fs.Args()[0], fs.Args()[1:]...)
 	f, err := pty.Start(c)
 	if err != nil {

@@ -1,6 +1,7 @@
 load("//website:defs.bzl", "doc")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//website:__pkg__"],
     licenses = ["notice"],
 )
@@ -47,4 +48,15 @@ doc(
     category = "Architecture Guide",
     permalink = "/docs/architecture_guide/performance/",
     weight = "20",
+)
+
+doc(
+    name = "networking",
+    src = "networking.md",
+    category = "Architecture Guide",
+    data = [
+        "packetflow.svg",
+    ],
+    permalink = "/docs/architecture_guide/networking/",
+    weight = "50",
 )

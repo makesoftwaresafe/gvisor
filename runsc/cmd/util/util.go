@@ -37,12 +37,27 @@ type jsonError struct {
 	Time  time.Time `json:"time"`
 }
 
+// Writer writes to log and stdout.
+type Writer struct{}
+
+// Write implements io.Writer.
+func (i *Writer) Write(data []byte) (n int, err error) {
+	log.Infof("%s", data)
+	return os.Stdout.Write(data)
+}
+
+// Infof writes message to log and stdout.
+func Infof(format string, args ...any) {
+	log.Infof(format, args...)
+	fmt.Printf(format+"\n", args...)
+}
+
 // Errorf logs error to containerd log (--log), to stderr, and debug logs. It
 // returns subcommands.ExitFailure for convenience with subcommand.Execute()
 // methods:
 //
 //	return Errorf("Danger! Danger!")
-func Errorf(format string, args ...interface{}) subcommands.ExitStatus {
+func Errorf(format string, args ...any) subcommands.ExitStatus {
 	// If runsc is being invoked by docker or cri-o, then we might not have
 	// access to stderr, so we log a serious-looking warning in addition to
 	// writing to stderr.
@@ -66,7 +81,7 @@ func Errorf(format string, args ...interface{}) subcommands.ExitStatus {
 }
 
 // Fatalf logs the same way as Errorf() does, plus *exits* the process.
-func Fatalf(format string, args ...interface{}) {
+func Fatalf(format string, args ...any) {
 	Errorf(format, args...)
 	// Return an error that is unlikely to be used by the application.
 	os.Exit(128)

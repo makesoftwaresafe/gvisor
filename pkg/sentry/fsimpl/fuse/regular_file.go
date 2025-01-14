@@ -22,17 +22,99 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
+	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
+// +stateify savable
 type regularFileFD struct {
 	fileDescription
 
-	// off is the file offset.
-	off int64
 	// offMu protects off.
-	offMu sync.Mutex
+	offMu sync.Mutex `state:"nosave"`
+
+	// off is the file offset.
+	// +checklocks:offMu
+	off int64
+
+	// mapsMu protects mappings.
+	mapsMu sync.Mutex `state:"nosave"`
+
+	// mappings tracks mappings of the file into memmap.MappingSpaces.
+	//
+	// Protected by mapsMu.
+	mappings memmap.MappingSet
+
+	// dataMu protects the fields below.
+	dataMu sync.RWMutex `state:"nosave"`
+
+	// data maps offsets into the file to offsets into memFile that store
+	// the file's data.
+	//
+	// Protected by dataMu.
+	data fsutil.FileRangeSet
+}
+
+// Seek implements vfs.FileDescriptionImpl.Allocate.
+func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if mode & ^uint64(linux.FALLOC_FL_KEEP_SIZE|linux.FALLOC_FL_PUNCH_HOLE|linux.FALLOC_FL_ZERO_RANGE) != 0 {
+		return linuxerr.EOPNOTSUPP
+	}
+	in := linux.FUSEFallocateIn{
+		Fh:     fd.Fh,
+		Offset: uint64(offset),
+		Length: uint64(length),
+		Mode:   uint32(mode),
+	}
+	i := fd.inode()
+	req := i.fs.conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), i.nodeID, linux.FUSE_FALLOCATE, &in)
+	res, err := i.fs.conn.Call(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := res.Error(); err != nil {
+		return err
+	}
+	i.attrMu.Lock()
+	defer i.attrMu.Unlock()
+	if uint64(offset+length) > i.size.Load() {
+		if err := i.reviseAttr(ctx, linux.FUSE_GETATTR_FH, fd.Fh); err != nil {
+			return err
+		}
+		// If the offset after update is still too large, return error.
+		if uint64(offset) >= i.size.Load() {
+			return io.EOF
+		}
+	}
+	return nil
+}
+
+// Seek implements vfs.FileDescriptionImpl.Seek.
+func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (int64, error) {
+	fd.offMu.Lock()
+	defer fd.offMu.Unlock()
+	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
+	switch whence {
+	case linux.SEEK_SET:
+		// use offset as specified
+	case linux.SEEK_CUR:
+		offset += fd.off
+	case linux.SEEK_END:
+		offset += int64(inode.size.Load())
+	default:
+		return 0, linuxerr.EINVAL
+	}
+	if offset < 0 {
+		return 0, linuxerr.EINVAL
+	}
+	fd.off = offset
+	return offset, nil
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -61,6 +143,8 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 	// TODO(gvisor.dev/issue/3678): Add direct IO support.
 
 	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
 
 	// Reading beyond EOF, update file size if outdated.
 	if uint64(offset+size) > inode.size.Load() {
@@ -140,7 +224,7 @@ func (fd *regularFileFD) Write(ctx context.Context, src usermem.IOSequence, opts
 
 // pwrite returns the number of bytes written, final offset and error. The
 // final offset should be ignored by PWrite.
-func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (written, finalOff int64, err error) {
+func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, offset int64, opts vfs.WriteOptions) (int64, int64, error) {
 	if offset < 0 {
 		return 0, offset, linuxerr.EINVAL
 	}
@@ -153,8 +237,8 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 
 	inode := fd.inode()
-	inode.metadataMu.Lock()
-	defer inode.metadataMu.Unlock()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
 
 	// If the file is opened with O_APPEND, update offset to file size.
 	// Note: since our Open() implements the interface of kernfs,
@@ -166,7 +250,6 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	}
 
 	srclen := src.NumBytes()
-
 	if srclen > math.MaxUint32 {
 		// FUSE only supports uint32 for size.
 		// Overflow.
@@ -177,53 +260,56 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 		return 0, offset, linuxerr.EINVAL
 	}
 
-	srclen, err = vfs.CheckLimit(ctx, offset, srclen)
+	limit, err := vfs.CheckLimit(ctx, offset, srclen)
 	if err != nil {
 		return 0, offset, err
 	}
-
-	if srclen == 0 {
+	if limit == 0 {
 		// Return before causing any side effects.
 		return 0, offset, nil
 	}
+	src = src.TakeFirst64(limit)
 
-	src = src.TakeFirst64(srclen)
-
-	// TODO(gvisor.dev/issue/3237): Add cache support:
-	// buffer cache. Ideally we write from src to our buffer cache first.
-	// The slice passed to fs.Write() should be a slice from buffer cache.
-	data := make([]byte, srclen)
-	// Reason for making a copy here: connection.Call() blocks on kerneltask,
-	// which in turn acquires mm.activeMu lock. Functions like CopyInTo() will
-	// attemp to acquire the mm.activeMu lock as well -> deadlock.
-	// We must finish reading from the userspace memory before
-	// t.Block() deactivates it.
-	cp, err := src.CopyIn(ctx, data)
-	if err != nil {
-		return 0, offset, err
-	}
-	if int64(cp) != srclen {
-		return 0, offset, linuxerr.EIO
-	}
-
-	n, err := fd.inode().fs.Write(ctx, fd, uint64(offset), uint32(srclen), data)
-	if err != nil {
-		return 0, offset, err
-	}
-
+	n, offset, err := inode.fs.Write(ctx, fd, offset, src)
 	if n == 0 {
 		// We have checked srclen != 0 previously.
 		// If err == nil, then it's a short write and we return EIO.
 		return 0, offset, linuxerr.EIO
 	}
 
-	written = int64(n)
-	finalOff = offset + written
-
-	if finalOff > int64(inode.size.Load()) {
-		inode.size.Store(uint64(finalOff))
+	if offset > int64(inode.size.Load()) {
+		inode.size.Store(uint64(offset))
 		inode.fs.conn.attributeVersion.Add(1)
 	}
+	inode.touchCMtime()
+	return n, offset, err
+}
 
-	return
+// ConfigureMMap implements vfs.FileDescriptionImpl.ConfigureMMap.
+func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
+	return linuxerr.ENOSYS
+}
+
+// AddMapping implements memmap.Mappable.AddMapping.
+func (fd *regularFileFD) AddMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) error {
+	return linuxerr.ENOSYS
+}
+
+// RemoveMapping implements memmap.Mappable.RemoveMapping.
+func (fd *regularFileFD) RemoveMapping(ctx context.Context, ms memmap.MappingSpace, ar hostarch.AddrRange, offset uint64, writable bool) {
+}
+
+// CopyMapping implements memmap.Mappable.CopyMapping.
+func (fd *regularFileFD) CopyMapping(ctx context.Context, ms memmap.MappingSpace, srcAR, dstAR hostarch.AddrRange, offset uint64, writable bool) error {
+	return linuxerr.ENOSYS
+}
+
+// Translate implements memmap.Mappable.Translate.
+func (fd *regularFileFD) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	return nil, linuxerr.ENOSYS
+}
+
+// InvalidateUnsavable implements memmap.Mappable.InvalidateUnsavable.
+func (fd *regularFileFD) InvalidateUnsavable(ctx context.Context) error {
+	return linuxerr.ENOSYS
 }

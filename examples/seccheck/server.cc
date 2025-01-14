@@ -27,11 +27,13 @@
 #include <vector>
 
 #include "absl/cleanup/cleanup.h"
+#include "absl/strings/str_replace.h"
 #include "absl/strings/string_view.h"
 #include "pkg/sentry/seccheck/points/common.pb.h"
 #include "pkg/sentry/seccheck/points/container.pb.h"
 #include "pkg/sentry/seccheck/points/sentry.pb.h"
 #include "pkg/sentry/seccheck/points/syscall.pb.h"
+#include "google/protobuf/text_format.h"
 
 typedef std::function<void(absl::string_view buf)> Callback;
 
@@ -57,14 +59,22 @@ void log(const char* fmt, ...) {
 }
 
 template <class T>
+std::string shortfmt(T msg) {
+  std::string short_text_msg;
+  google::protobuf::TextFormat::PrintToString(msg, &short_text_msg);
+  return absl::StrReplaceAll(short_text_msg,
+                             {{"\r\n", " "}, {"\n", " "}, {"\r", " "}});
+}
+
+template <class T>
 void unpackSyscall(absl::string_view buf) {
   T evt;
   if (!evt.ParseFromArray(buf.data(), buf.size())) {
     err(1, "ParseFromString(): %.*s", static_cast<int>(buf.size()), buf.data());
   }
-  log("%s %s %s\n", evt.has_exit() ? "X" : "E",
-      evt.GetMetadata().descriptor->name().c_str(),
-      evt.ShortDebugString().c_str());
+  absl::string_view name = evt.GetDescriptor()->name();
+  log("%s %.*s %s\n", evt.has_exit() ? "X" : "E", static_cast<int>(name.size()),
+      name.data(), shortfmt(evt).c_str());
 }
 
 template <class T>
@@ -73,8 +83,9 @@ void unpack(absl::string_view buf) {
   if (!evt.ParseFromArray(buf.data(), buf.size())) {
     err(1, "ParseFromString(): %.*s", static_cast<int>(buf.size()), buf.data());
   }
-  log("%s => %s\n", evt.GetMetadata().descriptor->name().c_str(),
-      evt.ShortDebugString().c_str());
+  absl::string_view name = evt.GetDescriptor()->name();
+  log("%.*s => %s\n", static_cast<int>(name.size()), name.data(),
+      shortfmt(evt).c_str());
 }
 
 // List of dispatchers indexed based on MessageType enum values.
@@ -95,6 +106,25 @@ std::vector<Callback> dispatchers = {
     unpackSyscall<::gvisor::syscall::Chdir>,
     unpackSyscall<::gvisor::syscall::Setid>,
     unpackSyscall<::gvisor::syscall::Setresid>,
+    unpackSyscall<::gvisor::syscall::Dup>,
+    unpackSyscall<::gvisor::syscall::Prlimit>,
+    unpackSyscall<::gvisor::syscall::Pipe>,
+    unpackSyscall<::gvisor::syscall::Fcntl>,
+    unpackSyscall<::gvisor::syscall::Signalfd>,
+    unpackSyscall<::gvisor::syscall::Eventfd>,
+    unpackSyscall<::gvisor::syscall::Chroot>,
+    unpackSyscall<::gvisor::syscall::Clone>,
+    unpackSyscall<::gvisor::syscall::Bind>,
+    unpackSyscall<::gvisor::syscall::Accept>,
+    unpackSyscall<::gvisor::syscall::TimerfdCreate>,
+    unpackSyscall<::gvisor::syscall::TimerfdSetTime>,
+    unpackSyscall<::gvisor::syscall::TimerfdGetTime>,
+    unpackSyscall<::gvisor::syscall::Fork>,
+    unpackSyscall<::gvisor::syscall::InotifyInit>,
+    unpackSyscall<::gvisor::syscall::InotifyAddWatch>,
+    unpackSyscall<::gvisor::syscall::InotifyRmWatch>,
+    unpackSyscall<::gvisor::syscall::SocketPair>,
+    unpackSyscall<::gvisor::syscall::Write>,
 };
 
 void unpack(absl::string_view buf) {
@@ -185,7 +215,7 @@ bool handshake(int client_fd) {
   if (bytes < 0) {
     printf("Error receiving handshake message: %d\n", errno);
     return false;
-  } else if (bytes == buf.size()) {
+  } else if (bytes == (int)buf.size()) {
     // Protect against the handshake becoming larger than the buffer allocated
     // for it.
     printf("handshake message too big\n");
@@ -212,7 +242,7 @@ bool handshake(int client_fd) {
   return true;
 }
 
-extern "C" int main(int argc, char** argv) {
+int main(int argc, char** argv) {
   for (int c = 0; (c = getopt(argc, argv, "q")) != -1;) {
     switch (c) {
       case 'q':

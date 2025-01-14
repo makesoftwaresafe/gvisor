@@ -66,7 +66,6 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -76,7 +75,6 @@ import (
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/buildssa"
 	"golang.org/x/tools/go/ssa"
-	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/tools/nogo/flags"
 )
 
@@ -176,7 +174,7 @@ type objdumpAnalyzer struct {
 }
 
 // Run implements nogo.binaryAnalyzer.Run.
-func (ob *objdumpAnalyzer) Run(pass *analysis.Pass, binary io.Reader) (interface{}, error) {
+func (ob *objdumpAnalyzer) Run(pass *analysis.Pass, binary io.Reader) (any, error) {
 	return run(pass, binary)
 }
 
@@ -341,7 +339,7 @@ func (es *Escapes) Reportf(pass *analysis.Pass) {
 			fmt.Fprintf(&b, "→ %s ", cs.Resolved.String())
 		}
 		fmt.Fprintf(&b, "→ %s", es.Details[r])
-		pass.Reportf(es.CallSites[r][0].LocalPos, b.String())
+		pass.Reportf(es.CallSites[r][0].LocalPos, "%s", b.String())
 	}
 }
 
@@ -375,13 +373,13 @@ func loadObjdump(binary io.Reader) (finalResults map[string][]string, finalErr e
 	if ok {
 		// Ensure that the file is seekable and that the offset is
 		// zero, since we can't control that.
-		if offset, err := input.Seek(0, os.SEEK_CUR); err != nil || offset != 0 {
+		if offset, err := input.Seek(0, io.SeekCurrent); err != nil || offset != 0 {
 			ok = false // Not usable.
 		}
 	}
 	if !ok {
 		// Copy to a temporary path.
-		f, err := ioutil.TempFile("", "")
+		f, err := os.CreateTemp("", "")
 		if err != nil {
 			return nil, fmt.Errorf("unable to create temp file: %w", err)
 		}
@@ -652,14 +650,11 @@ func findReasons(pass *analysis.Pass, fdecl *ast.FuncDecl) ([]EscapeReason, bool
 }
 
 // run performs the analysis.
-func run(pass *analysis.Pass, binary io.Reader) (interface{}, error) {
+func run(pass *analysis.Pass, binary io.Reader) (any, error) {
+	// Note that if this analysis fails, then we don't actually
+	// fail the analyzer itself. We simply report every possible
+	// escape. In most cases this will work just fine.
 	calls, callsErr := loadObjdump(binary)
-	if callsErr != nil {
-		// Note that if this analysis fails, then we don't actually
-		// fail the analyzer itself. We simply report every possible
-		// escape. In most cases this will work just fine.
-		log.Warningf("unable to load objdump: %v", callsErr)
-	}
 	allEscapes := make(map[string][]Escapes)
 	mergedEscapes := make(map[string]Escapes)
 	linePosition := func(inst, parent poser) LinePosition {
@@ -934,7 +929,7 @@ func run(pass *analysis.Pass, binary io.Reader) (interface{}, error) {
 			}
 			for reason, local := range testReasons {
 				// We didn't find the escapes we wanted.
-				pass.Reportf(fdecl.Pos(), fmt.Sprintf("testescapes not found: reason=%s, local=%t", reason, local))
+				pass.Reportf(fdecl.Pos(), "%s", fmt.Sprintf("testescapes not found: reason=%s, local=%t", reason, local))
 			}
 			if len(testReasons) > 0 {
 				// Report for debugging.

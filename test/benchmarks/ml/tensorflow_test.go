@@ -21,13 +21,22 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
+
+func BenchmarkTensorflowDashboard(b *testing.B) {
+	workloads := map[string]string{
+		"ConvolutionalNetwork": "3_NeuralNetworks/convolutional_network.py",
+		"LogisticRegression":   "2_BasicModels/logistic_regression.py",
+		"NeuralNetwork":        "3_NeuralNetworks/neural_network.py",
+	}
+	doTensorflowTest(b, workloads)
+}
 
 // BenchmarkTensorflow runs workloads from a TensorFlow tutorial.
 // See: https://github.com/aymericdamien/TensorFlow-Examples
 func BenchmarkTensorflow(b *testing.B) {
 	workloads := map[string]string{
-		"GradientDecisionTree": "2_BasicModels/gradient_boosted_decision_tree.py",
 		"Kmeans":               "2_BasicModels/kmeans.py",
 		"LogisticRegression":   "2_BasicModels/logistic_regression.py",
 		"NearestNeighbor":      "2_BasicModels/nearest_neighbor.py",
@@ -36,14 +45,17 @@ func BenchmarkTensorflow(b *testing.B) {
 		"MultilayerPerceptron": "3_NeuralNetworks/multilayer_perceptron.py",
 		"NeuralNetwork":        "3_NeuralNetworks/neural_network.py",
 	}
+	doTensorflowTest(b, workloads)
+}
 
+func doTensorflowTest(b *testing.B, workloads map[string]string) {
 	machine, err := harness.GetMachine()
 	if err != nil {
 		b.Fatalf("failed to get machine: %v", err)
 	}
 	defer machine.CleanUp()
 
-	for name, workload := range workloads {
+	for name, file := range workloads {
 		runName, err := tools.ParametersToName(tools.Parameter{
 			Name:  "operation",
 			Value: name,
@@ -59,22 +71,27 @@ func BenchmarkTensorflow(b *testing.B) {
 			b.StopTimer()
 
 			for i := 0; i < b.N; i++ {
-				container := machine.GetContainer(ctx, b)
-				defer container.CleanUp(ctx)
-				if err := harness.DropCaches(machine); err != nil {
-					b.Skipf("failed to drop caches: %v. You probably need root.", err)
-				}
+				func() {
+					container := machine.GetContainer(ctx, b)
+					defer container.CleanUp(ctx)
+					if i == 0 {
+						defer metricsviz.FromContainerLogs(ctx, b, container)
+					}
+					if err := harness.DropCaches(machine); err != nil {
+						b.Skipf("failed to drop caches: %v. You probably need root.", err)
+					}
 
-				// Run tensorflow.
-				b.StartTimer()
-				if out, err := container.Run(ctx, dockerutil.RunOpts{
-					Image:   "benchmarks/tensorflow",
-					Env:     []string{"PYTHONPATH=$PYTHONPATH:/TensorFlow-Examples/examples"},
-					WorkDir: "/TensorFlow-Examples/examples",
-				}, "python", workload); err != nil {
-					b.Errorf("failed to run container: %v logs: %s", err, out)
-				}
-				b.StopTimer()
+					// Run tensorflow.
+					b.StartTimer()
+					if out, err := container.Run(ctx, dockerutil.RunOpts{
+						Image:   "benchmarks/tensorflow",
+						Env:     []string{"PYTHONPATH=$PYTHONPATH:/TensorFlow-Examples/examples"},
+						WorkDir: "/TensorFlow-Examples/examples",
+					}, "python", file); err != nil {
+						b.Errorf("failed to run container: %v logs: %s", err, out)
+					}
+					b.StopTimer()
+				}()
 			}
 		})
 	}

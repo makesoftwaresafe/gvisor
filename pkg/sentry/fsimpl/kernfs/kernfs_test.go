@@ -53,7 +53,7 @@ func newTestSystem(t *testing.T, rootFn RootDentryFn) *testutil.System {
 	v.MustRegisterFilesystemType("testfs", &fsType{rootFn: rootFn}, &vfs.RegisterFilesystemTypeOptions{
 		AllowUserMount: true,
 	})
-	mns, err := v.NewMountNamespace(ctx, creds, "", "testfs", &vfs.MountOptions{})
+	mns, err := v.NewMountNamespace(ctx, creds, "", "testfs", &vfs.MountOptions{}, nil)
 	if err != nil {
 		t.Fatalf("Failed to create testfs root mount: %v", err)
 	}
@@ -104,9 +104,12 @@ type readonlyDir struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNoStatFS
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 }
@@ -138,10 +141,13 @@ type dir struct {
 	dirRefs
 	attrs
 	kernfs.InodeAlwaysValid
-	kernfs.InodeNotSymlink
 	kernfs.InodeNoStatFS
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 

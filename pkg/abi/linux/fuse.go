@@ -15,6 +15,8 @@
 package linux
 
 import (
+	"time"
+
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 )
 
@@ -77,6 +79,7 @@ const (
 	FUSE_POLL         = 40
 	FUSE_NOTIFY_REPLY = 41
 	FUSE_BATCH_FORGET = 42
+	FUSE_FALLOCATE    = 43
 )
 
 const (
@@ -88,6 +91,7 @@ const (
 // FUSEHeaderIn is the header read by the daemon with each request.
 //
 // +marshal
+// +stateify savable
 type FUSEHeaderIn struct {
 	// Len specifies the total length of the data, including this header.
 	Len uint32
@@ -113,11 +117,15 @@ type FUSEHeaderIn struct {
 	_ uint32
 }
 
+// SizeOfFUSEHeaderIn is the size of the FUSEHeaderIn struct.
+var SizeOfFUSEHeaderIn = uint32((*FUSEHeaderIn)(nil).SizeBytes())
+
 // FUSEHeaderOut is the header written by the daemon when it processes
 // a request and wants to send a reply (almost all operations require a
 // reply; if they do not, this will be explicitly documented).
 //
 // +marshal
+// +stateify savable
 type FUSEHeaderOut struct {
 	// Len specifies the total length of the data, including this header.
 	Len uint32
@@ -129,8 +137,11 @@ type FUSEHeaderOut struct {
 	Unique FUSEOpID
 }
 
+// SizeOfFUSEHeaderOut is the size of the FUSEHeaderOut struct.
+var SizeOfFUSEHeaderOut = uint32((*FUSEHeaderOut)(nil).SizeBytes())
+
 // FUSE_INIT flags, consistent with the ones in include/uapi/linux/fuse.h.
-// Our taget version is 7.23 but we have few implemented in advance.
+// Our target version is 7.23 but we have few implemented in advance.
 const (
 	FUSE_ASYNC_READ       = 1 << 0
 	FUSE_POSIX_LOCKS      = 1 << 1
@@ -290,7 +301,7 @@ type FUSEGetAttrIn struct {
 	Fh uint64
 }
 
-// FUSEAttr is the struct used in the reponse FUSEGetAttrOut.
+// FUSEAttr is the struct used in the response FUSEGetAttrOut.
 //
 // +marshal
 type FUSEAttr struct {
@@ -342,11 +353,29 @@ type FUSEAttr struct {
 	_ uint32
 }
 
-// FUSEGetAttrOut is the reply sent by the daemon to the kernel
-// for FUSEGetAttrIn.
+// ATimeNsec returns the last access time as the total time since the unix epoch
+// in nanoseconds.
+func (a FUSEAttr) ATimeNsec() int64 {
+	return int64(a.Atime)*time.Second.Nanoseconds() + int64(a.AtimeNsec)
+}
+
+// MTimeNsec returns the last modification time as the total time since the unix
+// epoch in nanoseconds.
+func (a FUSEAttr) MTimeNsec() int64 {
+	return int64(a.Mtime)*time.Second.Nanoseconds() + int64(a.MtimeNsec)
+}
+
+// CTimeNsec returns the last change time as the total time since the unix epoch
+// in nanoseconds.
+func (a FUSEAttr) CTimeNsec() int64 {
+	return int64(a.Ctime)*time.Second.Nanoseconds() + int64(a.CtimeNsec)
+}
+
+// FUSEAttrOut is the reply sent by the daemon to the kernel
+// for FUSEGetAttrIn and FUSESetAttrIn.
 //
 // +marshal
-type FUSEGetAttrOut struct {
+type FUSEAttrOut struct {
 	// AttrValid and AttrValidNsec describe the attribute cache duration
 	AttrValid uint64
 
@@ -442,7 +471,7 @@ const MAX_NON_LFS = ((1 << 31) - 1)
 const (
 	// FOPEN_DIRECT_IO indicates bypassing page cache for this opened file.
 	FOPEN_DIRECT_IO = 1 << 0
-	// FOPEN_KEEP_CACHE avoids invalidate of data cache on open.
+	// FOPEN_KEEP_CACHE avoids invalidating the data cache on open.
 	FOPEN_KEEP_CACHE = 1 << 1
 	// FOPEN_NONSEEKABLE indicates the file cannot be seeked.
 	FOPEN_NONSEEKABLE = 1 << 2
@@ -464,10 +493,10 @@ type FUSEOpenIn struct {
 //
 // +marshal
 type FUSEOpenOut struct {
-	// Fh is the file handler for opened file.
+	// Fh is the file handler for opened files.
 	Fh uint64
 
-	// OpenFlag for the opened file.
+	// OpenFlag for the opened files.
 	OpenFlag uint32
 
 	_ uint32
@@ -544,6 +573,9 @@ type FUSEWriteIn struct {
 
 	_ uint32
 }
+
+// SizeOfFUSEWriteIn is the size of the FUSEWriteIn struct.
+var SizeOfFUSEWriteIn = uint32((*FUSEWriteIn)(nil).SizeBytes())
 
 // FUSEWritePayloadIn combines header - FUSEWriteIn and payload
 // in a single marshallable struct when sending request by the
@@ -651,7 +683,7 @@ func (r *FUSERenameIn) SizeBytes() int {
 //
 // +marshal dynamic
 type FUSECreateIn struct {
-	// CreateMeta contains mode, rdev and umash field for FUSE_MKNODS.
+	// CreateMeta contains mode, rdev and umash fields for FUSE_MKNODS.
 	CreateMeta FUSECreateMeta
 
 	// Name is the name of the node to create.
@@ -696,7 +728,7 @@ type FUSEMknodMeta struct {
 //
 // +marshal dynamic
 type FUSEMknodIn struct {
-	// MknodMeta contains mode, rdev and umash field for FUSE_MKNODS.
+	// MknodMeta contains mode, rdev and umash fields for FUSE_MKNODS.
 	MknodMeta FUSEMknodMeta
 	// Name is the name of the node to create.
 	Name CString
@@ -744,6 +776,32 @@ func (r *FUSESymlinkIn) UnmarshalBytes(buf []byte) []byte {
 // SizeBytes implements marshal.Marshallable.SizeBytes.
 func (r *FUSESymlinkIn) SizeBytes() int {
 	return r.Name.SizeBytes() + r.Target.SizeBytes()
+}
+
+// FUSELinkIn is the request sent by the kernel to create a hard link.
+//
+// +marshal dynamic
+type FUSELinkIn struct {
+	// OldNodeID is the ID of the inode that is being linked to.
+	OldNodeID primitive.Uint64
+	// Name of the new hard link to create.
+	Name CString
+}
+
+// MarshalBytes implements marshal.Marshallable.MarshalBytes.
+func (r *FUSELinkIn) MarshalBytes(buf []byte) []byte {
+	buf = r.OldNodeID.MarshalBytes(buf)
+	return r.Name.MarshalBytes(buf)
+}
+
+// UnmarshalBytes implements marshal.Marshallable.UnmarshalBytes.
+func (r *FUSELinkIn) UnmarshalBytes(buf []byte) []byte {
+	panic("Unimplemented, FUSELinkIn is never unmarshalled")
+}
+
+// SizeBytes implements marshal.Marshallable.SizeBytes.
+func (r *FUSELinkIn) SizeBytes() int {
+	return r.OldNodeID.SizeBytes() + r.Name.SizeBytes()
 }
 
 // FUSEEmptyIn is used by operations without request body.
@@ -929,7 +987,7 @@ func (r *FUSEDirent) shiftNextDirent(buf []byte) []byte {
 func (r *FUSEDirent) UnmarshalBytes(src []byte) []byte {
 	srcP := r.Meta.UnmarshalBytes(src)
 
-	if r.Meta.NameLen > FUSE_NAME_MAX {
+	if r.Meta.NameLen > FUSE_NAME_MAX || r.Meta.NameLen > uint32(len(srcP)) {
 		// The name is too long and therefore invalid. We don't
 		// need to unmarshal the name since it'll be thrown away.
 		return r.shiftNextDirent(src)
@@ -1044,4 +1102,38 @@ type FUSEFsyncIn struct {
 
 	// padding
 	_ uint32
+}
+
+// FUSEAccessIn is the request sent by the kernel to the daemon when checking
+// permissions on a file.
+//
+// +marshal
+type FUSEAccessIn struct {
+	Mask uint32
+	// padding
+	_ uint32
+}
+
+// FUSEFallocateIn is the request sent by the kernel to the daemon to perform
+// a fallocate operation.
+//
+// +marshal
+type FUSEFallocateIn struct {
+	Fh     uint64
+	Offset uint64
+	Length uint64
+	Mode   uint32
+	// padding
+	_ uint32
+}
+
+// FUSEFlushIn is the request sent by the kernel to the daemon after a file is
+// closed.
+//
+// +marshal
+type FUSEFlushIn struct {
+	Fh        uint64
+	_         uint32 // unused
+	_         uint32 // padding
+	LockOwner uint64
 }

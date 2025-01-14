@@ -27,6 +27,7 @@
 #include "absl/strings/string_view.h"
 #include "test/syscalls/linux/unix_domain_socket_test_util.h"
 #include "test/util/capability_util.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -75,6 +76,8 @@ TEST_P(AllSocketPairTest, BasicSendmmsg) {
   char sent_data[200];
   RandomizeBuffer(sent_data, sizeof(sent_data));
 
+  // TODO(b/323000153): Flaky with S/R.
+  gvisor::testing::DisableSave ds;
   std::vector<struct mmsghdr> msgs(10);
   std::vector<struct iovec> iovs(msgs.size());
   const int chunk_size = sizeof(sent_data) / msgs.size();
@@ -334,7 +337,7 @@ TEST_P(AllSocketPairTest, RecvmmsgInvalidTimeout) {
 TEST_P(AllSocketPairTest, RecvmmsgTimeoutBeforeRecv) {
   // There is a known bug in the Linux recvmmsg(2) causing it to block forever
   // if the timeout expires while blocking for the first message.
-  SKIP_IF(!IsRunningOnGvisor());
+  SKIP_IF(!IsRunningOnGvisor() || IsRunningWithHostinet());
 
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
   char buf[10];
@@ -409,6 +412,10 @@ TEST_P(AllSocketPairTest, RcvBufSucceeds) {
 // Check that setting SO_RCVBUFFORCE above max is not clamped to the maximum
 // receive buffer size.
 TEST_P(AllSocketPairTest, SetSocketRecvBufForceAboveMax) {
+  // TODO(b/267210840): This test requires CAP_NET_ADMIN on the host to run,
+  // which we do not have in some test environments.
+  SKIP_IF(IsRunningWithHostinet());
+
   std::unique_ptr<SocketPair> sockets =
       ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
@@ -823,7 +830,7 @@ TEST_P(AllSocketPairTest, RecvTimeoutWaitAll) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
   struct timeval tv {
-    .tv_sec = 0, .tv_usec = 200000  // 200ms
+    .tv_sec = 1, .tv_usec = 0
   };
   EXPECT_THAT(setsockopt(sockets->second_fd(), SOL_SOCKET, SO_RCVTIMEO, &tv,
                          sizeof(tv)),
@@ -928,8 +935,8 @@ TEST_P(AllSocketPairTest, SetAndGetBooleanSocketOptions) {
 }
 
 TEST_P(AllSocketPairTest, GetSocketOutOfBandInlineOption) {
-  // We do not support disabling this option. It is always enabled.
-  SKIP_IF(!IsRunningOnGvisor());
+  // gVisor does not support this option, unless using Hostinet.
+  SKIP_IF(!IsRunningOnGvisor() || IsRunningWithHostinet());
 
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
   int enable = -1;
@@ -958,7 +965,7 @@ TEST_P(AllSocketPairTest, GetSocketRcvbufOption) {
       SyscallSucceeds());
   ASSERT_EQ(opt_len, sizeof(opt));
 
-  if (IsRunningOnGvisor()) {
+  if (IsRunningOnGvisor() && !IsRunningWithHostinet()) {
     // Minimum buffer size in gVisor is 4KiB.
     const int minRcvBufSizeGvisor = 4096;
     EXPECT_EQ(opt, minRcvBufSizeGvisor);
@@ -991,7 +998,7 @@ TEST_P(AllSocketPairTest, GetSetSocketRcvlowatOption) {
       SyscallSucceeds());
   ASSERT_EQ(opt_len, sizeof(opt));
 
-  if (IsRunningOnGvisor()) {
+  if (IsRunningOnGvisor() && !IsRunningWithHostinet()) {
     // TODO(b/226603727): Add support for setting SO_RCVLOWAT option in gVisor.
     EXPECT_EQ(opt, defaultSz);
   } else {

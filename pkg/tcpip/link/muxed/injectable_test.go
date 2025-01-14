@@ -23,17 +23,31 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
+func TestInjectableEndpointMTU(t *testing.T) {
+	endpoint, _, _ := makeTestInjectableEndpoint(t)
+
+	mtus := []uint32{100, 200}
+	for _, mtu := range mtus {
+		endpoint.SetMTU(mtu)
+
+		if want, v := mtu, endpoint.MTU(); want != v {
+			t.Errorf("MTU() = %v, want %v", v, want)
+		}
+	}
+}
+
 func TestInjectableEndpointRawDispatch(t *testing.T) {
 	endpoint, sock, dstIP := makeTestInjectableEndpoint(t)
 
-	endpoint.InjectOutbound(dstIP, []byte{0xFA})
+	v := buffer.NewViewWithData([]byte{0xFA})
+	defer v.Release()
+	endpoint.InjectOutbound(dstIP, v)
 
 	buf := make([]byte, ipv4.MaxTotalSize)
 	bytesRead, err := sock.Read(buf)
@@ -50,7 +64,7 @@ func TestInjectableEndpointDispatch(t *testing.T) {
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: 1,
-		Payload:            buffer.NewWithData([]byte{0xFB}),
+		Payload:            buffer.MakeWithData([]byte{0xFB}),
 	})
 	defer pkt.DecRef()
 	pkt.TransportHeader().Push(1)[0] = 0xFA
@@ -100,7 +114,7 @@ func TestInjectableEndpointDispatchHdrOnly(t *testing.T) {
 }
 
 func makeTestInjectableEndpoint(t *testing.T) (*InjectableEndpoint, *os.File, tcpip.Address) {
-	dstIP := tcpip.Address(net.ParseIP("1.2.3.4").To4())
+	dstIP := tcpip.AddrFromSlice(net.ParseIP("1.2.3.4").To4())
 	pair, err := unix.Socketpair(unix.AF_UNIX,
 		unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
@@ -118,6 +132,6 @@ func makeTestInjectableEndpoint(t *testing.T) (*InjectableEndpoint, *os.File, tc
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

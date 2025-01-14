@@ -66,8 +66,6 @@ Rules:
 
     *   Itself.
     *   Go standard library.
-        *   Except (transitively) package "net", which would result in a cgo
-            binary. Use `//pkg/unet` instead.
     *   `@org_golang_x_sys//unix:go_default_library` (Go import
         `golang.org/x/sys/unix`).
     *   `@org_golang_x_time//rate:go_default_library` (Go import
@@ -85,6 +83,8 @@ Rules:
         `github.com/google/subcommands`).
     *   `@com_github_opencontainers_runtime_spec//specs_go:go_default_library`
         (Go import `github.com/opencontainers/runtime-spec/specs_go`).
+
+*   For performance reasons, `runsc boot` may not run the `netpoller` goroutine.
 
 ### Code reviews
 
@@ -118,6 +118,25 @@ You may use `make refresh` to refresh the binary after any changes. For example:
 make dev
 docker run --rm --runtime=my-branch --rm hello-world
 make refresh
+```
+
+### Update golang dependencies
+
+First, we need to update dependencies in the go.mod and go.sum files. To do
+that, we should checkout the go branch and update dependencies using the go get
+tool.
+
+```bash
+git checkout origin/go
+go get golang.org/x/net
+```
+
+Next, we should checkout the master branch and update dependencies in the
+WORKSPACE file using the Gazelle tool.
+
+```bash
+git checkout origin/master
+bazel run //:gazelle -- update-repos -from_file=go.mod
 ```
 
 ### The small print

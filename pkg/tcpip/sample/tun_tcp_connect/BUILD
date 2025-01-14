@@ -1,16 +1,19 @@
 load("//tools:defs.bzl", "go_binary")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_binary(
     name = "tun_tcp_connect",
     srcs = ["main.go"],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/rawfile",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/fdbased",
-        "//pkg/tcpip/link/rawfile",
         "//pkg/tcpip/link/sniffer",
         "//pkg/tcpip/link/tun",
         "//pkg/tcpip/network/ipv4",

@@ -18,12 +18,11 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/syserr"
-	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 // connectionlessEndpoint is a unix endpoint for unix sockets that support operating in
-// a connectionless fashon.
+// a connectionless fashion.
 //
 // Specifically, this means datagram unix sockets not created with
 // socketpair(2).
@@ -79,12 +78,12 @@ func (e *connectionlessEndpoint) Close(ctx context.Context) {
 }
 
 // BidirectionalConnect implements BoundEndpoint.BidirectionalConnect.
-func (e *connectionlessEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error {
+func (e *connectionlessEndpoint) BidirectionalConnect(ctx context.Context, ce ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint), opts UnixSocketOpts) *syserr.Error {
 	return syserr.ErrConnectionRefused
 }
 
 // UnidirectionalConnect implements BoundEndpoint.UnidirectionalConnect.
-func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context) (ConnectedEndpoint, *syserr.Error) {
+func (e *connectionlessEndpoint) UnidirectionalConnect(ctx context.Context, opts UnixSocketOpts) (ConnectedEndpoint, *syserr.Error) {
 	e.Lock()
 	r := e.receiver
 	e.Unlock()
@@ -108,14 +107,15 @@ func (e *connectionlessEndpoint) SendMsg(ctx context.Context, data [][]byte, c C
 		return e.baseEndpoint.SendMsg(ctx, data, c, nil)
 	}
 
-	connected, err := to.UnidirectionalConnect(ctx)
+	opts := UnixSocketOpts{}
+	connected, err := to.UnidirectionalConnect(ctx, opts)
 	if err != nil {
 		return 0, nil, syserr.ErrInvalidEndpointState
 	}
 	defer connected.Release(ctx)
 
 	e.Lock()
-	n, notify, err := connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	n, notify, err := connected.Send(ctx, data, c, Address{Addr: e.path})
 	e.Unlock()
 
 	var notifyFn func()
@@ -132,8 +132,8 @@ func (e *connectionlessEndpoint) Type() linux.SockType {
 }
 
 // Connect attempts to connect directly to server.
-func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoint) *syserr.Error {
-	connected, err := server.UnidirectionalConnect(ctx)
+func (e *connectionlessEndpoint) Connect(ctx context.Context, server BoundEndpoint, opts UnixSocketOpts) *syserr.Error {
+	connected, err := server.UnidirectionalConnect(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -154,7 +154,7 @@ func (*connectionlessEndpoint) Listen(context.Context, int) *syserr.Error {
 }
 
 // Accept accepts a new connection.
-func (*connectionlessEndpoint) Accept(context.Context, *tcpip.FullAddress) (Endpoint, *syserr.Error) {
+func (*connectionlessEndpoint) Accept(context.Context, *Address, UnixSocketOpts) (Endpoint, *syserr.Error) {
 	return nil, syserr.ErrNotSupported
 }
 
@@ -166,7 +166,7 @@ func (*connectionlessEndpoint) Accept(context.Context, *tcpip.FullAddress) (Endp
 //
 // Bind will fail only if the socket is connected, bound or the passed address
 // is invalid (the empty string).
-func (e *connectionlessEndpoint) Bind(addr tcpip.FullAddress) *syserr.Error {
+func (e *connectionlessEndpoint) Bind(addr Address) *syserr.Error {
 	e.Lock()
 	defer e.Unlock()
 	if e.isBound() {
@@ -178,7 +178,7 @@ func (e *connectionlessEndpoint) Bind(addr tcpip.FullAddress) *syserr.Error {
 	}
 
 	// Save the bound address.
-	e.path = string(addr.Addr)
+	e.path = addr.Addr
 	return nil
 }
 

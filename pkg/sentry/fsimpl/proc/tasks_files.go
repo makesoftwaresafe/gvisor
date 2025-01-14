@@ -17,6 +17,7 @@ package proc
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"strconv"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -26,7 +27,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/usage"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
@@ -36,7 +37,10 @@ type selfSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	pidns *kernel.PIDNamespace
 }
@@ -77,7 +81,10 @@ type threadSelfSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	pidns *kernel.PIDNamespace
 }
@@ -263,7 +270,7 @@ var _ dynamicInode = (*meminfoData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*meminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	mf := kernel.KernelFromContext(ctx).MemoryFile()
-	_ = mf.UpdateUsage() // Best effort
+	_ = mf.UpdateUsage(nil) // Best effort
 	snapshot, totalUsage := usage.MemoryAccounting.Copy()
 	totalSize := usage.TotalMemory(mf.TotalSize(), totalUsage)
 	anon := snapshot.Anonymous + snapshot.Tmpfs
@@ -317,7 +324,7 @@ var _ dynamicInode = (*uptimeData)(nil)
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (*uptimeData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	k := kernel.KernelFromContext(ctx)
-	now := time.NowFromContext(ctx)
+	now := ktime.NowFromContext(ctx)
 
 	// Pretend that we've spent zero time sleeping (second number).
 	fmt.Fprintf(buf, "%.2f 0.00\n", now.Sub(k.Timekeeper().BootTime()).Seconds())
@@ -417,4 +424,30 @@ func kernelVersion(ctx context.Context) kernel.Version {
 		panic("Attempted to read version before initial Task is available")
 	}
 	return init.Leader().SyscallTable().Version
+}
+
+// sentryMeminfoData implements vfs.DynamicBytesSource for /proc/sentry-meminfo.
+//
+// +stateify savable
+type sentryMeminfoData struct {
+	dynamicBytesFileSetAttr
+}
+
+var _ dynamicInode = (*sentryMeminfoData)(nil)
+
+// Generate implements vfs.DynamicBytesSource.Generate.
+func (*sentryMeminfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	var sentryMeminfo runtime.MemStats
+	runtime.ReadMemStats(&sentryMeminfo)
+
+	fmt.Fprintf(buf, "Alloc:          %8d kB\n", sentryMeminfo.Alloc/1024)
+	fmt.Fprintf(buf, "TotalAlloc:     %8d kB\n", sentryMeminfo.TotalAlloc/1024)
+	fmt.Fprintf(buf, "Sys:            %8d kB\n", sentryMeminfo.Sys/1024)
+	fmt.Fprintf(buf, "Mallocs:        %8d\n", sentryMeminfo.Mallocs)
+	fmt.Fprintf(buf, "Frees:          %8d\n", sentryMeminfo.Frees)
+	fmt.Fprintf(buf, "Live Objects:   %8d\n", sentryMeminfo.Mallocs-sentryMeminfo.Frees)
+	fmt.Fprintf(buf, "HeapAlloc:      %8d kB\n", sentryMeminfo.HeapAlloc/1024)
+	fmt.Fprintf(buf, "HeapSys:        %8d kB\n", sentryMeminfo.HeapSys/1024)
+	fmt.Fprintf(buf, "HeapObjects:    %8d\n", sentryMeminfo.HeapObjects)
+	return nil
 }

@@ -47,10 +47,11 @@ func (e *timeoutError) Temporary() bool { return true }
 // A TCPListener is a wrapper around a TCP tcpip.Endpoint that implements
 // net.Listener.
 type TCPListener struct {
-	stack  *stack.Stack
-	ep     tcpip.Endpoint
-	wq     *waiter.Queue
-	cancel chan struct{}
+	stack      *stack.Stack
+	ep         tcpip.Endpoint
+	wq         *waiter.Queue
+	cancelOnce sync.Once
+	cancel     chan struct{}
 }
 
 // NewTCPListener creates a new TCPListener from a listening tcpip.Endpoint.
@@ -112,7 +113,9 @@ func (l *TCPListener) Close() error {
 // Shutdown stops the HTTP server.
 func (l *TCPListener) Shutdown() {
 	l.ep.Shutdown(tcpip.ShutdownWrite | tcpip.ShutdownRead)
-	close(l.cancel) // broadcast cancellation
+	l.cancelOnce.Do(func() {
+		close(l.cancel) // broadcast cancellation
+	})
 }
 
 // Addr implements net.Listener.Addr.
@@ -176,6 +179,7 @@ func (d *deadlineTimer) setDeadline(cancelCh *chan struct{}, timer **time.Timer,
 	// "A zero value for t means I/O operations will not time out."
 	// - net.Conn.SetDeadline
 	if t.IsZero() {
+		*timer = nil
 		return
 	}
 
@@ -466,11 +470,11 @@ func (c *TCPConn) newOpError(op string, err error) *net.OpError {
 }
 
 func fullToTCPAddr(addr tcpip.FullAddress) *net.TCPAddr {
-	return &net.TCPAddr{IP: net.IP(addr.Addr), Port: int(addr.Port)}
+	return &net.TCPAddr{IP: net.IP(addr.Addr.AsSlice()), Port: int(addr.Port)}
 }
 
 func fullToUDPAddr(addr tcpip.FullAddress) *net.UDPAddr {
-	return &net.UDPAddr{IP: net.IP(addr.Addr), Port: int(addr.Port)}
+	return &net.UDPAddr{IP: net.IP(addr.Addr.AsSlice()), Port: int(addr.Port)}
 }
 
 // DialTCP creates a new TCPConn connected to the specified address.
@@ -543,17 +547,15 @@ func DialContextTCP(ctx context.Context, s *stack.Stack, addr tcpip.FullAddress,
 type UDPConn struct {
 	deadlineTimer
 
-	stack *stack.Stack
-	ep    tcpip.Endpoint
-	wq    *waiter.Queue
+	ep tcpip.Endpoint
+	wq *waiter.Queue
 }
 
 // NewUDPConn creates a new UDPConn.
-func NewUDPConn(s *stack.Stack, wq *waiter.Queue, ep tcpip.Endpoint) *UDPConn {
+func NewUDPConn(wq *waiter.Queue, ep tcpip.Endpoint) *UDPConn {
 	c := &UDPConn{
-		stack: s,
-		ep:    ep,
-		wq:    wq,
+		ep: ep,
+		wq: wq,
 	}
 	c.deadlineTimer.init()
 	return c
@@ -583,7 +585,7 @@ func DialUDP(s *stack.Stack, laddr, raddr *tcpip.FullAddress, network tcpip.Netw
 		}
 	}
 
-	c := NewUDPConn(s, &wq, ep)
+	c := NewUDPConn(&wq, ep)
 
 	if raddr != nil {
 		if err := c.ep.Connect(*raddr); err != nil {
@@ -661,7 +663,7 @@ func (c *UDPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if addr != nil {
 		ua := addr.(*net.UDPAddr)
 		writeOptions.To = &tcpip.FullAddress{
-			Addr: tcpip.Address(ua.IP),
+			Addr: tcpip.AddrFromSlice(ua.IP),
 			Port: uint16(ua.Port),
 		}
 	}

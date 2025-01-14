@@ -83,9 +83,10 @@ func IPv6(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, fragID 
 	//	- Any IPv6 header bytes after the first 40 (i.e. extensions).
 	//	- The transport header, if present.
 	//	- Any other payload data.
-	dataBuf := pkt.Data().AsBuffer()
+	dataBuf := pkt.Data().ToBuffer()
 	dataBuf.TrimFront(header.IPv6MinimumSize)
 	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(ipHdr.NextHeader()), dataBuf)
+	defer it.Release()
 
 	// Iterate over the IPv6 extensions to find their length.
 	var nextHdr tcpip.TransportProtocolNumber
@@ -124,15 +125,18 @@ traverseExtensions:
 			}
 			rawPayload := it.AsRawHeader(true /* consume */)
 			extensionsSize = dataBuf.Size() - rawPayload.Buf.Size()
+			rawPayload.Release()
+			extHdr.Release()
 			break traverseExtensions
 
 		case header.IPv6RawPayloadHeader:
 			// We've found the payload after any extensions.
 			extensionsSize = dataBuf.Size() - extHdr.Buf.Size()
 			nextHdr = tcpip.TransportProtocolNumber(extHdr.Identifier)
+			extHdr.Release()
 			break traverseExtensions
-
 		default:
+			extHdr.Release()
 			// Any other extension is a no-op, keep looping until we find the payload.
 		}
 	}
@@ -211,17 +215,14 @@ func ICMPv6(pkt *stack.PacketBuffer) bool {
 		header.ICMPv6RouterAdvert,
 		header.ICMPv6NeighborSolicit,
 		header.ICMPv6NeighborAdvert,
-		header.ICMPv6RedirectMsg:
+		header.ICMPv6RedirectMsg,
+		header.ICMPv6MulticastListenerQuery,
+		header.ICMPv6MulticastListenerReport,
+		header.ICMPv6MulticastListenerV2Report,
+		header.ICMPv6MulticastListenerDone:
 		size := pkt.Data().Size()
 		if _, ok := pkt.TransportHeader().Consume(size); !ok {
 			panic(fmt.Sprintf("expected to consume the full data of size = %d bytes into transport header", size))
-		}
-	case header.ICMPv6MulticastListenerQuery,
-		header.ICMPv6MulticastListenerReport,
-		header.ICMPv6MulticastListenerDone:
-		size := header.ICMPv6HeaderSize + header.MLDMinimumSize
-		if _, ok := pkt.TransportHeader().Consume(size); !ok {
-			return false
 		}
 	case header.ICMPv6DstUnreachable,
 		header.ICMPv6PacketTooBig,

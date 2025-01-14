@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ipv6",
@@ -20,7 +23,6 @@ go_library(
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
-        "//pkg/tcpip/network/hash",
         "//pkg/tcpip/network/internal/fragmentation",
         "//pkg/tcpip/network/internal/ip",
         "//pkg/tcpip/network/internal/multicast",
@@ -41,9 +43,10 @@ go_test(
     deps = [
         "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
@@ -69,12 +72,12 @@ go_test(
         ":ipv6",
         "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/network/internal/testutil",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",
     ],

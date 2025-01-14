@@ -16,7 +16,6 @@ package utils
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"testing"
@@ -25,7 +24,7 @@ import (
 )
 
 func TestUpdateVolumeAnnotations(t *testing.T) {
-	dir, err := ioutil.TempDir("", "test-update-volume-annotations")
+	dir, err := os.MkdirTemp("", "test-update-volume-annotations")
 	if err != nil {
 		t.Fatalf("create tempdir: %v", err)
 	}
@@ -38,7 +37,7 @@ func TestUpdateVolumeAnnotations(t *testing.T) {
 		testLogDirPath       = "/var/log/pods/testns_testname_" + testPodUID
 		testLegacyLogDirPath = "/var/log/pods/" + testPodUID
 	)
-	testVolumePath := fmt.Sprintf("%s/%s/volumes/kubernetes.io~empty-dir/%s", dir, testPodUID, testVolumeName)
+	testVolumePath := fmt.Sprintf("%s/%s/volumes/%s/%s", dir, testPodUID, emptyDirVolumesDir, testVolumeName)
 
 	if err := os.MkdirAll(testVolumePath, 0755); err != nil {
 		t.Fatalf("Create test volume: %v", err)

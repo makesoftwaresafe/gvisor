@@ -47,19 +47,24 @@ var (
 
 var (
 	tasksStaticFiles = map[string]testutil.DirentType{
-		"cmdline":     linux.DT_REG,
-		"cpuinfo":     linux.DT_REG,
-		"filesystems": linux.DT_REG,
-		"loadavg":     linux.DT_REG,
-		"meminfo":     linux.DT_REG,
-		"mounts":      linux.DT_LNK,
-		"net":         linux.DT_LNK,
-		"self":        linux.DT_LNK,
-		"stat":        linux.DT_REG,
-		"sys":         linux.DT_DIR,
-		"thread-self": linux.DT_LNK,
-		"uptime":      linux.DT_REG,
-		"version":     linux.DT_REG,
+		"bus":            linux.DT_DIR,
+		"cmdline":        linux.DT_REG,
+		"cpuinfo":        linux.DT_REG,
+		"filesystems":    linux.DT_REG,
+		"fs":             linux.DT_DIR,
+		"irq":            linux.DT_DIR,
+		"loadavg":        linux.DT_REG,
+		"meminfo":        linux.DT_REG,
+		"mounts":         linux.DT_LNK,
+		"net":            linux.DT_LNK,
+		"self":           linux.DT_LNK,
+		"sentry-meminfo": linux.DT_REG,
+		"stat":           linux.DT_REG,
+		"sys":            linux.DT_DIR,
+		"sysrq-trigger":  linux.DT_REG,
+		"thread-self":    linux.DT_LNK,
+		"uptime":         linux.DT_REG,
+		"version":        linux.DT_REG,
 	}
 	tasksStaticFilesNextOffs = map[string]int64{
 		"self":        selfLink.NextOff,
@@ -77,6 +82,7 @@ var (
 		"fdinfo":        linux.DT_DIR,
 		"gid_map":       linux.DT_REG,
 		"io":            linux.DT_REG,
+		"limits":        linux.DT_REG,
 		"maps":          linux.DT_REG,
 		"mem":           linux.DT_REG,
 		"mountinfo":     linux.DT_REG,
@@ -85,6 +91,7 @@ var (
 		"ns":            linux.DT_DIR,
 		"oom_score":     linux.DT_REG,
 		"oom_score_adj": linux.DT_REG,
+		"root":          linux.DT_LNK,
 		"smaps":         linux.DT_REG,
 		"stat":          linux.DT_REG,
 		"statm":         linux.DT_REG,
@@ -107,12 +114,11 @@ func setup(t *testing.T) *testutil.System {
 		AllowUserMount: true,
 	})
 
-	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{})
+	mntns, err := k.VFS().NewMountNamespace(ctx, creds, "", tmpfs.Name, &vfs.MountOptions{}, k)
 	if err != nil {
 		t.Fatalf("NewMountNamespace(): %v", err)
 	}
-	root := mntns.Root()
-	root.IncRef()
+	root := mntns.Root(ctx)
 	defer root.DecRef(ctx)
 	pop := &vfs.PathOperation{
 		Root:  root,
@@ -165,7 +171,7 @@ func TestTasks(t *testing.T) {
 	k := kernel.KernelFromContext(s.Ctx)
 	var tasks []*kernel.Task
 	for i := 0; i < 5; i++ {
-		tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+		tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 		task, err := testutil.CreateTask(s.Ctx, fmt.Sprintf("name-%d", i), tc, s.MntNs, s.Root, s.Root)
 		if err != nil {
 			t.Fatalf("CreateTask(): %v", err)
@@ -248,7 +254,7 @@ func TestTasksOffset(t *testing.T) {
 
 	k := kernel.KernelFromContext(s.Ctx)
 	for i := 0; i < 3; i++ {
-		tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+		tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 		if _, err := testutil.CreateTask(s.Ctx, fmt.Sprintf("name-%d", i), tc, s.MntNs, s.Root, s.Root); err != nil {
 			t.Fatalf("CreateTask(): %v", err)
 		}
@@ -373,7 +379,7 @@ func TestTask(t *testing.T) {
 	defer s.Destroy()
 
 	k := kernel.KernelFromContext(s.Ctx)
-	tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 	_, err := testutil.CreateTask(s.Ctx, "name", tc, s.MntNs, s.Root, s.Root)
 	if err != nil {
 		t.Fatalf("CreateTask(): %v", err)
@@ -388,7 +394,7 @@ func TestProcSelf(t *testing.T) {
 	defer s.Destroy()
 
 	k := kernel.KernelFromContext(s.Ctx)
-	tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 	task, err := testutil.CreateTask(s.Ctx, "name", tc, s.MntNs, s.Root, s.Root)
 	if err != nil {
 		t.Fatalf("CreateTask(): %v", err)
@@ -404,8 +410,6 @@ func TestProcSelf(t *testing.T) {
 }
 
 func iterateDir(ctx context.Context, t *testing.T, s *testutil.System, fd *vfs.FileDescription) {
-	t.Logf("Iterating: %s", fd.MappedName(ctx))
-
 	var collector testutil.DirentCollector
 	if err := fd.IterDirents(ctx, &collector); err != nil {
 		t.Fatalf("IterDirents(): %v", err)
@@ -423,20 +427,16 @@ func iterateDir(ctx context.Context, t *testing.T, s *testutil.System, fd *vfs.F
 		}
 		absPath := path.Join(fd.MappedName(ctx), d.Name)
 		if d.Type == linux.DT_LNK {
-			link, err := s.VFS.ReadlinkAt(
+			_, err := s.VFS.ReadlinkAt(
 				ctx,
 				auth.CredentialsFromContext(ctx),
 				&vfs.PathOperation{Root: s.Root, Start: s.Root, Path: fspath.Parse(absPath)},
 			)
 			if err != nil {
 				t.Errorf("vfsfs.ReadlinkAt(%v) failed: %v", absPath, err)
-			} else {
-				t.Logf("Skipping symlink: %s => %s", absPath, link)
 			}
 			continue
 		}
-
-		t.Logf("Opening: %s", absPath)
 		child, err := s.VFS.OpenAt(
 			ctx,
 			auth.CredentialsFromContext(ctx),
@@ -486,13 +486,13 @@ func TestTree(t *testing.T) {
 
 	var tasks []*kernel.Task
 	for i := 0; i < 5; i++ {
-		tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+		tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 		task, err := testutil.CreateTask(s.Ctx, fmt.Sprintf("name-%d", i), tc, s.MntNs, s.Root, s.Root)
 		if err != nil {
 			t.Fatalf("CreateTask(): %v", err)
 		}
 		// Add file to populate /proc/[pid]/fd and fdinfo directories.
-		task.FDTable().NewFDVFS2(task.AsyncContext(), 0, file, kernel.FDFlags{})
+		task.FDTable().NewFD(task.AsyncContext(), 0, file, kernel.FDFlags{})
 		tasks = append(tasks, task)
 	}
 

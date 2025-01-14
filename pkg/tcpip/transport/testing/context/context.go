@@ -24,7 +24,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/time/rate"
 	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
@@ -75,6 +75,10 @@ type Options struct {
 	// HandleLocal specifies if non-loopback interfaces are allowed to loop
 	// packets.
 	HandleLocal bool
+
+	// EnableExperimentIPOption indicates whether the NIC is responsible for
+	// passing the experiment IP option.
+	EnableExperimentIPOption bool
 }
 
 // New allocates and initializes a test context containing a configured stack.
@@ -112,7 +116,7 @@ func NewWithOptions(t *testing.T, transportProtocols []stack.TransportProtocolFa
 	if testing.Verbose() {
 		wep = sniffer.New(ep)
 	}
-	if err := s.CreateNIC(NICID, wep); err != nil {
+	if err := s.CreateNICWithOptions(NICID, wep, stack.NICOptions{Name: "nic1", EnableExperimentIPOption: options.EnableExperimentIPOption}); err != nil {
 		t.Fatalf("CreateNIC(%d, _): %s", NICID, err)
 	}
 
@@ -156,7 +160,9 @@ func (c *Context) Cleanup() {
 	if c.EP != nil {
 		c.EP.Close()
 	}
-	refsvfs2.DoRepeatedLeakCheck()
+	c.Stack.Destroy()
+	c.Stack = nil
+	refs.DoRepeatedLeakCheck()
 }
 
 // CreateEndpoint creates the Context's Endpoint.
@@ -221,7 +227,7 @@ func (c *Context) CheckEndpointWriteStats(incr uint64, want *tcpip.TransportEndp
 		want.WriteErrors.WriteClosed.IncrementBy(incr)
 	case *tcpip.ErrInvalidEndpointState:
 		want.WriteErrors.InvalidEndpointState.IncrementBy(incr)
-	case *tcpip.ErrNoRoute, *tcpip.ErrBroadcastDisabled, *tcpip.ErrNetworkUnreachable:
+	case *tcpip.ErrHostUnreachable, *tcpip.ErrBroadcastDisabled, *tcpip.ErrNetworkUnreachable:
 		want.SendErrors.NoRoute.IncrementBy(incr)
 	default:
 		want.SendErrors.SendToNetworkFailed.IncrementBy(incr)
@@ -253,7 +259,7 @@ func (c *Context) CheckEndpointReadStats(incr uint64, want *tcpip.TransportEndpo
 // InjectPacket injects a packet into the context's link endpoint.
 func (c *Context) InjectPacket(netProto tcpip.NetworkProtocolNumber, buf []byte) {
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData(buf),
+		Payload: buffer.MakeWithData(buf),
 	})
 	defer pkt.DecRef()
 	c.LinkEP.InjectInbound(netProto, pkt)

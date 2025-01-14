@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
+	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
 )
@@ -85,12 +86,12 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 
 	fe := s.FeatureEnable.Word(sysno)
 
-	var straceContext interface{}
+	var straceContext any
 	if bits.IsAnyOn32(fe, StraceEnableBits) {
 		straceContext = s.Stracer.SyscallEnter(t, sysno, args, fe)
 	}
 
-	if seccheck.Global.SyscallEnabled(seccheck.SyscallRawEnter, sysno) {
+	if bits.IsAnyOn32(fe, SecCheckRawEnter) {
 		info := pb.Syscall{
 			Sysno: uint64(sysno),
 			Arg1:  args[0].Uint64(),
@@ -105,11 +106,11 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 			info.ContextData = &pb.ContextData{}
 			LoadSeccheckData(t, fields.Context, info.ContextData)
 		}
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.RawSyscall(t, fields, &info)
 		})
 	}
-	if seccheck.Global.SyscallEnabled(seccheck.SyscallEnter, sysno) {
+	if bits.IsAnyOn32(fe, SecCheckEnter) {
 		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallEnter, sysno))
 		var ctxData *pb.ContextData
 		if !fields.Context.Empty() {
@@ -120,9 +121,9 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 			Sysno: sysno,
 			Args:  args,
 		}
-		cb := t.SyscallTable().LookupSyscallToProto(sysno)
+		cb := s.LookupSyscallToProto(sysno)
 		msg, msgType := cb(t, fields, ctxData, info)
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Syscall(t, fields, ctxData, msgType, msg)
 		})
 	}
@@ -139,7 +140,7 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 		}
 		if fn != nil {
 			// Call our syscall implementation.
-			rval, ctrl, err = fn(t, args)
+			rval, ctrl, err = fn(t, sysno, args)
 		} else {
 			// Use the missing function if not found.
 			rval, err = t.SyscallTable().Missing(t, sysno, args)
@@ -158,7 +159,7 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 		s.Stracer.SyscallExit(straceContext, t, sysno, rval, err)
 	}
 
-	if seccheck.Global.SyscallEnabled(seccheck.SyscallRawExit, sysno) {
+	if bits.IsAnyOn32(fe, SecCheckRawExit) {
 		info := pb.Syscall{
 			Sysno: uint64(sysno),
 			Arg1:  args[0].Uint64(),
@@ -177,11 +178,11 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 			info.ContextData = &pb.ContextData{}
 			LoadSeccheckData(t, fields.Context, info.ContextData)
 		}
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.RawSyscall(t, fields, &info)
 		})
 	}
-	if seccheck.Global.SyscallEnabled(seccheck.SyscallExit, sysno) {
+	if bits.IsAnyOn32(fe, SecCheckExit) {
 		fields := seccheck.Global.GetFieldSet(seccheck.GetPointForSyscall(seccheck.SyscallExit, sysno))
 		var ctxData *pb.ContextData
 		if !fields.Context.Empty() {
@@ -195,9 +196,9 @@ func (t *Task) executeSyscall(sysno uintptr, args arch.SyscallArguments) (rval u
 			Rval:  rval,
 			Errno: ExtractErrno(err, int(sysno)),
 		}
-		cb := t.SyscallTable().LookupSyscallToProto(sysno)
+		cb := s.LookupSyscallToProto(sysno)
 		msg, msgType := cb(t, fields, ctxData, info)
-		seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Syscall(t, fields, ctxData, msgType, msg)
 		})
 	}
@@ -234,7 +235,7 @@ func (t *Task) doSyscall() taskRunState {
 
 	// Check seccomp filters. The nil check is for performance (as seccomp use
 	// is rare), not needed for correctness.
-	if t.syscallFilters.Load() != nil {
+	if t.seccomp.Load() != nil {
 		switch r := t.checkSeccompSyscall(int32(sysno), args, hostarch.Addr(t.Arch().IP())); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("Syscall %d: denied by seccomp", sysno)
@@ -367,7 +368,7 @@ func (*runSyscallExit) execute(t *Task) taskRunState {
 // indicated by an execution fault at address addr. doVsyscall returns the
 // task's next run state.
 func (t *Task) doVsyscall(addr hostarch.Addr, sysno uintptr) taskRunState {
-	metric.WeirdnessMetric.Increment("vsyscall_count")
+	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeVsyscallCount)
 
 	// Grab the caller up front, to make sure there's a sensible stack.
 	caller := t.Arch().Native(uintptr(0))
@@ -382,7 +383,7 @@ func (t *Task) doVsyscall(addr hostarch.Addr, sysno uintptr) taskRunState {
 	// to syscall ABI because they both use RDI, RSI, and RDX for the first three
 	// arguments and none of the vsyscalls uses more than two arguments.
 	args := t.Arch().SyscallArgs()
-	if t.syscallFilters.Load() != nil {
+	if t.seccomp.Load() != nil {
 		switch r := t.checkSeccompSyscall(int32(sysno), args, addr); r {
 		case linux.SECCOMP_RET_ERRNO, linux.SECCOMP_RET_TRAP:
 			t.Debugf("vsyscall %d, caller %x: denied by seccomp", sysno, t.Arch().Value(caller))
@@ -477,6 +478,8 @@ func ExtractErrno(err error, sysno int) int {
 		return ExtractErrno(err.Err, sysno)
 	case *os.SyscallError:
 		return ExtractErrno(err.Err, sysno)
+	case *platform.ContextError:
+		return int(err.Errno)
 	default:
 		if errno, ok := linuxerr.TranslateError(err); ok {
 			return int(linuxerr.ToUnix(errno))

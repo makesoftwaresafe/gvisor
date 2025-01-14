@@ -18,7 +18,6 @@ package transport
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/lisafs"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -88,6 +87,65 @@ func (c *ControlMessages) Release(ctx context.Context) {
 	*c = ControlMessages{}
 }
 
+// RecvArgs are the arguments to Endpoint.RecvMsg and Receiver.Recv.
+type RecvArgs struct {
+	// Creds indicates if credential control messages are requested by the
+	// caller. This is useful for determining if control messages can be
+	// coalesced. Creds is a hint and can be safely ignored by the
+	// implementation if no coalescing is possible. It is fine to return
+	// credential control messages when none were requested or to not
+	// return credential control messages when they were requested.
+	Creds bool
+
+	// NumRights is the number of SCM_RIGHTS FDs requested by the caller.
+	// This is useful if one must allocate a buffer to receive a SCM_RIGHTS
+	// message or determine if control messages can be coalesced. numRights
+	// is a hint and can be safely ignored by the implementation if the
+	// number of available SCM_RIGHTS FDs is known and no coalescing is
+	// possible. It is fine for the returned number of SCM_RIGHTS FDs to be
+	// either higher or lower than the requested number.
+	NumRights int
+
+	// If Peek is true, no data should be consumed from the Endpoint. Any and
+	// all data returned from a peek should be available in the next call to
+	// Recv or RecvMsg.
+	Peek bool
+}
+
+// RecvOutput is the output from Endpoint.RecvMsg and Receiver.Recv.
+type RecvOutput struct {
+	// RecvLen is the number of bytes copied into RecvArgs.Data.
+	RecvLen int64
+
+	// MsgLen is the length of the read message consumed for datagram Endpoints.
+	// MsgLen is always the same as RecvLen for stream Endpoints.
+	MsgLen int64
+
+	// Source is the source address we received from.
+	Source Address
+
+	// Control is the ControlMessages read.
+	Control ControlMessages
+
+	// ControlTrunc indicates that the NumRights hint was used to receive
+	// fewer than the total available SCM_RIGHTS FDs. Additional truncation
+	// may be required by the caller.
+	ControlTrunc bool
+
+	// UnusedRights is a slice of unused RightsControlMessage which should
+	// be Release()d.
+	UnusedRights []RightsControlMessage
+}
+
+// UnixSocketOpts is a container for configuration options for gvisor's management of
+// unix sockets.
+// +stateify savable
+type UnixSocketOpts struct {
+	// If true, the endpoint will be put in a closed state before save; if false, an attempt to save
+	// will throw.
+	DisconnectOnSave bool
+}
+
 // Endpoint is the interface implemented by Unix transport protocol
 // implementations that expose functionality like sendmsg, recvmsg, connect,
 // etc. to Unix socket implementations.
@@ -102,37 +160,8 @@ type Endpoint interface {
 	// RecvMsg reads data and a control message from the endpoint. This method
 	// does not block if there is no data pending.
 	//
-	// creds indicates if credential control messages are requested by the
-	// caller. This is useful for determining if control messages can be
-	// coalesced. creds is a hint and can be safely ignored by the
-	// implementation if no coalescing is possible. It is fine to return
-	// credential control messages when none were requested or to not return
-	// credential control messages when they were requested.
-	//
-	// numRights is the number of SCM_RIGHTS FDs requested by the caller. This
-	// is useful if one must allocate a buffer to receive a SCM_RIGHTS message
-	// or determine if control messages can be coalesced. numRights is a hint
-	// and can be safely ignored by the implementation if the number of
-	// available SCM_RIGHTS FDs is known and no coalescing is possible. It is
-	// fine for the returned number of SCM_RIGHTS FDs to be either higher or
-	// lower than the requested number.
-	//
-	// If peek is true, no data should be consumed from the Endpoint. Any and
-	// all data returned from a peek should be available in the next call to
-	// RecvMsg.
-	//
-	// recvLen is the number of bytes copied into data.
-	//
-	// msgLen is the length of the read message consumed for datagram Endpoints.
-	// msgLen is always the same as recvLen for stream Endpoints.
-	//
-	// CMTruncated indicates that the numRights hint was used to receive fewer
-	// than the total available SCM_RIGHTS FDs. Additional truncation may be
-	// required by the caller.
-	//
-	// If set, notify is a callback that should be called after RecvMesg
-	// completes without mm.activeMu held.
-	RecvMsg(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool, addr *tcpip.FullAddress) (recvLen, msgLen int64, cm ControlMessages, CMTruncated bool, notify func(), err *syserr.Error)
+	// The returned callback should be called if not nil.
+	RecvMsg(ctx context.Context, data [][]byte, args RecvArgs) (RecvOutput, func(), *syserr.Error)
 
 	// SendMsg writes data and a control message to the endpoint's peer.
 	// This method does not block if the data cannot be written.
@@ -149,7 +178,7 @@ type Endpoint interface {
 	// endpoint passed in as a parameter.
 	//
 	// The error codes are the same as Connect.
-	Connect(ctx context.Context, server BoundEndpoint) *syserr.Error
+	Connect(ctx context.Context, server BoundEndpoint, opts UnixSocketOpts) *syserr.Error
 
 	// Shutdown closes the read and/or write end of the endpoint connection
 	// to its peer.
@@ -167,22 +196,22 @@ type Endpoint interface {
 	//
 	// peerAddr if not nil will be populated with the address of the connected
 	// peer on a successful accept.
-	Accept(ctx context.Context, peerAddr *tcpip.FullAddress) (Endpoint, *syserr.Error)
+	Accept(ctx context.Context, peerAddr *Address, opts UnixSocketOpts) (Endpoint, *syserr.Error)
 
 	// Bind binds the endpoint to a specific local address and port.
 	// Specifying a NIC is optional.
-	Bind(address tcpip.FullAddress) *syserr.Error
+	Bind(address Address) *syserr.Error
 
 	// Type return the socket type, typically either SockStream, SockDgram
 	// or SockSeqpacket.
 	Type() linux.SockType
 
 	// GetLocalAddress returns the address to which the endpoint is bound.
-	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
+	GetLocalAddress() (Address, tcpip.Error)
 
 	// GetRemoteAddress returns the address to which the endpoint is
 	// connected.
-	GetRemoteAddress() (tcpip.FullAddress, tcpip.Error)
+	GetRemoteAddress() (Address, tcpip.Error)
 
 	// SetSockOpt sets a socket option.
 	SetSockOpt(opt tcpip.SettableSocketOption) tcpip.Error
@@ -242,7 +271,7 @@ type BoundEndpoint interface {
 	//
 	// This method will return syserr.ErrConnectionRefused on endpoints with a
 	// type that isn't SockStream or SockSeqpacket.
-	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint)) *syserr.Error
+	BidirectionalConnect(ctx context.Context, ep ConnectingEndpoint, returnConnect func(Receiver, ConnectedEndpoint), opts UnixSocketOpts) *syserr.Error
 
 	// UnidirectionalConnect establishes a write-only connection to a unix
 	// endpoint.
@@ -252,7 +281,7 @@ type BoundEndpoint interface {
 	//
 	// This method will return syserr.ErrConnectionRefused on a non-SockDgram
 	// endpoint.
-	UnidirectionalConnect(ctx context.Context) (ConnectedEndpoint, *syserr.Error)
+	UnidirectionalConnect(ctx context.Context, opts UnixSocketOpts) (ConnectedEndpoint, *syserr.Error)
 
 	// Passcred returns whether or not the SO_PASSCRED socket option is
 	// enabled on this end.
@@ -269,9 +298,31 @@ type BoundEndpoint interface {
 // on the host.
 type HostBoundEndpoint interface {
 	// SetBoundSocketFD will be called on supporting endpoints after
-	// binding a socket on the host filesystem. Implementations should use
-	// delegate Listen and Accept calls to the ClientBoundSocketFD.
-	SetBoundSocketFD(*lisafs.ClientBoundSocketFD)
+	// binding a socket on the host filesystem. Implementations should
+	// delegate Listen and Accept calls to the BoundSocketFD. The ownership
+	// of bsFD is transferred to the endpoint.
+	SetBoundSocketFD(ctx context.Context, bsFD BoundSocketFD) error
+
+	// ResetBoundSocketFD cleans up the BoundSocketFD set by the last successful
+	// SetBoundSocketFD call.
+	ResetBoundSocketFD(ctx context.Context)
+}
+
+// BoundSocketFD is an interface that wraps a socket FD that was bind(2)-ed.
+// It allows to listen and accept on that socket.
+type BoundSocketFD interface {
+	// Close closes the socket FD.
+	Close(ctx context.Context)
+
+	// NotificationFD is a host FD that can be used to notify when new clients
+	// connect to the socket.
+	NotificationFD() int32
+
+	// Listen is analogous to listen(2).
+	Listen(ctx context.Context, backlog int32) error
+
+	// Accept is analogous to accept(2).
+	Accept(ctx context.Context) (int, error)
 }
 
 // message represents a message passed over a Unix domain socket.
@@ -291,7 +342,7 @@ type message struct {
 	//
 	// If the endpoint that sent the message is not bound, the Address is
 	// the empty string.
-	Address tcpip.FullAddress
+	Address Address
 }
 
 // Length returns number of bytes stored in the message.
@@ -320,10 +371,8 @@ func (m *message) Truncate(n int64) {
 type Receiver interface {
 	// Recv receives a single message. This method does not block.
 	//
-	// See Endpoint.RecvMsg for documentation on shared arguments.
-	//
 	// notify indicates if RecvNotify should be called.
-	Recv(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool) (recvLen, msgLen int64, cm ControlMessages, CMTruncated bool, source tcpip.FullAddress, notify bool, err *syserr.Error)
+	Recv(ctx context.Context, data [][]byte, args RecvArgs) (out RecvOutput, notify bool, err *syserr.Error)
 
 	// RecvNotify notifies the Receiver of a successful Recv. This must not be
 	// called while holding any endpoint locks.
@@ -337,6 +386,9 @@ type Receiver interface {
 	// CloseNotify notifies the Receiver of recv being closed. This must not be
 	// called while holding any endpoint locks.
 	CloseNotify()
+
+	// IsRecvClosed returns true if reception of additional messages is closed.
+	IsRecvClosed() bool
 
 	// Readable returns if messages should be attempted to be received. This
 	// includes when read has been shutdown.
@@ -355,6 +407,13 @@ type Receiver interface {
 	Release(ctx context.Context)
 }
 
+// Address is a unix socket address.
+//
+// +stateify savable
+type Address struct {
+	Addr string
+}
+
 // queueReceiver implements Receiver for datagram sockets.
 //
 // +stateify savable
@@ -363,17 +422,17 @@ type queueReceiver struct {
 }
 
 // Recv implements Receiver.Recv.
-func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool) (int64, int64, ControlMessages, bool, tcpip.FullAddress, bool, *syserr.Error) {
+func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, args RecvArgs) (RecvOutput, bool, *syserr.Error) {
 	var m *message
 	var notify bool
 	var err *syserr.Error
-	if peek {
+	if args.Peek {
 		m, err = q.readQueue.Peek()
 	} else {
 		m, notify, err = q.readQueue.Dequeue()
 	}
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, tcpip.FullAddress{}, false, err
+		return RecvOutput{}, false, err
 	}
 	src := []byte(m.Data)
 	var copied int64
@@ -382,7 +441,13 @@ func (q *queueReceiver) Recv(ctx context.Context, data [][]byte, creds bool, num
 		copied += int64(n)
 		src = src[n:]
 	}
-	return copied, int64(len(m.Data)), m.Control, false, m.Address, notify, nil
+	out := RecvOutput{
+		RecvLen: copied,
+		MsgLen:  int64(len(m.Data)),
+		Control: m.Control,
+		Source:  m.Address,
+	}
+	return out, notify, nil
 }
 
 // RecvNotify implements Receiver.RecvNotify.
@@ -399,6 +464,11 @@ func (q *queueReceiver) CloseNotify() {
 // CloseRecv implements Receiver.CloseRecv.
 func (q *queueReceiver) CloseRecv() {
 	q.readQueue.Close()
+}
+
+// IsRecvClosed implements Receiver.IsRecvClosed.
+func (q *queueReceiver) IsRecvClosed() bool {
+	return q.readQueue.isClosed()
 }
 
 // Readable implements Receiver.Readable.
@@ -430,7 +500,7 @@ type streamQueueReceiver struct {
 	mu      streamQueueReceiverMutex `state:"nosave"`
 	buffer  []byte
 	control ControlMessages
-	addr    tcpip.FullAddress
+	addr    Address
 }
 
 func vecCopy(data [][]byte, buf []byte) (int64, [][]byte, []byte) {
@@ -475,7 +545,7 @@ func (q *streamQueueReceiver) RecvMaxQueueSize() int64 {
 }
 
 // Recv implements Receiver.Recv.
-func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds bool, numRights int, peek bool) (int64, int64, ControlMessages, bool, tcpip.FullAddress, bool, *syserr.Error) {
+func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, args RecvArgs) (RecvOutput, bool, *syserr.Error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -488,7 +558,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 		// the next time Recv() is called.
 		m, n, err := q.readQueue.Dequeue()
 		if err != nil {
-			return 0, 0, ControlMessages{}, false, tcpip.FullAddress{}, false, err
+			return RecvOutput{}, false, err
 		}
 		notify = n
 		q.buffer = []byte(m.Data)
@@ -497,14 +567,20 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 	}
 
 	var copied int64
-	if peek {
+	if args.Peek {
 		// Don't consume control message if we are peeking.
 		c := q.control.Clone()
 
 		// Don't consume data since we are peeking.
 		copied, _, _ = vecCopy(data, q.buffer)
 
-		return copied, copied, c, false, q.addr, notify, nil
+		out := RecvOutput{
+			RecvLen: copied,
+			MsgLen:  copied,
+			Control: c,
+			Source:  q.addr,
+		}
+		return out, notify, nil
 	}
 
 	// Consume data and control message since we are not peeking.
@@ -515,15 +591,16 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 
 	// Remove rights from q.control and leave behind just the creds.
 	q.control.Rights = nil
-	if !wantCreds {
+	if !args.Creds {
 		c.Credentials = nil
 	}
 
-	var cmTruncated bool
-	if c.Rights != nil && numRights == 0 {
-		c.Rights.Release(ctx)
+	var out RecvOutput
+	if c.Rights != nil && args.NumRights == 0 {
+		// We won't use these rights.
+		out.UnusedRights = append(out.UnusedRights, c.Rights)
 		c.Rights = nil
-		cmTruncated = true
+		out.ControlTrunc = true
 	}
 
 	haveRights := c.Rights != nil
@@ -546,7 +623,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 		q.control = m.Control
 		q.addr = m.Address
 
-		if wantCreds {
+		if args.Creds {
 			if (q.control.Credentials == nil) != (c.Credentials == nil) {
 				// One message has credentials, the other does not.
 				break
@@ -558,7 +635,7 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 			}
 		}
 
-		if numRights != 0 && c.Rights != nil && q.control.Rights != nil {
+		if args.NumRights != 0 && c.Rights != nil && q.control.Rights != nil {
 			// Both messages have rights.
 			break
 		}
@@ -574,9 +651,9 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 
 		if q.control.Rights != nil {
 			// Consume rights.
-			if numRights == 0 {
-				cmTruncated = true
-				q.control.Rights.Release(ctx)
+			if args.NumRights == 0 {
+				out.ControlTrunc = true
+				out.UnusedRights = append(out.UnusedRights, q.control.Rights)
 			} else {
 				c.Rights = q.control.Rights
 				haveRights = true
@@ -584,7 +661,12 @@ func (q *streamQueueReceiver) Recv(ctx context.Context, data [][]byte, wantCreds
 			q.control.Rights = nil
 		}
 	}
-	return copied, copied, c, cmTruncated, q.addr, notify, nil
+
+	out.MsgLen = copied
+	out.RecvLen = copied
+	out.Source = q.addr
+	out.Control = c
+	return out, notify, nil
 }
 
 // Release implements Receiver.Release.
@@ -599,7 +681,7 @@ type ConnectedEndpoint interface {
 	Passcred() bool
 
 	// GetLocalAddress implements Endpoint.GetLocalAddress.
-	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
+	GetLocalAddress() (Address, tcpip.Error)
 
 	// Send sends a single message. This method does not block.
 	//
@@ -607,7 +689,7 @@ type ConnectedEndpoint interface {
 	//
 	// syserr.ErrWouldBlock can be returned along with a partial write if
 	// the caller should block to send the rest of the data.
-	Send(ctx context.Context, data [][]byte, c ControlMessages, from tcpip.FullAddress) (n int64, notify bool, err *syserr.Error)
+	Send(ctx context.Context, data [][]byte, c ControlMessages, from Address) (n int64, notify bool, err *syserr.Error)
 
 	// SendNotify notifies the ConnectedEndpoint of a successful Send. This
 	// must not be called while holding any endpoint locks.
@@ -621,6 +703,9 @@ type ConnectedEndpoint interface {
 	// CloseNotify notifies the ConnectedEndpoint of send being closed. This
 	// must not be called while holding any endpoint locks.
 	CloseNotify()
+
+	// IsSendClosed returns true if transmission of additional messages is closed.
+	IsSendClosed() bool
 
 	// Writable returns if messages should be attempted to be sent. This
 	// includes when write has been shutdown.
@@ -663,7 +748,7 @@ type connectedEndpoint struct {
 		Passcred() bool
 
 		// GetLocalAddress implements Endpoint.GetLocalAddress.
-		GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
+		GetLocalAddress() (Address, tcpip.Error)
 
 		// Type implements Endpoint.Type.
 		Type() linux.SockType
@@ -678,12 +763,12 @@ func (e *connectedEndpoint) Passcred() bool {
 }
 
 // GetLocalAddress implements ConnectedEndpoint.GetLocalAddress.
-func (e *connectedEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
+func (e *connectedEndpoint) GetLocalAddress() (Address, tcpip.Error) {
 	return e.endpoint.GetLocalAddress()
 }
 
 // Send implements ConnectedEndpoint.Send.
-func (e *connectedEndpoint) Send(ctx context.Context, data [][]byte, c ControlMessages, from tcpip.FullAddress) (int64, bool, *syserr.Error) {
+func (e *connectedEndpoint) Send(ctx context.Context, data [][]byte, c ControlMessages, from Address) (int64, bool, *syserr.Error) {
 	discardEmpty := false
 	truncate := false
 	if e.endpoint.Type() == linux.SOCK_STREAM {
@@ -715,6 +800,11 @@ func (e *connectedEndpoint) CloseNotify() {
 // CloseSend implements ConnectedEndpoint.CloseSend.
 func (e *connectedEndpoint) CloseSend() {
 	e.writeQueue.Close()
+}
+
+// IsSendClosed implements ConnectedEndpoint.IsSendClosed.
+func (e *connectedEndpoint) IsSendClosed() bool {
+	return e.writeQueue.isClosed()
 }
 
 // Writable implements ConnectedEndpoint.Writable.
@@ -831,30 +921,25 @@ func (e *baseEndpoint) Connected() bool {
 }
 
 // RecvMsg reads data and a control message from the endpoint.
-func (e *baseEndpoint) RecvMsg(ctx context.Context, data [][]byte, creds bool, numRights int, peek bool, addr *tcpip.FullAddress) (int64, int64, ControlMessages, bool, func(), *syserr.Error) {
+func (e *baseEndpoint) RecvMsg(ctx context.Context, data [][]byte, args RecvArgs) (RecvOutput, func(), *syserr.Error) {
 	e.Lock()
-
 	receiver := e.receiver
-	if receiver == nil {
-		e.Unlock()
-		return 0, 0, ControlMessages{}, false, nil, syserr.ErrNotConnected
-	}
-
-	recvLen, msgLen, cms, cmt, a, notify, err := receiver.Recv(ctx, data, creds, numRights, peek)
 	e.Unlock()
+
+	if receiver == nil {
+		return RecvOutput{}, nil, syserr.ErrNotConnected
+	}
+
+	out, notify, err := receiver.Recv(ctx, data, args)
 	if err != nil {
-		return 0, 0, ControlMessages{}, false, nil, err
+		return RecvOutput{}, nil, err
 	}
 
-	var notifyFn func()
 	if notify {
-		notifyFn = receiver.RecvNotify
+		return out, receiver.RecvNotify, nil
 	}
 
-	if addr != nil {
-		*addr = a
-	}
-	return recvLen, msgLen, cms, cmt, notifyFn, nil
+	return out, nil, nil
 }
 
 // SendMsg writes data and a control message to the endpoint's peer.
@@ -871,7 +956,7 @@ func (e *baseEndpoint) SendMsg(ctx context.Context, data [][]byte, c ControlMess
 	}
 
 	connected := e.connected
-	n, notify, err := connected.Send(ctx, data, c, tcpip.FullAddress{Addr: tcpip.Address(e.path)})
+	n, notify, err := connected.Send(ctx, data, c, Address{Addr: e.path})
 	e.Unlock()
 
 	var notifyFn func()
@@ -978,22 +1063,22 @@ func (e *baseEndpoint) Shutdown(flags tcpip.ShutdownFlags) *syserr.Error {
 }
 
 // GetLocalAddress returns the bound path.
-func (e *baseEndpoint) GetLocalAddress() (tcpip.FullAddress, tcpip.Error) {
+func (e *baseEndpoint) GetLocalAddress() (Address, tcpip.Error) {
 	e.Lock()
 	defer e.Unlock()
-	return tcpip.FullAddress{Addr: tcpip.Address(e.path)}, nil
+	return Address{Addr: e.path}, nil
 }
 
 // GetRemoteAddress returns the local address of the connected endpoint (if
 // available).
-func (e *baseEndpoint) GetRemoteAddress() (tcpip.FullAddress, tcpip.Error) {
+func (e *baseEndpoint) GetRemoteAddress() (Address, tcpip.Error) {
 	e.Lock()
 	c := e.connected
 	e.Unlock()
 	if c != nil {
 		return c.GetLocalAddress()
 	}
-	return tcpip.FullAddress{}, &tcpip.ErrNotConnected{}
+	return Address{}, &tcpip.ErrNotConnected{}
 }
 
 // Release implements BoundEndpoint.Release.
@@ -1007,7 +1092,7 @@ type stackHandler struct {
 }
 
 // Option implements tcpip.StackHandler.
-func (h *stackHandler) Option(option interface{}) tcpip.Error {
+func (h *stackHandler) Option(option any) tcpip.Error {
 	panic("unimplemented")
 }
 

@@ -22,7 +22,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
@@ -188,6 +188,11 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 			fd.impl.UnlockBSD(context.Background(), fd)
 		}
 
+		// Unlock any OFD locks.
+		if fd.impl.SupportsLocks() {
+			fd.impl.UnlockPOSIX(ctx, fd, lock.LockRange{0, lock.LockEOF})
+		}
+
 		// Release implementation resources.
 		fd.impl.Release(ctx)
 		if fd.writable {
@@ -196,7 +201,7 @@ func (fd *FileDescription) DecRef(ctx context.Context) {
 		fd.vd.DecRef(ctx)
 		fd.flagsMu.Lock()
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 && fd.asyncHandler != nil {
-			fd.asyncHandler.Unregister(fd)
+			fd.impl.UnregisterFileAsyncHandler(fd)
 		}
 		fd.asyncHandler = nil
 		fd.flagsMu.Unlock()
@@ -276,19 +281,19 @@ func (fd *FileDescription) SetStatusFlags(ctx context.Context, creds *auth.Crede
 	// TODO(gvisor.dev/issue/1035): FileDescriptionImpl.SetOAsync()?
 	const settableFlags = linux.O_APPEND | linux.O_ASYNC | linux.O_DIRECT | linux.O_NOATIME | linux.O_NONBLOCK
 	fd.flagsMu.Lock()
+	defer fd.flagsMu.Unlock()
 	if fd.asyncHandler != nil {
 		// Use fd.statusFlags instead of oldFlags, which may have become outdated,
 		// to avoid double registering/unregistering.
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC == 0 && flags&linux.O_ASYNC != 0 {
-			if err := fd.asyncHandler.Register(fd); err != nil {
+			if err := fd.impl.RegisterFileAsyncHandler(fd); err != nil {
 				return err
 			}
 		} else if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 && flags&linux.O_ASYNC == 0 {
-			fd.asyncHandler.Unregister(fd)
+			fd.impl.UnregisterFileAsyncHandler(fd)
 		}
 	}
 	fd.statusFlags.Store((oldFlags &^ settableFlags) | (flags & settableFlags))
-	fd.flagsMu.Unlock()
 	return nil
 }
 
@@ -329,6 +334,9 @@ type FileDescriptionImpl interface {
 	OnClose(ctx context.Context) error
 
 	// Stat returns metadata for the file represented by the FileDescription.
+	//
+	// If opts.Sync == linux.AT_STATX_SYNC_DONT_SYNC, Stat cannot take locks
+	// preceding memmap.MappingIdentity locks.
 	Stat(ctx context.Context, opts StatOptions) (linux.Statx, error)
 
 	// SetStat updates metadata for the file represented by the
@@ -441,7 +449,7 @@ type FileDescriptionImpl interface {
 	ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error
 
 	// Ioctl implements the ioctl(2) syscall.
-	Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error)
+	Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error)
 
 	// ListXattr returns all extended attribute names for the file.
 	ListXattr(ctx context.Context, size uint64) ([]string, error)
@@ -474,6 +482,9 @@ type FileDescriptionImpl interface {
 
 	// TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
 	TestPOSIX(ctx context.Context, uid lock.UniqueID, t lock.LockType, r lock.LockRange) (linux.Flock, error)
+
+	RegisterFileAsyncHandler(fd *FileDescription) error
+	UnregisterFileAsyncHandler(fd *FileDescription)
 }
 
 // Dirent holds the information contained in struct linux_dirent64.
@@ -548,7 +559,13 @@ func (fd *FileDescription) SetStat(ctx context.Context, opts SetStatOptions) err
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.SetStat(ctx, opts)
+	if err := fd.impl.SetStat(ctx, opts); err != nil {
+		return err
+	}
+	if ev := InotifyEventFromStatMask(opts.Stat.Mask); ev != 0 {
+		fd.Dentry().InotifyWithParent(ctx, ev, 0, InodeEvent)
+	}
+	return nil
 }
 
 // StatFS returns metadata for the filesystem containing the file represented
@@ -673,6 +690,7 @@ func (fd *FileDescription) Write(ctx context.Context, src usermem.IOSequence, op
 // IterDirents has been called since the last call to Seek, it continues
 // iteration from the end of the last call.
 func (fd *FileDescription) IterDirents(ctx context.Context, cb IterDirentsCallback) error {
+	defer fd.Dentry().InotifyWithParent(ctx, linux.IN_ACCESS, 0, PathEvent)
 	return fd.impl.IterDirents(ctx, cb)
 }
 
@@ -693,8 +711,8 @@ func (fd *FileDescription) ConfigureMMap(ctx context.Context, opts *memmap.MMapO
 }
 
 // Ioctl implements the ioctl(2) syscall.
-func (fd *FileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
-	return fd.impl.Ioctl(ctx, uio, args)
+func (fd *FileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
+	return fd.impl.Ioctl(ctx, uio, sysno, args)
 }
 
 // ListXattr returns all extended attribute names for the file represented by
@@ -760,7 +778,11 @@ func (fd *FileDescription) SetXattr(ctx context.Context, opts *SetXattrOptions) 
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.SetXattr(ctx, *opts)
+	if err := fd.impl.SetXattr(ctx, *opts); err != nil {
+		return err
+	}
+	fd.Dentry().InotifyWithParent(ctx, linux.IN_ATTRIB, 0, InodeEvent)
+	return nil
 }
 
 // RemoveXattr removes the given extended attribute from the file represented
@@ -776,7 +798,11 @@ func (fd *FileDescription) RemoveXattr(ctx context.Context, name string) error {
 		rp.Release(ctx)
 		return err
 	}
-	return fd.impl.RemoveXattr(ctx, name)
+	if err := fd.impl.RemoveXattr(ctx, name); err != nil {
+		return err
+	}
+	fd.Dentry().InotifyWithParent(ctx, linux.IN_ATTRIB, 0, InodeEvent)
+	return nil
 }
 
 // SyncFS instructs the filesystem containing fd to execute the semantics of
@@ -887,6 +913,22 @@ func (fd *FileDescription) ComputeLockRange(ctx context.Context, start uint64, l
 	return lock.ComputeRange(int64(start), int64(length), off)
 }
 
+// ReadFull read all contents from the file.
+func (fd *FileDescription) ReadFull(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
+	var total int64
+	for dst.NumBytes() > 0 {
+		n, err := fd.PRead(ctx, dst, offset+total, ReadOptions{})
+		total += n
+		if err == io.EOF && total != 0 {
+			return total, io.ErrUnexpectedEOF
+		} else if err != nil {
+			return total, err
+		}
+		dst = dst.DropFirst64(n)
+	}
+	return total, nil
+}
+
 // A FileAsync sends signals to its owner when w is ready for IO. This is only
 // implemented by pkg/sentry/fasync:FileAsync, but we unfortunately need this
 // interface to avoid circular dependencies.
@@ -910,7 +952,7 @@ func (fd *FileDescription) SetAsyncHandler(newHandler func() FileAsync) (FileAsy
 	if fd.asyncHandler == nil {
 		fd.asyncHandler = newHandler()
 		if fd.statusFlags.RacyLoad()&linux.O_ASYNC != 0 {
-			if err := fd.asyncHandler.Register(fd); err != nil {
+			if err := fd.impl.RegisterFileAsyncHandler(fd); err != nil {
 				return nil, err
 			}
 		}

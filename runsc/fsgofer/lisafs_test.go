@@ -28,7 +28,7 @@ import (
 
 func init() {
 	log.SetLevel(log.Debug)
-	if err := fsgofer.OpenProcSelfFD(); err != nil {
+	if err := fsgofer.OpenProcSelfFD("/proc/self/fd"); err != nil {
 		panic(err)
 	}
 }
@@ -38,7 +38,7 @@ type tester struct{}
 
 // NewServer implements testsuite.Tester.NewServer.
 func (tester) NewServer(t *testing.T) *lisafs.Server {
-	return &fsgofer.NewLisafsServer(fsgofer.Config{HostUDS: true}).Server
+	return &fsgofer.NewLisafsServer(fsgofer.Config{}).Server
 }
 
 // LinkSupported implements testsuite.Tester.LinkSupported.
@@ -49,6 +49,13 @@ func (tester) LinkSupported() bool {
 // SetUserGroupIDSupported implements testsuite.Tester.SetUserGroupIDSupported.
 func (tester) SetUserGroupIDSupported() bool {
 	return true
+}
+
+// BindSupported implements testsuite.Tester.BindSupported.
+func (tester) BindSupported() bool {
+	// In some test environments, the mount path is really large and bind(2)
+	// fails with EINVAL if the path length >= 108.
+	return false
 }
 
 func TestFSGofer(t *testing.T) {

@@ -16,6 +16,7 @@ package tcpip
 
 import (
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -62,6 +63,10 @@ type SocketOptionsHandler interface {
 	// changed. The handler notifies the writers if the send buffer size is
 	// increased with setsockopt(2) for TCP endpoints.
 	WakeupWriters()
+
+	// GetAcceptConn returns true if the socket is a TCP socket and is in
+	// listening state.
+	GetAcceptConn() bool
 }
 
 // DefaultSocketOptionsHandler is an embeddable type that implements no-op
@@ -111,11 +116,16 @@ func (*DefaultSocketOptionsHandler) OnSetReceiveBufferSize(v, oldSz int64) (newS
 	return v, nil
 }
 
+// GetAcceptConn implements SocketOptionsHandler.GetAcceptConn.
+func (*DefaultSocketOptionsHandler) GetAcceptConn() bool {
+	return false
+}
+
 // StackHandler holds methods to access the stack options. These must be
 // implemented by the stack.
 type StackHandler interface {
 	// Option allows retrieving stack wide options.
-	Option(option interface{}) Error
+	Option(option any) Error
 
 	// TransportProtocolOption allows retrieving individual protocol level
 	// option values.
@@ -253,6 +263,10 @@ type SocketOptions struct {
 	// rcvlowat specifies the minimum number of bytes which should be
 	// received to indicate the socket as readable.
 	rcvlowat atomicbitops.Int32
+
+	// experimentOptionValue is the value set for the IP option experiment header
+	// if it is not zero.
+	experimentOptionValue atomicbitops.Uint32
 }
 
 // InitHandler initializes the handler. This must be called before using the
@@ -529,6 +543,17 @@ func (so *SocketOptions) SetLinger(linger LingerOption) {
 	so.mu.Unlock()
 }
 
+// GetExperimentOptionValue gets value for the experiment IP option header.
+func (so *SocketOptions) GetExperimentOptionValue() uint16 {
+	v := so.experimentOptionValue.Load()
+	return uint16(v)
+}
+
+// SetExperimentOptionValue sets the value for the experiment IP option header.
+func (so *SocketOptions) SetExperimentOptionValue(v uint16) {
+	so.experimentOptionValue.Store(uint32(v))
+}
+
 // SockErrOrigin represents the constants for error origin.
 type SockErrOrigin uint8
 
@@ -605,7 +630,7 @@ type SockError struct {
 	Cause SockErrorCause
 
 	// Payload is the errant packet's payload.
-	Payload []byte
+	Payload *buffer.View
 	// Dst is the original destination address of the errant packet.
 	Dst FullAddress
 	// Offender is the original sender address of the errant packet.
@@ -652,7 +677,7 @@ func (so *SocketOptions) QueueErr(err *SockError) {
 }
 
 // QueueLocalErr queues a local error onto the local queue.
-func (so *SocketOptions) QueueLocalErr(err Error, net NetworkProtocolNumber, info uint32, dst FullAddress, payload []byte) {
+func (so *SocketOptions) QueueLocalErr(err Error, net NetworkProtocolNumber, info uint32, dst FullAddress, payload *buffer.View) {
 	so.QueueErr(&SockError{
 		Err:      err,
 		Cause:    &LocalSockError{info: info},
@@ -740,4 +765,9 @@ func (so *SocketOptions) GetRcvlowat() int32 {
 func (so *SocketOptions) SetRcvlowat(rcvlowat int32) Error {
 	so.rcvlowat.Store(rcvlowat)
 	return nil
+}
+
+// GetAcceptConn gets value for SO_ACCEPTCONN option.
+func (so *SocketOptions) GetAcceptConn() bool {
+	return so.handler.GetAcceptConn()
 }

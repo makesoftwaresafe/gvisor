@@ -58,7 +58,7 @@ package gvisor.common;
 // Note that addition of new message types do not require version changes.
 // Server implementations should gracefully handle messages that it doesn't
 // understand. Similarly, payload for message can change following protobuf
-// rules for compatibilty. For example, adding new fields to a protobuf type
+// rules for compatibility. For example, adding new fields to a protobuf type
 // doesn't require version bump.
 message Handshake {
   uint32 version = 1;
@@ -113,5 +113,24 @@ enum MessageType {
   MESSAGE_SYSCALL_CHDIR = 13;
   MESSAGE_SYSCALL_SETID = 14;
   MESSAGE_SYSCALL_SETRESID = 15;
+  MESSAGE_SYSCALL_PRLIMIT64 = 16;
+  MESSAGE_SYSCALL_PIPE = 17;
+  MESSAGE_SYSCALL_FCNTL = 18;
+  MESSAGE_SYSCALL_DUP = 19;
+  MESSAGE_SYSCALL_SIGNALFD = 20;
+  MESSAGE_SYSCALL_CHROOT = 21;
+  MESSAGE_SYSCALL_EVENTFD = 22;
+  MESSAGE_SYSCALL_CLONE = 23;
+  MESSAGE_SYSCALL_BIND = 24;
+  MESSAGE_SYSCALL_ACCEPT = 25;
+  MESSAGE_SYSCALL_TIMERFD_CREATE = 26;
+  MESSAGE_SYSCALL_TIMERFD_SETTIME = 27;
+  MESSAGE_SYSCALL_TIMERFD_GETTIME = 28;
+  MESSAGE_SYSCALL_FORK = 29;
+  MESSAGE_SYSCALL_INOTIFY_INIT = 30;
+  MESSAGE_SYSCALL_INOTIFY_ADD_WATCH = 31;
+  MESSAGE_SYSCALL_INOTIFY_RM_WATCH = 32;
+  MESSAGE_SYSCALL_SOCKETPAIR = 33;
+  MESSAGE_SYSCALL_WRITE = 34;
 }
 // LINT.ThenChange(../../../../examples/seccheck/server.cc)

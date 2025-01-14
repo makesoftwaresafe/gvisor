@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "filter",
@@ -8,6 +11,8 @@ go_library(
         "config.go",
         "config_amd64.go",
         "config_arm64.go",
+        "config_cgo.go",
+        "config_profile.go",
         "extra_filters.go",
         "extra_filters_msan.go",
         "extra_filters_race.go",

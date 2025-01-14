@@ -1,5 +1,8 @@
+load("//pkg/sync/locking:locking.bzl", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
+
+package(default_applicable_licenses = ["//:license"])
 
 licenses(["notice"])
 
@@ -8,7 +11,7 @@ go_template_instance(
     out = "fd_dir_inode_refs.go",
     package = "proc",
     prefix = "fdDirInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "fdDirInode",
     },
@@ -19,7 +22,7 @@ go_template_instance(
     out = "fd_info_dir_inode_refs.go",
     package = "proc",
     prefix = "fdInfoDirInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "fdInfoDirInode",
     },
@@ -30,7 +33,7 @@ go_template_instance(
     out = "subtasks_inode_refs.go",
     package = "proc",
     prefix = "subtasksInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "subtasksInode",
     },
@@ -41,7 +44,7 @@ go_template_instance(
     out = "task_inode_refs.go",
     package = "proc",
     prefix = "taskInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "taskInode",
     },
@@ -52,18 +55,27 @@ go_template_instance(
     out = "tasks_inode_refs.go",
     package = "proc",
     prefix = "tasksInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "tasksInode",
     },
 )
 
+declare_rwmutex(
+    name = "dentries_mutex",
+    out = "dentries_mutex.go",
+    package = "proc",
+    prefix = "dentries",
+)
+
 go_library(
     name = "proc",
     srcs = [
+        "dentries_mutex.go",
         "fd_dir_inode_refs.go",
         "fd_info_dir_inode_refs.go",
         "filesystem.go",
+        "proc_impl.go",
         "subtasks.go",
         "subtasks_inode_refs.go",
         "task.go",
@@ -85,16 +97,16 @@ go_library(
         "//pkg/errors/linuxerr",
         "//pkg/hostarch",
         "//pkg/log",
+        "//pkg/rand",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
-        "//pkg/sentry/fs/lock",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/fsimpl/lock",
+        "//pkg/sentry/fsimpl/nsfs",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/mm",
         "//pkg/sentry/socket",
@@ -103,9 +115,11 @@ go_library(
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "//pkg/sync/locking",
         "//pkg/tcpip/header",
         "//pkg/tcpip/network/ipv4",
         "//pkg/usermem",
+        "//pkg/waiter",
     ],
 )
 

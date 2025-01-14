@@ -19,8 +19,6 @@ package testsuite
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"os"
 	"testing"
 	"time"
@@ -30,8 +28,8 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/lisafs"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/unet"
 )
 
@@ -47,12 +45,15 @@ type Tester interface {
 	// SetUserGroupIDSupported returns true if the backing server supports
 	// changing UID/GID for files.
 	SetUserGroupIDSupported() bool
+
+	// BindSupported returns true if the backing server supports BindAt.
+	BindSupported() bool
 }
 
 // RunAllLocalFSTests runs all local FS tests as subtests.
 func RunAllLocalFSTests(t *testing.T, tester Tester) {
 	for name, testFn := range localFSTests {
-		mountPath, err := ioutil.TempDir(os.Getenv("TEST_TMPDIR"), "")
+		mountPath, err := os.MkdirTemp(os.Getenv("TEST_TMPDIR"), "")
 		if err != nil {
 			t.Fatalf("creation of temporary mountpoint failed: %v", err)
 		}
@@ -64,7 +65,7 @@ func RunAllLocalFSTests(t *testing.T, tester Tester) {
 // TestFunc describes the signature of a test method.
 type TestFunc func(context.Context, *testing.T, Tester, lisafs.ClientFD)
 
-var localFSTests map[string]TestFunc = map[string]TestFunc{
+var localFSTests = map[string]TestFunc{
 	"Stat":            testStat,
 	"RegularFileIO":   testRegularFileIO,
 	"RegularFileOpen": testRegularFileOpen,
@@ -77,6 +78,7 @@ var localFSTests map[string]TestFunc = map[string]TestFunc{
 	"Walk":            testWalk,
 	"Rename":          testRename,
 	"Mknod":           testMknod,
+	"UDS":             testUDS,
 	"Getdents":        testGetdents,
 }
 
@@ -100,9 +102,12 @@ func RunTest(t *testing.T, tester Tester, testName string, testFn TestFunc, moun
 	}
 	server.StartConnection(conn)
 
-	c, root, err := lisafs.NewClient(clientSocket)
+	c, root, _, err := lisafs.NewClient(clientSocket)
 	if err != nil {
 		t.Fatalf("client creation failed: %v", err)
+	}
+	if err := c.StartChannels(); err != nil {
+		t.Fatalf("failed to start channels: %v", err)
 	}
 
 	if !root.ControlFD.Ok() {
@@ -119,7 +124,7 @@ func RunTest(t *testing.T, tester Tester, testName string, testFn TestFunc, moun
 	// Release server resources and check for leaks. Note that leak check must
 	// happen before c.Close() because server cleans up resources on shutdown.
 	server.Destroy()
-	refsvfs2.DoRepeatedLeakCheck()
+	refs.DoRepeatedLeakCheck()
 
 	c.Close() // This should trigger client and server shutdown.
 	server.Wait()
@@ -198,6 +203,14 @@ func mknod(ctx context.Context, t *testing.T, dir lisafs.ClientFD, name string) 
 		t.Fatalf("mknod failed: %v", err)
 	}
 	return dir.Client().NewFD(nodeIno.ControlFD), nodeIno.Stat
+}
+
+func bind(ctx context.Context, t *testing.T, dir lisafs.ClientFD, name string, sockType linux.SockType) (lisafs.ClientFD, *lisafs.ClientBoundSocketFD, linux.Statx) {
+	nodeIno, socket, err := dir.BindAt(ctx, sockType, name, 0777, lisafs.UID(unix.Getuid()), lisafs.GID(unix.Getgid()))
+	if err != nil {
+		t.Fatalf("bind failed: %v", err)
+	}
+	return dir.Client().NewFD(nodeIno.ControlFD), socket, nodeIno.Stat
 }
 
 func walk(ctx context.Context, t *testing.T, dir lisafs.ClientFD, names []string) []lisafs.Inode {
@@ -479,7 +492,8 @@ func testHardLink(ctx context.Context, t *testing.T, tester Tester, root lisafs.
 	defer closeFD(ctx, t, fd)
 	defer unix.Close(hostFD)
 
-	link, linkStat := link(ctx, t, root, name, controlFile)
+	linkName := "linkFile"
+	link, linkStat := link(ctx, t, root, linkName, controlFile)
 	defer closeFD(ctx, t, link)
 
 	if linkStat.Ino != fileIno.Ino {
@@ -528,7 +542,7 @@ func testWalk(ctx context.Context, t *testing.T, tester Tester, root lisafs.Clie
 		closeFD(ctx, t, root.Client().NewFD(inode.ControlFD))
 	}
 
-	// Test WalkStat which additonally returns Statx for root because the first
+	// Test WalkStat which additionally returns Statx for root because the first
 	// path component is "".
 	dirNames = append([]string{""}, dirNames...)
 	gotStats := walkStat(ctx, t, root, dirNames)
@@ -563,9 +577,21 @@ func testRename(ctx context.Context, t *testing.T, tester Tester, root lisafs.Cl
 }
 
 func testMknod(ctx context.Context, t *testing.T, tester Tester, root lisafs.ClientFD) {
-	name := "namedPipe"
+	name := "regular-file"
 	pipeFile, pipeStat := mknod(ctx, t, root, name)
 	defer closeFD(ctx, t, pipeFile)
+
+	if got := pipeStat.Mode & unix.S_IFMT; got != unix.S_IFREG {
+		t.Errorf("socket file mode is incorrect: want %#x, got %#x", unix.S_IFSOCK, got)
+	}
+	if tester.SetUserGroupIDSupported() {
+		if want := unix.Getuid(); int(pipeStat.UID) != want {
+			t.Errorf("socket file uid is incorrect: want %d, got %d", want, pipeStat.UID)
+		}
+		if want := unix.Getgid(); int(pipeStat.GID) != want {
+			t.Errorf("socket file gid is incorrect: want %d, got %d", want, pipeStat.GID)
+		}
+	}
 
 	var stat linux.Statx
 	statTo(ctx, t, pipeFile, &stat)
@@ -579,6 +605,43 @@ func testMknod(ctx context.Context, t *testing.T, tester Tester, root lisafs.Cli
 	if stat.GID != pipeStat.GID {
 		t.Errorf("mknod GID is incorrect: want %d, got %d", pipeStat.GID, stat.GID)
 	}
+}
+
+func testUDS(ctx context.Context, t *testing.T, tester Tester, root lisafs.ClientFD) {
+	if !tester.BindSupported() {
+		t.Skipf("server does not support BindAt RPC")
+	}
+	const name = "sock"
+	file, socket, stat := bind(ctx, t, root, name, unix.SOCK_STREAM)
+	defer closeFD(ctx, t, file)
+	defer socket.Close(ctx)
+
+	if got := stat.Mode & unix.S_IFMT; got != unix.S_IFSOCK {
+		t.Errorf("socket file mode is incorrect: want %#x, got %#x", unix.S_IFSOCK, got)
+	}
+	if tester.SetUserGroupIDSupported() {
+		if want := unix.Getuid(); int(stat.UID) != want {
+			t.Errorf("socket file uid is incorrect: want %d, got %d", want, stat.UID)
+		}
+		if want := unix.Getgid(); int(stat.GID) != want {
+			t.Errorf("socket file gid is incorrect: want %d, got %d", want, stat.GID)
+		}
+	}
+
+	var got linux.Statx
+	statTo(ctx, t, file, &got)
+	if stat.Mode != got.Mode {
+		t.Errorf("UDS mode is incorrect: want %d, got %d", stat.Mode, got.Mode)
+	}
+	if stat.UID != got.UID {
+		t.Errorf("mknod UID is incorrect: want %d, got %d", stat.UID, got.UID)
+	}
+	if stat.GID != got.GID {
+		t.Errorf("mknod GID is incorrect: want %d, got %d", stat.GID, got.GID)
+	}
+
+	// TODO(b/194709873): Once listen and accept are implemented, test connecting
+	// and accepting a connection using sockF.
 }
 
 func testGetdents(ctx context.Context, t *testing.T, tester Tester, root lisafs.ClientFD) {

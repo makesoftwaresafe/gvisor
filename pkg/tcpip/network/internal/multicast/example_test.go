@@ -22,7 +22,6 @@ import (
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/network/internal/multicast"
@@ -129,13 +128,13 @@ func deliverPktLocally(*stack.PacketBuffer) {
 
 func newPacketBuffer(body string) *stack.PacketBuffer {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte(body)),
+		Payload: buffer.MakeWithData([]byte(body)),
 	})
 }
 
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

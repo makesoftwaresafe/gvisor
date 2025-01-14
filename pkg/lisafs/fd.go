@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
@@ -38,7 +38,7 @@ func (f FDID) Ok() bool {
 
 // genericFD can represent any type of FD.
 type genericFD interface {
-	refsvfs2.RefCounter
+	refs.RefCounter
 }
 
 // A ControlFD is the gateway to the backing filesystem tree node. It is an
@@ -84,9 +84,9 @@ type ControlFD struct {
 
 var _ genericFD = (*ControlFD)(nil)
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 func (fd *ControlFD) DecRef(context.Context) {
 	fd.controlFDRefs.DecRef(func() {
 		fd.conn.server.renameMu.RLock()
@@ -254,9 +254,9 @@ func (fd *OpenFD) ControlFD() ControlFDImpl {
 	return fd.controlFD.impl
 }
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 func (fd *OpenFD) DecRef(context.Context) {
 	fd.openFDRefs.DecRef(func() {
 		fd.controlFD.openFDsMu.Lock()
@@ -311,9 +311,9 @@ func (fd *BoundSocketFD) ControlFD() ControlFDImpl {
 	return fd.controlFD.impl
 }
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 func (fd *BoundSocketFD) DecRef(context.Context) {
 	fd.boundSocketFDRefs.DecRef(func() {
 		fd.controlFD.DecRef(nil) // Drop the ref on the control FD.
@@ -484,6 +484,13 @@ type ControlFDImpl interface {
 	// On the server, Connect has a read concurrency guarantee.
 	Connect(sockType uint32) (int, error)
 
+	// ConnectWithCreds is a wrapper around Connect but first changes the gofer's
+	// euid and egid to the given uid and gid before calling Connect. It restores
+	// the euid and egid after Connect.
+	//
+	// On the server, ConnectWithCreds has a read concurrency guarantee.
+	ConnectWithCreds(sockType uint32, uid UID, gid GID) (int, error)
+
 	// BindAt creates a host unix domain socket of type sockType, bound to
 	// the given namt of type sockType, bound to the given name. It returns
 	// a ControlFD that can be used for path operations on the socket, a
@@ -492,7 +499,7 @@ type ControlFDImpl interface {
 	// connections).
 	//
 	// On the server, BindAt has a write concurrency guarantee.
-	BindAt(name string, sockType uint32) (*ControlFD, linux.Statx, *BoundSocketFD, int, error)
+	BindAt(name string, sockType uint32, mode linux.FileMode, uid UID, gid GID) (*ControlFD, linux.Statx, *BoundSocketFD, int, error)
 
 	// UnlinkAt the file identified by name in this directory.
 	//
@@ -574,7 +581,7 @@ type OpenFDImpl interface {
 	// On the server, Stat has a read concurrency guarantee.
 	Stat() (linux.Statx, error)
 
-	// Sync is simialr to fsync(2).
+	// Sync is similar to fsync(2).
 	//
 	// On the server, Sync has a read concurrency guarantee.
 	Sync() error

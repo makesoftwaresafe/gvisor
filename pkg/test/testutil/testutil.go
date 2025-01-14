@@ -23,10 +23,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/exec"
@@ -41,6 +39,7 @@ import (
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/rand"
 	"gvisor.dev/gvisor/pkg/sentry/watchdog"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/runsc/config"
@@ -49,14 +48,36 @@ import (
 )
 
 var (
-	checkpoint           = flag.Bool("checkpoint", boolFromEnv("CHECKPOINT", true), "control checkpoint/restore support")
-	partition            = flag.Int("partition", intFromEnv("PARTITION", 1), "partition number, this is 1-indexed")
-	totalPartitions      = flag.Int("total_partitions", intFromEnv("TOTAL_PARTITIONS", 1), "total number of partitions")
-	isRunningWithHostNet = flag.Bool("hostnet", boolFromEnv("HOSTNET", false), "whether test is running with hostnet")
-	runscPath            = flag.String("runsc", os.Getenv("RUNTIME"), "path to runsc binary")
+	partition       = flag.Int("partition", IntFromEnv("PARTITION", 1), "partition number, this is 1-indexed")
+	totalPartitions = flag.Int("total_partitions", IntFromEnv("TOTAL_PARTITIONS", 1), "total number of partitions")
+	runscPath       = flag.String("runsc", os.Getenv("RUNTIME"), "path to runsc binary")
+
+	// Flags controlling features for sandbox under test, prefixed with
+	// "test-" to avoid potential conflicts with runsc flags.
+	checkpointSupported              = flag.Bool("test-checkpoint", BoolFromEnv("TEST_CHECKPOINT", true), "control checkpoint/restore support")
+	isRunningWithOverlay             = flag.Bool("test-overlay", BoolFromEnv("TEST_OVERLAY", false), "whether test is running with --overlay2")
+	isRunningWithNetRaw              = flag.Bool("test-net-raw", BoolFromEnv("TEST_NET_RAW", false), "whether test is running with raw socket support")
+	isRunningWithHostNet             = flag.Bool("test-hostnet", BoolFromEnv("TEST_HOSTNET", false), "whether test is running with hostnet")
+	isRunningWithSaveRestoreNetstack = flag.Bool("test-save-restore-netstack", BoolFromEnv("TEST_SAVE_RESTORE_NETSTACK", false), "whether test is running with --TESTONLY-save-restore-netstack")
+	// TestEnvSupportsNetAdmin indicates whether a test sandbox can perform
+	// all net admin tasks. Note that some test environments cannot perform
+	// some tasks despite the presence of CAP_NET_ADMIN.
+	TestEnvSupportsNetAdmin = true
 )
 
-func intFromEnv(name string, def int) int {
+// StringFromEnv returns the value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func StringFromEnv(name, def string) string {
+	str := os.Getenv(name)
+	if str == "" {
+		return def
+	}
+	return str
+}
+
+// IntFromEnv returns the integer value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func IntFromEnv(name string, def int) int {
 	str := os.Getenv(name)
 	if str == "" {
 		return def
@@ -69,7 +90,9 @@ func intFromEnv(name string, def int) int {
 	return int(v)
 }
 
-func boolFromEnv(name string, def bool) bool {
+// BoolFromEnv returns the boolean value of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func BoolFromEnv(name string, def bool) bool {
 	str := strings.ToLower(os.Getenv(name))
 	if str == "" {
 		return def
@@ -81,14 +104,43 @@ func boolFromEnv(name string, def bool) bool {
 	return v
 }
 
+// DurationFromEnv returns the duration of the named environment variable, or `def` if unset/empty.
+// It is useful for defining flags where the default value can be specified through the environment.
+func DurationFromEnv(name string, def time.Duration) time.Duration {
+	str := strings.ToLower(os.Getenv(name))
+	if str == "" {
+		return def
+	}
+	d, err := time.ParseDuration(str)
+	if err != nil {
+		panic(fmt.Errorf("invalid environment variable %q; got %q expected duration: %w", name, str, err))
+	}
+	return d
+}
+
 // IsCheckpointSupported returns the relevant command line flag.
 func IsCheckpointSupported() bool {
-	return *checkpoint
+	return *checkpointSupported
 }
 
 // IsRunningWithHostNet returns the relevant command line flag.
 func IsRunningWithHostNet() bool {
 	return *isRunningWithHostNet
+}
+
+// IsRunningWithNetRaw returns the relevant command line flag.
+func IsRunningWithNetRaw() bool {
+	return *isRunningWithNetRaw
+}
+
+// IsRunningWithOverlay returns the relevant command line flag.
+func IsRunningWithOverlay() bool {
+	return *isRunningWithOverlay
+}
+
+// IsRunningWithSaveRestoreNetstack returns the relevant command line flag.
+func IsRunningWithSaveRestoreNetstack() bool {
+	return *isRunningWithSaveRestoreNetstack
 }
 
 // ImageByName mangles the image name used locally. This depends on the image
@@ -124,7 +176,7 @@ func TmpDir() string {
 // This is designed to be implemented by *testing.T.
 type Logger interface {
 	Name() string
-	Logf(fmt string, args ...interface{})
+	Logf(fmt string, args ...any)
 }
 
 // DefaultLogger logs using the log package.
@@ -136,7 +188,7 @@ func (d DefaultLogger) Name() string {
 }
 
 // Logf implements Logger.Logf.
-func (d DefaultLogger) Logf(fmt string, args ...interface{}) {
+func (d DefaultLogger) Logf(fmt string, args ...any) {
 	log.Printf(fmt, args...)
 }
 
@@ -153,7 +205,7 @@ func (m multiLogger) Name() string {
 }
 
 // Logf implements Logger.Logf.
-func (m multiLogger) Logf(fmt string, args ...interface{}) {
+func (m multiLogger) Logf(fmt string, args ...any) {
 	for _, l := range m {
 		l.Logf(fmt, args...)
 	}
@@ -207,7 +259,7 @@ func TestConfig(t *testing.T) *config.Config {
 	}
 	// Change test defaults.
 	conf.Debug = true
-	conf.DebugLog = path.Join(logDir, "runsc.log."+t.Name()+".%TIMESTAMP%.%COMMAND%")
+	conf.DebugLog = path.Join(logDir, "runsc.log."+t.Name()+".%TIMESTAMP%.%COMMAND%.txt")
 	conf.LogPackets = true
 	conf.Network = config.NetworkNone
 	conf.Strace = true
@@ -242,7 +294,7 @@ func NewSpecWithArgs(args ...string) *specs.Spec {
 			},
 			// Root is readonly, but many tests want to write to tmpdir.
 			// This creates a writable mount inside the root. Also, when tmpdir points
-			// to "/tmp", it makes the the actual /tmp to be mounted and not a tmpfs
+			// to "/tmp", it makes the actual /tmp to be mounted and not a tmpfs
 			// inside the sentry.
 			{
 				Type:        "bind",
@@ -256,7 +308,7 @@ func NewSpecWithArgs(args ...string) *specs.Spec {
 
 // SetupRootDir creates a root directory for containers.
 func SetupRootDir() (string, func(), error) {
-	rootDir, err := ioutil.TempDir(TmpDir(), "containers")
+	rootDir, err := os.MkdirTemp(TmpDir(), "containers")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating root dir: %v", err)
 	}
@@ -284,7 +336,7 @@ func SetupContainer(spec *specs.Spec, conf *config.Config) (rootDir, bundleDir s
 
 // SetupBundleDir creates a bundle dir and writes the spec to config.json.
 func SetupBundleDir(spec *specs.Spec) (string, func(), error) {
-	bundleDir, err := ioutil.TempDir(TmpDir(), "bundle")
+	bundleDir, err := os.MkdirTemp(TmpDir(), "bundle")
 	if err != nil {
 		return "", nil, fmt.Errorf("error creating bundle dir: %v", err)
 	}
@@ -302,31 +354,16 @@ func writeSpec(dir string, spec *specs.Spec) error {
 	if err != nil {
 		return err
 	}
-	return ioutil.WriteFile(filepath.Join(dir, "config.json"), b, 0755)
+	return os.WriteFile(filepath.Join(dir, "config.json"), b, 0755)
 }
-
-// idRandomSrc is a pseudo random generator used to in RandomID.
-var idRandomSrc = rand.New(rand.NewSource(time.Now().UnixNano()))
-
-// idRandomSrcMtx is the mutex protecting idRandomSrc.Read from being used
-// concurrently in differnt goroutines.
-var idRandomSrcMtx sync.Mutex
 
 // RandomID returns 20 random bytes following the given prefix.
 func RandomID(prefix string) string {
-	// Read 20 random bytes.
 	b := make([]byte, 20)
-	// Rand.Read is not safe for concurrent use. Packetimpact tests can be run in
-	// parallel now, so we have to protect the Read with a mutex. Otherwise we'll
-	// run into name conflicts.
-	// https://golang.org/pkg/math/rand/#Rand.Read
-	idRandomSrcMtx.Lock()
 	// "[Read] always returns len(p) and a nil error." --godoc
-	if _, err := idRandomSrc.Read(b); err != nil {
-		idRandomSrcMtx.Unlock()
+	if _, err := rand.Read(b); err != nil {
 		panic("rand.Read failed: " + err.Error())
 	}
-	idRandomSrcMtx.Unlock()
 	if prefix != "" {
 		prefix = prefix + "-"
 	}
@@ -540,7 +577,7 @@ func KillCommand(cmd *exec.Cmd) error {
 // WriteTmpFile writes text to a temporary file, closes the file, and returns
 // the name of the file. A cleanup function is also returned.
 func WriteTmpFile(pattern, text string) (string, func(), error) {
-	file, err := ioutil.TempFile(TmpDir(), pattern)
+	file, err := os.CreateTemp(TmpDir(), pattern)
 	if err != nil {
 		return "", nil, err
 	}

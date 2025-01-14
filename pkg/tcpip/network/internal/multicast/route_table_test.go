@@ -23,7 +23,6 @@ import (
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -47,7 +46,7 @@ var (
 
 func newPacketBuffer(body string) *stack.PacketBuffer {
 	return stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte(body)),
+		Payload: buffer.MakeWithData([]byte(body)),
 	})
 }
 
@@ -259,7 +258,7 @@ func TestAddInstalledRouteWithPending(t *testing.T) {
 
 	cmpOpts := []cmp.Option{
 		cmp.Transformer("AsSlices", func(pkt *stack.PacketBuffer) [][]byte {
-			return pkt.Slices()
+			return pkt.AsSlices()
 		}),
 		cmp.Comparer(func(a [][]byte, b [][]byte) bool {
 			return cmp.Equal(a, b)
@@ -418,8 +417,8 @@ func TestRemoveAllInstalledRoutes(t *testing.T) {
 	}
 
 	routes := map[stack.UnicastSourceAndMulticastDestination]stack.MulticastRoute{
-		defaultRouteKey: defaultRoute,
-		stack.UnicastSourceAndMulticastDestination{otherAddress, otherAddress}: defaultRoute,
+		defaultRouteKey:              defaultRoute,
+		{otherAddress, otherAddress}: defaultRoute,
 	}
 
 	for key, route := range routes {
@@ -514,6 +513,6 @@ func TestSetLastUsedTimestamp(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

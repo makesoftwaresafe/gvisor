@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_test(
     name = "ip_test",
@@ -13,14 +16,15 @@ go_test(
     deps = [
         "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
+        "//pkg/tcpip/network/internal/testutil",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/prependable",

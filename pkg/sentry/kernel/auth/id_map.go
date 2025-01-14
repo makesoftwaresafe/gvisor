@@ -69,8 +69,8 @@ func (ns *UserNamespace) mapID(m *idMapSet, id uint32) uint32 {
 //
 // Preconditions: end >= start.
 func (ns *UserNamespace) allIDsMapped(m *idMapSet, start, end uint32) bool {
-	ns.mu.NestedLock()
-	defer ns.mu.NestedUnlock()
+	ns.mu.NestedLock(userNamespaceLockNs)
+	defer ns.mu.NestedUnlock(userNamespaceLockNs)
 	return m.SpanRange(idMapRange{start, end}) == end-start
 }
 
@@ -185,10 +185,10 @@ func (ns *UserNamespace) trySetUIDMap(entries []IDMapEntry) error {
 			return linuxerr.EPERM
 		}
 		// If either of these Adds fail, we have an overlapping range.
-		if !ns.uidMapFromParent.Add(idMapRange{e.FirstParentID, lastParentID}, e.FirstID) {
+		if !ns.uidMapFromParent.TryInsertRange(idMapRange{e.FirstParentID, lastParentID}, e.FirstID).Ok() {
 			return linuxerr.EINVAL
 		}
-		if !ns.uidMapToParent.Add(idMapRange{e.FirstID, lastID}, e.FirstParentID) {
+		if !ns.uidMapToParent.TryInsertRange(idMapRange{e.FirstID, lastID}, e.FirstParentID).Ok() {
 			return linuxerr.EINVAL
 		}
 	}
@@ -248,10 +248,10 @@ func (ns *UserNamespace) trySetGIDMap(entries []IDMapEntry) error {
 		if !ns.parent.allIDsMapped(&ns.parent.gidMapToParent, e.FirstParentID, lastParentID) {
 			return linuxerr.EPERM
 		}
-		if !ns.gidMapFromParent.Add(idMapRange{e.FirstParentID, lastParentID}, e.FirstID) {
+		if !ns.gidMapFromParent.TryInsertRange(idMapRange{e.FirstParentID, lastParentID}, e.FirstID).Ok() {
 			return linuxerr.EINVAL
 		}
-		if !ns.gidMapToParent.Add(idMapRange{e.FirstID, lastID}, e.FirstParentID) {
+		if !ns.gidMapToParent.TryInsertRange(idMapRange{e.FirstID, lastID}, e.FirstParentID).Ok() {
 			return linuxerr.EINVAL
 		}
 	}

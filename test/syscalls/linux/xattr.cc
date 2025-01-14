@@ -39,6 +39,7 @@ namespace testing {
 namespace {
 
 using ::gvisor::testing::IsTmpfs;
+using ::testing::AnyOf;
 
 class XattrTest : public FileTest {};
 
@@ -103,6 +104,19 @@ TEST_F(XattrTest, XattrInvalidPrefix) {
               SyscallFailsWithErrno(EOPNOTSUPP));
   EXPECT_THAT(removexattr(path, name.c_str()),
               SyscallFailsWithErrno(EOPNOTSUPP));
+}
+
+TEST_F(XattrTest, SecurityCapacityXattr) {
+  SKIP_IF(!IsRunningOnGvisor());
+  const char* path = test_file_name_.c_str();
+  const char name[] = "security.capacity";
+  const std::string val = "";
+  EXPECT_THAT(lsetxattr(path, name, &val, val.size(), 0),
+              SyscallFailsWithErrno(EOPNOTSUPP));
+  int buf = 0;
+  EXPECT_THAT(lgetxattr(path, name, &buf, /*size=*/128),
+              SyscallFailsWithErrno(AnyOf(ENODATA, EOPNOTSUPP)));
+  EXPECT_THAT(lremovexattr(path, name), SyscallFailsWithErrno(EOPNOTSUPP));
 }
 
 // Do not allow save/restore cycles after making the test file read-only, as
@@ -185,7 +199,12 @@ TEST_F(XattrTest, XattrOnDirectory) {
   EXPECT_THAT(getxattr(dir.path().c_str(), name, nullptr, 0),
               SyscallSucceedsWithValue(0));
 
-  char list[sizeof(name)];
+  // Overlay may have private attributes. Even though it is not returned to
+  // userspace, it is counted against the `size` argument in listxattr(2).
+  // See fs/overlayfs/inode.c:ovl_listxattr(). Notice that `size` is not
+  // extended to accommodate for private attributes that are filtered later.
+  // So use a large enough buffer for xattr list.
+  char list[64];
   EXPECT_THAT(listxattr(dir.path().c_str(), list, sizeof(list)),
               SyscallSucceedsWithValue(sizeof(name)));
   EXPECT_STREQ(list, name);
@@ -254,8 +273,7 @@ TEST_F(XattrTest, SetXattrZeroSize) {
   EXPECT_THAT(setxattr(path, name, &val, 0, /*flags=*/0), SyscallSucceeds());
 
   char buf = '-';
-  EXPECT_THAT(getxattr(path, name, &buf, XATTR_SIZE_MAX),
-              SyscallSucceedsWithValue(0));
+  EXPECT_THAT(getxattr(path, name, &buf, 1), SyscallSucceedsWithValue(0));
   EXPECT_EQ(buf, '-');
 }
 
@@ -277,8 +295,11 @@ TEST_F(XattrTest, SetXattrSizeTooLarge) {
 TEST_F(XattrTest, SetXattrNullValueAndNonzeroSize) {
   const char* path = test_file_name_.c_str();
   const char name[] = "user.test";
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
   EXPECT_THAT(setxattr(path, name, nullptr, 1, /*flags=*/0),
               SyscallFailsWithErrno(EFAULT));
+#pragma GCC diagnostic pop
 
   EXPECT_THAT(getxattr(path, name, nullptr, 0), SyscallFailsWithErrno(ENODATA));
 }
@@ -441,8 +462,11 @@ TEST_F(XattrTest, GetXattrNullValue) {
   size_t size = sizeof(val);
   EXPECT_THAT(setxattr(path, name, &val, size, /*flags=*/0), SyscallSucceeds());
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
   EXPECT_THAT(getxattr(path, name, nullptr, size),
               SyscallFailsWithErrno(EFAULT));
+#pragma GCC diagnostic pop
 }
 
 TEST_F(XattrTest, GetXattrNullValueAndZeroSize) {
@@ -453,7 +477,10 @@ TEST_F(XattrTest, GetXattrNullValueAndZeroSize) {
   // Set value with zero size.
   EXPECT_THAT(setxattr(path, name, &val, 0, /*flags=*/0), SyscallSucceeds());
   // Get value with nonzero size.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
   EXPECT_THAT(getxattr(path, name, nullptr, size), SyscallSucceedsWithValue(0));
+#pragma GCC diagnostic pop
 
   // Set value with nonzero size.
   EXPECT_THAT(setxattr(path, name, &val, size, /*flags=*/0), SyscallSucceeds());
@@ -503,8 +530,11 @@ TEST_F(XattrTest, ListXattrNoXattrs) {
 
   // ListXattr should succeed if there are no attributes, even if the buffer
   // passed in is a nullptr.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
   EXPECT_THAT(listxattr(path, nullptr, sizeof(list)),
               SyscallSucceedsWithValue(0));
+#pragma GCC diagnostic pop
 }
 
 TEST_F(XattrTest, ListXattrNullBuffer) {
@@ -512,8 +542,11 @@ TEST_F(XattrTest, ListXattrNullBuffer) {
   const char name[] = "user.test";
   EXPECT_THAT(setxattr(path, name, nullptr, 0, /*flags=*/0), SyscallSucceeds());
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wnonnull"
   EXPECT_THAT(listxattr(path, nullptr, sizeof(name)),
               SyscallFailsWithErrno(EFAULT));
+#pragma GCC diagnostic pop
 }
 
 TEST_F(XattrTest, ListXattrSizeTooSmall) {

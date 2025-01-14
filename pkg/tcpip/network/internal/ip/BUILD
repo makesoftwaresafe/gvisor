@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ip",
@@ -18,6 +21,7 @@ go_library(
     deps = [
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
     ],
 )
@@ -34,6 +38,7 @@ go_test(
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/faketime",
+        "//pkg/tcpip/header",
         "//pkg/tcpip/stack",
         "@com_github_google_go_cmp//cmp:go_default_library",
     ],

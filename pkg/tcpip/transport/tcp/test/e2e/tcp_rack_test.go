@@ -21,12 +21,12 @@ import (
 	"testing"
 	"time"
 
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
-	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp/test/e2e"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp/testing/context"
 	"gvisor.dev/gvisor/pkg/test/testutil"
@@ -41,12 +41,9 @@ const (
 // TestRACKUpdate tests the RACK related fields are updated when an ACK is
 // received on a SACK enabled connection.
 func TestRACKUpdate(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	var xmitTime tcpip.MonotonicTime
 	probeDone := make(chan struct{})
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	probe := func(state *tcp.TCPEndpointState) {
 		// Validate that the endpoint Sender.RACKState is what we expect.
 		if state.Sender.RACKState.XmitTime.Before(xmitTime) {
 			t.Fatalf("RACK transmit time failed to update when an ACK is received")
@@ -62,7 +59,11 @@ func TestRACKUpdate(t *testing.T) {
 			t.Fatalf("RACK RTT failed to update when an ACK is received, got RACKState.RTT == 0 want != 0")
 		}
 		close(probeDone)
-	})
+	}
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
+
 	e2e.SetStackSACKPermitted(t, c, true)
 	e2e.CreateConnectedWithSACKAndTS(c)
 
@@ -91,15 +92,12 @@ func TestRACKUpdate(t *testing.T) {
 
 // TestRACKDetectReorder tests that RACK detects packet reordering.
 func TestRACKDetectReorder(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	t.Skipf("Skipping this test as reorder detection does not consider DSACK.")
 
 	var n int
 	const ackNumToVerify = 2
 	probeDone := make(chan struct{})
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	probe := func(state *tcp.TCPEndpointState) {
 		gotSeq := state.Sender.RACKState.FACK
 		wantSeq := state.Sender.SndNxt
 		// FACK should be updated to the highest ending sequence number of the
@@ -120,7 +118,11 @@ func TestRACKDetectReorder(t *testing.T) {
 			t.Fatalf("RACK reorder detection failed")
 		}
 		close(probeDone)
-	})
+	}
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
+
 	e2e.SetStackSACKPermitted(t, c, true)
 	e2e.CreateConnectedWithSACKAndTS(c)
 	data := make([]byte, ackNumToVerify*maxPayload)
@@ -158,9 +160,9 @@ const (
 	invalidDSACKDetected = 3
 )
 
-func addDSACKSeenCheckerProbe(t *testing.T, c *context.Context, numACK int, probeDone chan int) {
+func dsackSeenCheckerProbe(t *testing.T, numACK int, probeDone chan int) tcp.TCPProbeFunc {
 	var n int
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	return func(state *tcp.TCPEndpointState) {
 		// Validate that RACK detects DSACK.
 		n++
 		if n < numACK {
@@ -175,7 +177,7 @@ func addDSACKSeenCheckerProbe(t *testing.T, c *context.Context, numACK int, prob
 			return
 		}
 		probeDone <- validDSACKDetected
-	})
+	}
 }
 
 // TestRACKTLPRecovery tests that RACK sends a tail loss probe (TLP) in the
@@ -332,8 +334,10 @@ func TestNoTLPRecoveryOnDSACK(t *testing.T) {
 	if err := c.EP.GetSockOpt(&info); err != nil {
 		t.Fatalf("GetSockOpt failed: %v", err)
 	}
-	if p := c.GetPacketWithTimeout(info.RTO); p != nil {
+	var p *buffer.View
+	if p = c.GetPacketWithTimeout(info.RTO); p != nil {
 		t.Errorf("received an unexpected packet: %v", p)
+		p.Release()
 	}
 
 	metricPollFn := func() error {
@@ -466,12 +470,12 @@ func TestRACKOnePacketTailLoss(t *testing.T) {
 // TestRACKDetectDSACK tests that RACK detects DSACK with duplicate segments.
 // See: https://tools.ietf.org/html/rfc2883#section-4.1.1.
 func TestRACKDetectDSACK(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 2
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 8
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -531,12 +535,12 @@ func TestRACKDetectDSACK(t *testing.T) {
 // order segments.
 // See: https://tools.ietf.org/html/rfc2883#section-4.1.2.
 func TestRACKDetectDSACKWithOutOfOrder(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 2
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 10
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -578,12 +582,12 @@ func TestRACKDetectDSACKWithOutOfOrder(t *testing.T) {
 // duplicate of out of order packet.
 // See: https://tools.ietf.org/html/rfc2883#section-4.1.3
 func TestRACKDetectDSACKWithOutOfOrderDup(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 4
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 10
 	e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -622,12 +626,12 @@ func TestRACKDetectDSACKWithOutOfOrderDup(t *testing.T) {
 // TestRACKDetectDSACKSingleDup tests DSACK for a single duplicate subsegment.
 // See: https://tools.ietf.org/html/rfc2883#section-4.2.1.
 func TestRACKDetectDSACKSingleDup(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 4
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 4
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -650,7 +654,7 @@ func TestRACKDetectDSACKSingleDup(t *testing.T) {
 	bytesRead += maxPayload
 	c.SendAckWithSACK(seq, bytesRead, []header.SACKBlock{{start, end}})
 
-	// Simulate receving delayed subsegment of #2 packet and delayed #3 packet by
+	// Simulate receiving delayed subsegment of #2 packet and delayed #3 packet by
 	// sending DSACK block for the subsegment.
 	dsackStart := c.IRS.Add(1 + seqnum.Size(bytesRead))
 	dsackEnd := dsackStart.Add(seqnum.Size(maxPayload / 2))
@@ -693,12 +697,12 @@ func TestRACKDetectDSACKSingleDup(t *testing.T) {
 // duplicate subsegments covered by the cumulative acknowledgement.
 // See: https://tools.ietf.org/html/rfc2883#section-4.2.2.
 func TestRACKDetectDSACKDupWithCumulativeACK(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 5
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 6
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -747,12 +751,12 @@ func TestRACKDetectDSACKDupWithCumulativeACK(t *testing.T) {
 // covered by the cumulative acknowledgement.
 // See: https://tools.ietf.org/html/rfc2883#section-4.2.3.
 func TestRACKDetectDSACKDup(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan int)
 	const ackNumToVerify = 5
-	addDSACKSeenCheckerProbe(t, c, ackNumToVerify, probeDone)
+	probe := dsackSeenCheckerProbe(t, ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 7
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -802,13 +806,10 @@ func TestRACKDetectDSACKDup(t *testing.T) {
 // TestRACKWithInvalidDSACKBlock tests that DSACK is not detected when DSACK
 // is not the first SACK block.
 func TestRACKWithInvalidDSACKBlock(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan struct{})
 	const ackNumToVerify = 2
 	var n int
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	probe := func(state *tcp.TCPEndpointState) {
 		// Validate that RACK does not detect DSACK when DSACK block is
 		// not the first SACK block.
 		n++
@@ -820,7 +821,10 @@ func TestRACKWithInvalidDSACKBlock(t *testing.T) {
 		if n == ackNumToVerify {
 			close(probeDone)
 		}
-	})
+	}
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	numPackets := 10
 	data := e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -852,9 +856,9 @@ func TestRACKWithInvalidDSACKBlock(t *testing.T) {
 	<-probeDone
 }
 
-func addReorderWindowCheckerProbe(c *context.Context, numACK int, probeDone chan error) {
+func reorderWindowCheckerProbe(numACK int, probeDone chan error) tcp.TCPProbeFunc {
 	var n int
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	return func(state *tcp.TCPEndpointState) {
 		// Validate that RACK detects DSACK.
 		n++
 		if n < numACK {
@@ -876,16 +880,16 @@ func addReorderWindowCheckerProbe(c *context.Context, numACK int, probeDone chan
 			return
 		}
 		probeDone <- nil
-	})
+	}
 }
 
 func TestRACKCheckReorderWindow(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan error)
 	const ackNumToVerify = 3
-	addReorderWindowCheckerProbe(c, ackNumToVerify, probeDone)
+	probe := reorderWindowCheckerProbe(ackNumToVerify, probeDone)
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	const numPackets = 7
 	e2e.SendAndReceiveWithSACK(t, c, maxPayload, numPackets, true /* enableRACK */)
@@ -960,25 +964,26 @@ func TestRACKWithDuplicateACK(t *testing.T) {
 // TestRACKUpdateSackedOut tests the sacked out field is updated when a SACK
 // is received.
 func TestRACKUpdateSackedOut(t *testing.T) {
-	c := context.New(t, uint32(mtu))
-	defer c.Cleanup()
-
 	probeDone := make(chan struct{})
 	ackNum := 0
-	c.Stack().AddTCPProbe(func(state *stack.TCPEndpointState) {
+	probe := func(state *tcp.TCPEndpointState) {
 		// Validate that the endpoint Sender.SackedOut is what we expect.
 		if state.Sender.SackedOut != 2 && ackNum == 0 {
 			t.Fatalf("SackedOut got updated to wrong value got: %v want: 2", state.Sender.SackedOut)
 		}
 
-		if state.Sender.SackedOut != 0 && ackNum == 1 {
+		if !state.Sender.FastRecovery.Active && state.Sender.SackedOut != 0 && ackNum == 1 {
 			t.Fatalf("SackedOut got updated to wrong value got: %v want: 0", state.Sender.SackedOut)
 		}
+
 		if ackNum > 0 {
 			close(probeDone)
 		}
 		ackNum++
-	})
+	}
+
+	c := context.NewWithProbe(t, uint32(mtu), probe)
+	defer c.Cleanup()
 
 	e2e.SendAndReceiveWithSACK(t, c, maxPayload, 8 /* numPackets */, true /* enableRACK */)
 
@@ -1071,6 +1076,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

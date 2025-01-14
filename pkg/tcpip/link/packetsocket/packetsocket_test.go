@@ -20,7 +20,6 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
@@ -36,6 +35,7 @@ type nullEndpoint struct {
 func (*nullEndpoint) MTU() uint32 {
 	return math.MaxUint32
 }
+func (*nullEndpoint) SetMTU(uint32) {}
 func (*nullEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return 0
 }
@@ -43,8 +43,9 @@ func (*nullEndpoint) MaxHeaderLength() uint16 {
 	return 0
 }
 func (*nullEndpoint) LinkAddress() tcpip.LinkAddress {
-	var l tcpip.LinkAddress
-	return l
+	return ""
+}
+func (*nullEndpoint) SetLinkAddress(tcpip.LinkAddress) {
 }
 func (*nullEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
 	return pkts.Len(), nil
@@ -54,13 +55,15 @@ func (e *nullEndpoint) IsAttached() bool                      { return e.disp !=
 func (*nullEndpoint) Wait()                                   {}
 func (*nullEndpoint) ARPHardwareType() header.ARPHardwareType { return header.ARPHardwareNone }
 func (*nullEndpoint) AddHeader(*stack.PacketBuffer)           {}
+func (*nullEndpoint) ParseHeader(*stack.PacketBuffer) bool    { return true }
+func (*nullEndpoint) Close()                                  {}
+func (*nullEndpoint) SetOnCloseAction(func())                 {}
 
 var _ stack.NetworkDispatcher = (*testNetworkDispatcher)(nil)
 
 type linkPacketInfo struct {
 	pkt      *stack.PacketBuffer
 	protocol tcpip.NetworkProtocolNumber
-	incoming bool
 }
 
 type networkPacketInfo struct {
@@ -100,11 +103,10 @@ func (t *testNetworkDispatcher) DeliverNetworkPacket(protocol tcpip.NetworkProto
 	t.networkPacket = networkPacket
 }
 
-func (t *testNetworkDispatcher) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, incoming bool) {
+func (t *testNetworkDispatcher) DeliverLinkPacket(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	linkPacket := linkPacketInfo{
 		pkt:      pkt.IncRef(),
 		protocol: protocol,
-		incoming: incoming,
 	}
 
 	if t.linkPacket != (linkPacketInfo{}) {
@@ -129,6 +131,7 @@ func TestPacketDispatch(t *testing.T) {
 	pkt.NetworkProtocolNumber = protocol
 
 	{
+		pkt.PktType = tcpip.PacketOutgoing
 		var pkts stack.PacketBufferList
 		pkts.PushBack(pkt)
 		if n, err := ep.WritePackets(pkts); err != nil {
@@ -140,18 +143,19 @@ func TestPacketDispatch(t *testing.T) {
 		if want := (networkPacketInfo{}); d.networkPacket != want {
 			t.Errorf("got d.networkPacket = %#v, want = %#v", d.networkPacket, want)
 		}
-		if want := (linkPacketInfo{pkt: pkt, protocol: protocol, incoming: false}); d.linkPacket != want {
+		if want := (linkPacketInfo{pkt: pkt, protocol: protocol}); d.linkPacket != want {
 			t.Errorf("got d.linkPacket = %#v, want = %#v", d.linkPacket, want)
 		}
 	}
 
 	d.reset()
 	{
+		pkt.PktType = tcpip.PacketHost
 		nullEP.disp.DeliverNetworkPacket(protocol, pkt)
 		if want := (networkPacketInfo{pkt: pkt, protocol: protocol}); d.networkPacket != want {
 			t.Errorf("got d.networkPacket = %#v, want = %#v", d.networkPacket, want)
 		}
-		if want := (linkPacketInfo{pkt: pkt, protocol: protocol, incoming: true}); d.linkPacket != want {
+		if want := (linkPacketInfo{pkt: pkt, protocol: protocol}); d.linkPacket != want {
 			t.Errorf("got d.linkPacket = %#v, want = %#v", d.linkPacket, want)
 		}
 	}
@@ -160,6 +164,6 @@ func TestPacketDispatch(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

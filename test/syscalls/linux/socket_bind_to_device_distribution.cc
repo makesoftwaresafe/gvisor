@@ -133,13 +133,13 @@ TEST_P(BindToDeviceDistributionTest, Tcp) {
   }
 
   constexpr int kConnectAttempts = 10000;
-  std::atomic<int> connects_received = ATOMIC_VAR_INIT(0);
+  std::atomic<int> connects_received(0);
   std::vector<int> accept_counts(listener_fds.size(), 0);
   std::vector<std::unique_ptr<ScopedThread>> listen_threads(
       listener_fds.size());
 
   for (size_t i = 0; i < listener_fds.size(); i++) {
-    listen_threads[i] = absl::make_unique<ScopedThread>(
+    listen_threads[i] = std::make_unique<ScopedThread>(
         [&listener_fds, &accept_counts, &connects_received, i,
          kConnectAttempts]() {
           do {
@@ -256,13 +256,13 @@ TEST_P(BindToDeviceDistributionTest, Udp) {
   }
 
   constexpr int kConnectAttempts = 10000;
-  std::atomic<int> packets_received = ATOMIC_VAR_INIT(0);
+  std::atomic<int> packets_received(0);
   std::vector<int> packets_per_socket(listener_fds.size(), 0);
   std::vector<std::unique_ptr<ScopedThread>> receiver_threads(
       listener_fds.size());
 
   for (size_t i = 0; i < listener_fds.size(); i++) {
-    receiver_threads[i] = absl::make_unique<ScopedThread>(
+    receiver_threads[i] = std::make_unique<ScopedThread>(
         [&listener_fds, &packets_per_socket, &packets_received, i]() {
           do {
             struct sockaddr_storage addr = {};

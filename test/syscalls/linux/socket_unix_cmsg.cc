@@ -658,6 +658,42 @@ TEST_P(UnixSocketPairCmsgTest, FDPassPeek) {
   EXPECT_THAT(close(received_fd), SyscallSucceeds());
 }
 
+// A zero-length SCM_RIGHTS array should be equivalent to sending no FDs at all.
+TEST_P(UnixSocketPairCmsgTest, ZeroFDPass) {
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), nullptr, 0, sent_data, sizeof(sent_data)));
+
+  char received_data[sizeof(sent_data)];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(received_data, sent_data, sizeof(sent_data)));
+}
+
+TEST_P(UnixSocketPairCmsgTest, ZeroFDPassCoalesceData) {
+  SKIP_IF(GetParam().type != SOCK_STREAM);
+  auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
+
+  char sent_data[20];
+  RandomizeBuffer(sent_data, sizeof(sent_data));
+  ASSERT_NO_FATAL_FAILURE(
+      SendFDs(sockets->first_fd(), nullptr, 0, sent_data, sizeof(sent_data)));
+  ASSERT_NO_FATAL_FAILURE(
+      WriteFd(sockets->first_fd(), sent_data, sizeof(sent_data)));
+
+  char received_data[sizeof(sent_data) * 2];
+  ASSERT_NO_FATAL_FAILURE(
+      RecvNoCmsg(sockets->second_fd(), received_data, sizeof(received_data)));
+
+  EXPECT_EQ(0, memcmp(received_data, sent_data, sizeof(sent_data)));
+  EXPECT_EQ(0, memcmp(received_data + sizeof(sent_data), sent_data,
+                      sizeof(sent_data)));
+}
+
 TEST_P(UnixSocketPairCmsgTest, BasicCredPass) {
   auto sockets = ASSERT_NO_ERRNO_AND_VALUE(NewSocketPair());
 
@@ -1421,6 +1457,36 @@ TEST_P(UnixSocketPairCmsgTest, FDPassAfterSoPassCredWithoutCredSpace) {
   EXPECT_EQ(cmsg->cmsg_len, sizeof(control));
   EXPECT_EQ(cmsg->cmsg_level, SOL_SOCKET);
   EXPECT_EQ(cmsg->cmsg_type, SCM_CREDENTIALS);
+}
+
+TEST_P(UnixSocketPairCmsgTest, InheritPasscred) {
+  // Create an abstract server, but set SO_PASSCRED on it
+  struct sockaddr_un bind_addr =
+      ASSERT_NO_ERRNO_AND_VALUE(UniqueUnixAddr(true, AF_UNIX));
+  auto bound = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+  SetSoPassCred(bound.get());
+  ASSERT_THAT(bind(bound.get(), AsSockAddr(&bind_addr), sizeof(bind_addr)),
+              SyscallSucceeds());
+  ASSERT_THAT(listen(bound.get(),
+                     /* backlog = */ 5),  // NOLINT(bugprone-argument-comment)
+              SyscallSucceeds());
+
+  // Create a connected socket pair using the server
+  auto connected = ASSERT_NO_ERRNO_AND_VALUE(Socket(AF_UNIX, SOCK_STREAM, 0));
+  ASSERT_THAT(
+      connect(connected.get(), AsSockAddr(&bind_addr), sizeof(bind_addr)),
+      SyscallSucceeds());
+  auto accepted =
+      ASSERT_NO_ERRNO_AND_VALUE(Accept4(bound.get(), nullptr, nullptr, 0));
+  ASSERT_THAT(close(bound.release()), SyscallSucceeds());
+
+  // The accepted socket should have SO_PASSCRED set
+  int opt;
+  socklen_t optLen = sizeof(opt);
+  EXPECT_THAT(
+      getsockopt(accepted.get(), SOL_SOCKET, SO_PASSCRED, &opt, &optLen),
+      SyscallSucceeds());
+  EXPECT_TRUE(opt);
 }
 
 // This test will validate that MSG_CTRUNC as an input flag to recvmsg will

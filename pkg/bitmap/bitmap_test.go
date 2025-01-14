@@ -16,7 +16,7 @@ package bitmap
 
 import (
 	"math"
-	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -110,7 +110,7 @@ func TestRemove(t *testing.T) {
 		bitmap.Remove(firstSlice[i])
 	}
 	bitmapSlice := bitmap.ToSlice()
-	if !reflect.DeepEqual(bitmapSlice, secondSlice) {
+	if !slices.Equal(bitmapSlice, secondSlice) {
 		t.Errorf("After Remove() firstSlice, remained slice: %v, wanted: %v", bitmapSlice, secondSlice)
 	}
 
@@ -119,7 +119,7 @@ func TestRemove(t *testing.T) {
 	}
 	bitmapSlice = bitmap.ToSlice()
 	emptySlice := make([]uint32, 0)
-	if !reflect.DeepEqual(bitmapSlice, emptySlice) {
+	if !slices.Equal(bitmapSlice, emptySlice) {
 		t.Errorf("After Remove secondSlice, remained slice: %v, wanted: %v", bitmapSlice, emptySlice)
 	}
 
@@ -153,7 +153,7 @@ func TestFlipRange(t *testing.T) {
 
 			bitmap.FlipRange(uint32(tt.flipRangeMin), uint32(tt.flipRangeMax+1))
 			flipBitmapSlice := bitmap.ToSlice()
-			if !reflect.DeepEqual(flipFillSlice, flipBitmapSlice) {
+			if !slices.Equal(flipFillSlice, flipBitmapSlice) {
 				t.Errorf("%v, flipped slice: %v, wanted: %v", tt.name, flipBitmapSlice, flipFillSlice)
 			}
 		})
@@ -186,7 +186,7 @@ func TestClearRange(t *testing.T) {
 					clearedSlice = append(clearedSlice, uint32(i))
 				}
 			}
-			if !reflect.DeepEqual(clearedSlice, clearedBitmapSlice) {
+			if !slices.Equal(clearedSlice, clearedBitmapSlice) {
 				t.Errorf("%v, cleared slice: %v, wanted: %v", tt.name, clearedBitmapSlice, clearedSlice)
 			}
 		})
@@ -292,6 +292,63 @@ func TestBitmapNumOnes(t *testing.T) {
 	if bitmapOnes != uint32(20) {
 		t.Errorf("After ClearRange, GetNumOnes() returns: %v, wanted: %v", bitmapOnes, 20)
 	}
+
+	// Reset to fully clear bitmap.
+	bitmap.Reset()
+	bitmapOnes = bitmap.GetNumOnes()
+	if bitmapOnes != uint32(0) {
+		t.Errorf("After Reset, GetNumOnes() returns: %v, wanted: %v", bitmapOnes, 0)
+	}
+}
+
+type bitmapForEachTestcase struct {
+	start, end uint32
+	expected   map[uint32]bool
+}
+
+func TestForEach(t *testing.T) {
+	const bitmapSize = 1 << 20
+	bitmap := New(bitmapSize)
+	bitmap.FlipRange(200, 400)
+	bitmap.FlipRange(1003, 1004)
+	bitmap.FlipRange(1005, 1006)
+	bitmap.FlipRange(1096, 1098)
+	testcases := []bitmapForEachTestcase{
+		{0, 0, map[uint32]bool{}},
+		{0, 100, map[uint32]bool{}},
+		{1003, 1004, map[uint32]bool{1003: true}},
+		{1003, 1006, map[uint32]bool{1003: true, 1005: true}},
+		{1000, 2000, map[uint32]bool{1003: true, 1005: true, 1096: true, 1097: true}},
+		{1000, 1097, map[uint32]bool{1003: true, 1005: true, 1096: true}},
+		{1060, 1097, map[uint32]bool{1096: true}},
+		{0, bitmapSize, func() map[uint32]bool {
+			m := make(map[uint32]bool)
+			for _, i := range bitmap.ToSlice() {
+				m[i] = true
+			}
+			return m
+		}()},
+		{234, 356, func() map[uint32]bool {
+			m := make(map[uint32]bool)
+			for i := uint32(234); i < 356; i++ {
+				m[i] = true
+			}
+			return m
+		}()},
+	}
+	for _, tc := range testcases {
+		bitmap.ForEach(tc.start, tc.end, func(idx uint32) bool {
+			if _, ok := tc.expected[idx]; !ok {
+				t.Errorf("[%d, %d): unexpeced index: %d", tc.start, tc.end, idx)
+				return false
+			}
+			delete(tc.expected, idx)
+			return true
+		})
+		if len(tc.expected) != 0 {
+			t.Errorf("[%d-%d): leftover: %#v", tc.start, tc.end, tc.expected)
+		}
+	}
 }
 
 type BitmapGetFirstTestcase struct {
@@ -338,5 +395,21 @@ func TestFirstOne(t *testing.T) {
 		if v != tc.expectedValue && (err != nil) == tc.wantErr {
 			t.Errorf("FirstOne() returns: %v, wanted: %v", v, tc.expectedValue)
 		}
+	}
+}
+
+func TestGrow(t *testing.T) {
+	bitmap := New(uint32(64))
+	bitmap.FlipRange(0, 64)
+	bitmap.Grow(64)
+
+	want := make([]uint32, 64)
+	for i := 0; i < 128; i++ {
+		if i < 64 {
+			want[i] = uint32(i)
+		}
+	}
+	if !slices.Equal(bitmap.ToSlice(), want) {
+		t.Errorf("Grow() got: %v, want: %v", bitmap.ToSlice(), want)
 	}
 }

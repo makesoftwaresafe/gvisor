@@ -1,6 +1,7 @@
 load("//tools:defs.bzl", "bzl_library")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -24,28 +25,25 @@ bzl_library(
 )
 
 config_setting(
-    name = "linux_arm64_cross",
-    values = {
-        "cpu": "aarch64",
-        "host_cpu": "k8",
-    },
-    visibility = ["//visibility:private"],
+    name = "amd64",
+    values = {"cpu": "k8"},
 )
 
 config_setting(
-    name = "linux_amd64_cross",
-    values = {
-        "cpu": "k8",
-        "host_cpu": "aarch64",
-    },
-    visibility = ["//visibility:private"],
+    name = "arm64",
+    values = {"cpu": "aarch64"},
+)
+
+config_setting(
+    name = "riscv64",
+    values = {"cpu": "riscv64"},
 )
 
 genrule(
     name = "version",
     outs = ["version.txt"],
     cmd = "cat bazel-out/stable-status.txt | grep STABLE_VERSION | cut -d' ' -f2- | sed 's/^[^[:digit:]]*//g' >$@",
-    stamp = True,
+    stamp = 1,
     tags = [
         "manual",
         "nobuilder",

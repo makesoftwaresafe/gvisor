@@ -20,6 +20,7 @@ import (
 	"path"
 
 	"gvisor.dev/gvisor/pkg/fd"
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
 // PointX represents the checkpoint X.
@@ -61,11 +62,13 @@ const (
 	FieldSentryExecveBinaryInfo Field = iota
 )
 
-// Points is a map with all the Points registered in the system.
+// Points is a map with all the trace points registered in the system.
 var Points = map[string]PointDesc{}
-var sinks = map[string]SinkDesc{}
 
-// defaultContextFields are the fields present in most Points.
+// Sinks is a map with all the sinks registered in the system.
+var Sinks = map[string]SinkDesc{}
+
+// defaultContextFields are the fields present in most trace points.
 var defaultContextFields = []FieldDesc{
 	{
 		ID:   FieldCtxtTime,
@@ -113,19 +116,19 @@ type SinkDesc struct {
 	// allow the sink to do whatever is necessary to set it up. If it returns a
 	// file, this file is donated to the sandbox and passed to the sink when New
 	// is called. config is an opaque json object passed to the sink.
-	Setup func(config map[string]interface{}) (*os.File, error)
+	Setup func(config map[string]any) (*os.File, error)
 	// New creates a new sink. config is an opaque json object passed to the sink.
 	// endpoing is a file descriptor to the file returned in Setup. It's set to -1
 	// if Setup returned nil.
-	New func(config map[string]interface{}, endpoint *fd.FD) (Checker, error)
+	New func(config map[string]any, endpoint *fd.FD) (Sink, error)
 }
 
 // RegisterSink registers a new sink to make it discoverable.
 func RegisterSink(sink SinkDesc) {
-	if _, ok := sinks[sink.Name]; ok {
+	if _, ok := Sinks[sink.Name]; ok {
 		panic(fmt.Sprintf("Sink %q already registered", sink.Name))
 	}
-	sinks[sink.Name] = sink
+	Sinks[sink.Name] = sink
 }
 
 // PointDesc describes a Point that is available to be configured.
@@ -208,8 +211,8 @@ func addSyscallPointHelper(typ SyscallType, sysno uintptr, name string, optional
 	})
 }
 
-// These are all the Points available in the system.
-func init() {
+// genericInit initializes non-architecture-specific Points available in the system.
+func genericInit() {
 	// Points from the container namespace.
 	registerPoint(PointDesc{
 		ID:   PointContainerStart,
@@ -241,13 +244,57 @@ func init() {
 		ContextFields: defaultContextFields,
 	})
 	registerPoint(PointDesc{
-		ID:            PointExitNotifyParent,
-		Name:          "sentry/exit_notify_parent",
-		ContextFields: defaultContextFields,
+		ID:   PointExitNotifyParent,
+		Name: "sentry/exit_notify_parent",
+		ContextFields: []FieldDesc{
+			{
+				ID:   FieldCtxtTime,
+				Name: "time",
+			},
+			{
+				ID:   FieldCtxtThreadID,
+				Name: "thread_id",
+			},
+			{
+				ID:   FieldCtxtThreadStartTime,
+				Name: "task_start_time",
+			},
+			{
+				ID:   FieldCtxtThreadGroupID,
+				Name: "group_id",
+			},
+			{
+				ID:   FieldCtxtThreadGroupStartTime,
+				Name: "thread_group_start_time",
+			},
+			{
+				ID:   FieldCtxtContainerID,
+				Name: "container_id",
+			},
+			{
+				ID:   FieldCtxtCredentials,
+				Name: "credentials",
+			},
+			{
+				ID:   FieldCtxtProcessName,
+				Name: "process_name",
+			},
+		},
 	})
 	registerPoint(PointDesc{
 		ID:            PointTaskExit,
 		Name:          "sentry/task_exit",
 		ContextFields: defaultContextFields,
+	})
+}
+
+var initOnce sync.Once
+
+// Initialize initializes the Points available in the system.
+// Must be called prior to using any of them.
+func Initialize() {
+	initOnce.Do(func() {
+		genericInit()
+		archInit()
 	})
 }

@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"reflect"
 	"testing"
@@ -27,20 +28,11 @@ import (
 	"gvisor.dev/gvisor/pkg/state/pretty"
 )
 
-// discard is an implementation of wire.Writer.
-type discard struct{}
-
-// Write implements wire.Writer.Write.
-func (discard) Write(p []byte) (int, error) { return len(p), nil }
-
-// WriteByte implements wire.Writer.WriteByte.
-func (discard) WriteByte(byte) error { return nil }
-
 // checkEqual checks if two objects are equal.
 //
 // N.B. This only handles one level of dereferences for NaN. Otherwise we
 // would need to fork the entire implementation of reflect.DeepEqual.
-func checkEqual(root, loadedValue interface{}) bool {
+func checkEqual(root, loadedValue any) bool {
 	if reflect.DeepEqual(root, loadedValue) {
 		return true
 	}
@@ -74,7 +66,7 @@ func checkEqual(root, loadedValue interface{}) bool {
 }
 
 // runTestCases runs a test for each object in objects.
-func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []interface{}) {
+func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []any) {
 	t.Helper()
 	for i, root := range objects {
 		t.Run(fmt.Sprintf("%s%d", prefix, i), func(t *testing.T) {
@@ -103,7 +95,7 @@ func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []interf
 					t.Errorf("PrettyPrint(html=false) failed unexpected: %v", err)
 				}
 			}
-			if err := pretty.PrintHTML(discard{}, bytes.NewReader(saveBuffer.Bytes())); err != nil {
+			if err := pretty.PrintHTML(io.Discard, bytes.NewReader(saveBuffer.Bytes())); err != nil {
 				// See above.
 				if !shouldFail {
 					t.Errorf("PrettyPrint(html=true) failed unexpected: %v", err)
@@ -154,8 +146,8 @@ func runTestCases(t *testing.T, shouldFail bool, prefix string, objects []interf
 	}
 }
 
-// convert converts the slice to an []interface{}.
-func convert(v interface{}) (r []interface{}) {
+// convert converts the slice to an []any.
+func convert(v any) (r []any) {
 	s := reflect.ValueOf(v) // Must be slice.
 	for i := 0; i < s.Len(); i++ {
 		r = append(r, s.Index(i).Interface())
@@ -164,7 +156,7 @@ func convert(v interface{}) (r []interface{}) {
 }
 
 // flatten flattens multiple slices.
-func flatten(vs ...interface{}) (r []interface{}) {
+func flatten(vs ...any) (r []any) {
 	for _, v := range vs {
 		r = append(r, convert(v)...)
 	}
@@ -172,7 +164,7 @@ func flatten(vs ...interface{}) (r []interface{}) {
 }
 
 // filter maps from one slice to another.
-func filter(vs interface{}, fn func(interface{}) (interface{}, bool)) (r []interface{}) {
+func filter(vs any, fn func(any) (any, bool)) (r []any) {
 	s := reflect.ValueOf(vs)
 	for i := 0; i < s.Len(); i++ {
 		v, ok := fn(s.Index(i).Interface())
@@ -184,7 +176,7 @@ func filter(vs interface{}, fn func(interface{}) (interface{}, bool)) (r []inter
 }
 
 // combine combines objects in two slices as specified.
-func combine(v1, v2 interface{}, fn func(_, _ interface{}) interface{}) (r []interface{}) {
+func combine(v1, v2 any, fn func(_, _ any) any) (r []any) {
 	s1 := reflect.ValueOf(v1)
 	s2 := reflect.ValueOf(v2)
 	for i := 0; i < s1.Len(); i++ {
@@ -197,8 +189,8 @@ func combine(v1, v2 interface{}, fn func(_, _ interface{}) interface{}) (r []int
 }
 
 // pointersTo is a filter function that returns pointers.
-func pointersTo(vs interface{}) []interface{} {
-	return filter(vs, func(o interface{}) (interface{}, bool) {
+func pointersTo(vs any) []any {
+	return filter(vs, func(o any) (any, bool) {
 		v := reflect.New(reflect.TypeOf(o))
 		v.Elem().Set(reflect.ValueOf(o))
 		return v.Interface(), true
@@ -206,9 +198,9 @@ func pointersTo(vs interface{}) []interface{} {
 }
 
 // interfacesTo is a filter function that returns interface objects.
-func interfacesTo(vs interface{}) []interface{} {
-	return filter(vs, func(o interface{}) (interface{}, bool) {
-		var v [1]interface{}
+func interfacesTo(vs any) []any {
+	return filter(vs, func(o any) (any, bool) {
+		var v [1]any
 		v[0] = o
 		return v, true
 	})

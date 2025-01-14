@@ -36,7 +36,7 @@ const waitBufMaxBytes = 131072
 // full, at which point they are written to the wait buffer. Bytes are
 // processed (i.e. undergo termios transformations) as they are added to the
 // read buffer. The read buffer is readable when its length is nonzero and
-// readable is true.
+// readable is true, or when its length is zero and readable is true (EOF).
 //
 // +stateify savable
 type queue struct {
@@ -58,7 +58,7 @@ type queue struct {
 	// so readable must be checked.
 	readable bool
 
-	// transform is the the queue's function for transforming bytes
+	// transform is the queue's function for transforming bytes
 	// entering the queue. For example, transform might convert all '\r's
 	// entering the queue to '\n's.
 	transformer
@@ -110,6 +110,9 @@ func (q *queue) read(ctx context.Context, dst usermem.IOSequence, l *lineDiscipl
 	defer q.mu.Unlock()
 
 	if !q.readable {
+		if l.numReplicas == 0 {
+			return 0, false, false, linuxerr.EIO
+		}
 		return 0, false, false, linuxerr.ErrWouldBlock
 	}
 

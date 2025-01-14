@@ -45,7 +45,7 @@ func (*Delete) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Delete) Usage() string {
-	return `delete [flags] <container ids>`
+	return "delete [flags] <container ids>\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -54,7 +54,7 @@ func (d *Delete) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (d *Delete) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (d *Delete) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() == 0 {
 		f.Usage()
 		return subcommands.ExitUsageError

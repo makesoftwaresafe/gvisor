@@ -18,104 +18,62 @@ package fdimport
 import (
 	"fmt"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/fd"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/host"
-	hostvfs2 "gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/host"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-// Import imports a slice of FDs into the given FDTable. If console is true,
-// sets up TTY for the first 3 FDs in the slice representing stdin, stdout,
-// stderr. Used FDs are either closed or released. It's safe for the caller to
-// close any remaining files upon return.
-func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth.KUID, gid auth.KGID, fds []*fd.FD) (*host.TTYFileOperations, *hostvfs2.TTYFileDescription, error) {
-	if kernel.VFS2Enabled {
-		ttyFile, err := importVFS2(ctx, fdTable, console, uid, gid, fds)
-		return nil, ttyFile, err
-	}
-	ttyFile, err := importFS(ctx, fdTable, console, fds)
-	return ttyFile, nil, err
-}
-
-func importFS(ctx context.Context, fdTable *kernel.FDTable, console bool, fds []*fd.FD) (*host.TTYFileOperations, error) {
-	var ttyFile *fs.File
-	for appFD, hostFD := range fds {
-		var appFile *fs.File
-
-		if console && appFD < 3 {
-			// Import the file as a host TTY file.
-			if ttyFile == nil {
-				var err error
-				appFile, err = host.ImportFile(ctx, hostFD.FD(), true /* isTTY */)
-				if err != nil {
-					return nil, err
-				}
-				defer appFile.DecRef(ctx)
-				_ = hostFD.Close() // FD is dup'd i ImportFile.
-
-				// Remember this in the TTY file, as we will
-				// use it for the other stdio FDs.
-				ttyFile = appFile
-			} else {
-				// Re-use the existing TTY file, as all three
-				// stdio FDs must point to the same fs.File in
-				// order to share TTY state, specifically the
-				// foreground process group id.
-				appFile = ttyFile
-			}
-		} else {
-			// Import the file as a regular host file.
-			var err error
-			appFile, err = host.ImportFile(ctx, hostFD.FD(), false /* isTTY */)
-			if err != nil {
-				return nil, err
-			}
-			defer appFile.DecRef(ctx)
-			_ = hostFD.Close() // FD is dup'd i ImportFile.
-		}
-
-		// Add the file to the FD map.
-		if err := fdTable.NewFDAt(ctx, int32(appFD), appFile, kernel.FDFlags{}); err != nil {
-			return nil, err
-		}
-	}
-
-	if ttyFile == nil {
-		return nil, nil
-	}
-	return ttyFile.FileOperations.(*host.TTYFileOperations), nil
-}
-
-func importVFS2(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth.KUID, gid auth.KGID, stdioFDs []*fd.FD) (*hostvfs2.TTYFileDescription, error) {
+// Import imports a map of FDs into the given FDTable. If console is true,
+// sets up TTY for sentry stdin, stdout, and stderr FDs. Used FDs are either
+// closed or released. It's safe for the caller to close any remaining files
+// upon return.
+func Import(ctx context.Context, fdTable *kernel.FDTable, console bool, uid auth.KUID, gid auth.KGID, fds map[int]*fd.FD, containerName string) (*host.TTYFileDescription, error) {
 	k := kernel.KernelFromContext(ctx)
 	if k == nil {
 		return nil, fmt.Errorf("cannot find kernel from context")
 	}
+	mnt := k.HostMount()
+
+	// Collect host fds and flags. Do this before importing any fds because
+	// multiple fds may refer to the same file, and importing fds may
+	// change flags.
+	fdFlags := make(map[*fd.FD]kernel.FDFlags)
+	for _, hostFD := range fds {
+		var err error
+		fdFlags[hostFD], err = getFDFlags(hostFD)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var ttyFile *vfs.FileDescription
-	for appFD, hostFD := range stdioFDs {
+	for appFD, hostFD := range fds {
+		fdOpts := host.NewFDOptions{
+			Savable: true,
+		}
+		if uid != auth.NoID || gid != auth.NoID {
+			fdOpts.VirtualOwner = true
+			fdOpts.UID = uid
+			fdOpts.GID = gid
+		}
 		var appFile *vfs.FileDescription
 
+		fdOpts.RestoreKey = host.MakeRestoreID(containerName, appFD)
 		if console && appFD < 3 {
 			// Import the file as a host TTY file.
 			if ttyFile == nil {
+				fdOpts.IsTTY = true
 				var err error
-				appFile, err = hostvfs2.NewFD(ctx, k.HostMount(), hostFD.FD(), &hostvfs2.NewFDOptions{
-					Savable:      true,
-					IsTTY:        true,
-					VirtualOwner: true,
-					UID:          uid,
-					GID:          gid,
-				})
+				appFile, err = host.NewFD(ctx, mnt, hostFD.FD(), &fdOpts)
 				if err != nil {
 					return nil, err
 				}
 				defer appFile.DecRef(ctx)
-				hostFD.Release() // FD is transfered to host FD.
+				hostFD.Release() // FD is transferred to host FD.
 
 				// Remember this in the TTY file, as we will use it for the other stdio
 				// FDs.
@@ -128,26 +86,35 @@ func importVFS2(ctx context.Context, fdTable *kernel.FDTable, console bool, uid 
 			}
 		} else {
 			var err error
-			appFile, err = hostvfs2.NewFD(ctx, k.HostMount(), hostFD.FD(), &hostvfs2.NewFDOptions{
-				Savable:      true,
-				VirtualOwner: true,
-				UID:          uid,
-				GID:          gid,
-			})
+			appFile, err = host.NewFD(ctx, mnt, hostFD.FD(), &fdOpts)
 			if err != nil {
 				return nil, err
 			}
 			defer appFile.DecRef(ctx)
-			hostFD.Release() // FD is transfered to host FD.
+			hostFD.Release() // FD is transferred to host FD.
 		}
 
-		if err := fdTable.NewFDAtVFS2(ctx, int32(appFD), appFile, kernel.FDFlags{}); err != nil {
+		df, err := fdTable.NewFDAt(ctx, int32(appFD), appFile, fdFlags[hostFD])
+		if err != nil {
 			return nil, err
 		}
+		if df != nil {
+			df.DecRef(ctx)
+			return nil, fmt.Errorf("app FD %d displaced while importing FDs", appFD)
+		}
 	}
-
 	if ttyFile == nil {
 		return nil, nil
 	}
-	return ttyFile.Impl().(*hostvfs2.TTYFileDescription), nil
+	return ttyFile.Impl().(*host.TTYFileDescription), nil
+}
+
+func getFDFlags(f *fd.FD) (kernel.FDFlags, error) {
+	fdflags, _, errno := unix.Syscall(unix.SYS_FCNTL, uintptr(f.FD()), unix.F_GETFD, 0)
+	if errno != 0 {
+		return kernel.FDFlags{}, fmt.Errorf("failed to get fd flags for fd %d (errno=%d)", f, errno)
+	}
+	return kernel.FDFlags{
+		CloseOnExec: fdflags&unix.O_CLOEXEC != 0,
+	}, nil
 }

@@ -18,7 +18,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/mq"
@@ -39,7 +38,7 @@ const (
 // +stateify savable
 type RegistryImpl struct {
 	// root is the root dentry of the mq filesystem. Its main usage is to
-	// retreive the root inode, which we use to add, remove, and lookup message
+	// retrieve the root inode, which we use to add, remove, and lookup message
 	// queues.
 	//
 	// We hold a reference on root and release when the registry is destroyed.
@@ -99,7 +98,7 @@ func (r *RegistryImpl) Get(ctx context.Context, name string, access mq.AccessTyp
 		return nil, false, linuxerr.EACCES
 	}
 
-	fd, err := r.newFD(qInode.queue, qInode, access, block, flags)
+	fd, err := r.newFD(ctx, qInode.queue, qInode, access, block, flags)
 	if err != nil {
 		return nil, false, err
 	}
@@ -114,7 +113,7 @@ func (r *RegistryImpl) New(ctx context.Context, name string, q *mq.Queue, access
 	if err != nil {
 		return nil, err
 	}
-	return r.newFD(q, qInode, access, block, flags)
+	return r.newFD(ctx, q, qInode, access, block, flags)
 }
 
 // Unlink implements mq.RegistryImpl.Unlink.
@@ -129,6 +128,7 @@ func (r *RegistryImpl) Unlink(ctx context.Context, name string) error {
 	if err != nil {
 		return err
 	}
+	defer inode.DecRef(ctx)
 	return root.Unlink(ctx, name, inode)
 }
 
@@ -139,7 +139,7 @@ func (r *RegistryImpl) Destroy(ctx context.Context) {
 }
 
 // newFD returns a new file description created using the given queue and inode.
-func (r *RegistryImpl) newFD(q *mq.Queue, inode *queueInode, access mq.AccessType, block bool, flags uint32) (*vfs.FileDescription, error) {
+func (r *RegistryImpl) newFD(ctx context.Context, q *mq.Queue, inode *queueInode, access mq.AccessType, block bool, flags uint32) (*vfs.FileDescription, error) {
 	view, err := mq.NewView(q, access, block)
 	if err != nil {
 		return nil, err
@@ -147,6 +147,7 @@ func (r *RegistryImpl) newFD(q *mq.Queue, inode *queueInode, access mq.AccessTyp
 
 	var dentry kernfs.Dentry
 	dentry.Init(&r.fs.Filesystem, inode)
+	defer dentry.DecRef(ctx)
 
 	fd := &queueFD{queue: view}
 	err = fd.Init(r.mount, &dentry, inode.queue, inode.Locks(), flags)
@@ -157,15 +158,15 @@ func (r *RegistryImpl) newFD(q *mq.Queue, inode *queueInode, access mq.AccessTyp
 }
 
 // perm returns a permission mask created using given flags.
-func perm(access mq.AccessType) fs.PermMask {
+func perm(access mq.AccessType) vfs.AccessTypes {
 	switch access {
 	case mq.ReadWrite:
-		return fs.PermMask{Read: true, Write: true}
+		return vfs.MayRead | vfs.MayWrite
 	case mq.WriteOnly:
-		return fs.PermMask{Write: true}
+		return vfs.MayWrite
 	case mq.ReadOnly:
-		return fs.PermMask{Read: true}
+		return vfs.MayRead
 	default:
-		return fs.PermMask{} // Can't happen, see NewView.
+		return 0 // Can't happen, see NewView.
 	}
 }

@@ -18,12 +18,12 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	fslock "gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	fslock "gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 )
 
 // FileLocks supports POSIX and BSD style locks, which correspond to fcntl(2)
 // and flock(2) respectively in Linux. It can be embedded into various file
-// implementations for VFS2 that support locking.
+// implementations that support locking.
 //
 // Note that in Linux these two types of locks are _not_ cooperative, because
 // race and deadlock conditions make merging them prohibitive. We do the same
@@ -40,7 +40,7 @@ type FileLocks struct {
 
 // LockBSD tries to acquire a BSD-style lock on the entire file.
 func (fl *FileLocks) LockBSD(ctx context.Context, uid fslock.UniqueID, ownerID int32, t fslock.LockType, block bool) error {
-	if err := fl.bsd.LockRegion(ctx, uid, ownerID, t, fslock.LockRange{0, fslock.LockEOF}, block); err == nil || err == linuxerr.ErrWouldBlock {
+	if err := fl.bsd.LockRegion(ctx, uid, ownerID, t, fslock.LockRange{0, fslock.LockEOF}, false, block); err == nil || err == linuxerr.ErrWouldBlock {
 		return err
 	}
 	return linuxerr.ERESTARTSYS
@@ -56,7 +56,8 @@ func (fl *FileLocks) UnlockBSD(uid fslock.UniqueID) {
 
 // LockPOSIX tries to acquire a POSIX-style lock on a file region.
 func (fl *FileLocks) LockPOSIX(ctx context.Context, uid fslock.UniqueID, ownerPID int32, t fslock.LockType, r fslock.LockRange, block bool) error {
-	if err := fl.posix.LockRegion(ctx, uid, ownerPID, t, r, block); err == nil || err == linuxerr.ErrWouldBlock {
+	_, ofd := uid.(*FileDescription)
+	if err := fl.posix.LockRegion(ctx, uid, ownerPID, t, r, ofd, block); err == nil || err == linuxerr.ErrWouldBlock {
 		return err
 	}
 	return linuxerr.ERESTARTSYS
@@ -73,5 +74,6 @@ func (fl *FileLocks) UnlockPOSIX(ctx context.Context, uid fslock.UniqueID, r fsl
 
 // TestPOSIX returns information about whether the specified lock can be held, in the style of the F_GETLK fcntl.
 func (fl *FileLocks) TestPOSIX(ctx context.Context, uid fslock.UniqueID, t fslock.LockType, r fslock.LockRange) (linux.Flock, error) {
-	return fl.posix.TestRegion(ctx, uid, t, r), nil
+	_, ofd := uid.(*FileDescription)
+	return fl.posix.TestRegion(ctx, uid, t, r, ofd), nil
 }

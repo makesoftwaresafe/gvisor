@@ -1,7 +1,7 @@
 """Meta and miscellaneous rules."""
 
-load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//:bzl_library.bzl", _bzl_library = "bzl_library")
+load("@bazel_skylib//rules:build_test.bzl", _build_test = "build_test")
 load("@bazel_skylib//rules:common_settings.bzl", _BuildSettingInfo = "BuildSettingInfo", _bool_flag = "bool_flag")
 
 build_test = _build_test
@@ -21,12 +21,25 @@ def proto_library(name, has_services = None, **kwargs):
         **kwargs
     )
 
-def select_arch(amd64 = "amd64", arm64 = "arm64", default = None, **kwargs):
-    values = {
-        "@bazel_tools//src/conditions:linux_x86_64": amd64,
-        "@bazel_tools//src/conditions:linux_aarch64": arm64,
-    }
-    if default:
+def select_arch(amd64 = None, arm64 = None, riscv64 = None, default = None, **kwargs):
+    """Select an option against standard architectures.
+
+    Args:
+      amd64: the option if the architecture is amd64.
+      arm64: the option if the architecture is arm64.
+      default: the option if no matching architecture is provided.
+      **kwargs: extra select arguments.
+
+    Returns:
+      An appropriate select."""
+    values = dict()
+    if amd64 != None:
+        values["//tools/bazeldefs:amd64"] = amd64
+    if arm64 != None:
+        values["//tools/bazeldefs:arm64"] = arm64
+    if riscv64 != None:
+        values["//tools/bazeldefs:riscv64"] = riscv64
+    if default != None:
         values["//conditions:default"] = default
     return select(values, **kwargs)
 
@@ -72,3 +85,24 @@ def default_net_util():
 
 def coreutil():
     return []  # Nothing needed.
+
+def bpf_program(name, src, bpf_object, visibility, hdrs):
+    """Generates BPF object files from .c source code.
+
+    Args:
+      name: target name for BPF program.
+      src: BPF program souce code in C.
+      bpf_object: name of generated bpf object code.
+      visibility: target visibility.
+      hdrs: header files, but currently unsupported.
+    """
+    if hdrs != []:
+        fail("hdrs attribute is unsupported")
+
+    native.genrule(
+        name = name,
+        srcs = [src],
+        visibility = visibility,
+        outs = [bpf_object],
+        cmd = "clang -O2 -Wall -Werror -target bpf -c $< -o $@ -I/usr/include/$$(uname -m)-linux-gnu",
+    )

@@ -18,7 +18,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,7 +31,6 @@ import (
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	"gvisor.dev/gvisor/pkg/urpc"
 	"gvisor.dev/gvisor/runsc/cmd/util"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
@@ -58,6 +56,13 @@ type Exec struct {
 	// file descriptor referencing the master end of the console's
 	// pseudoterminal.
 	consoleSocket string
+
+	// passFDs are user-supplied FDs from the host to be exposed to the
+	// sandboxed app.
+	passFDs fdMappings
+
+	// execFD is the host file descriptor used for program execution.
+	execFD int
 }
 
 // Name implements subcommands.Command.Name.
@@ -83,7 +88,7 @@ EXAMPLE:
 If the container is configured to run /bin/ps the following will
 output a list of processes running in the container:
 
-       # runc exec <container-id> ps
+       # runsc exec <container-id> ps
 
 OPTIONS:
 `
@@ -101,44 +106,70 @@ func (ex *Exec) SetFlags(f *flag.FlagSet) {
 	f.StringVar(&ex.pidFile, "pid-file", "", "filename that the container pid will be written to")
 	f.StringVar(&ex.internalPidFile, "internal-pid-file", "", "filename that the container-internal pid will be written to")
 	f.StringVar(&ex.consoleSocket, "console-socket", "", "path to an AF_UNIX socket which will receive a file descriptor referencing the master end of the console's pseudoterminal")
+	f.Var(&ex.passFDs, "pass-fd", "file descriptor passed to the container in M:N format, where M is the host and N is the guest descriptor (can be supplied multiple times)")
+	f.IntVar(&ex.execFD, "exec-fd", -1, "host file descriptor used for program execution")
 }
 
 // Execute implements subcommands.Command.Execute. It starts a process in an
 // already created container.
-func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (ex *Exec) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	conf := args[0].(*config.Config)
-	e, id, err := ex.parseArgs(f, conf.EnableRaw)
-	if err != nil {
-		util.Fatalf("parsing process spec: %v", err)
-	}
 	waitStatus := args[1].(*unix.WaitStatus)
 
+	if f.NArg() < 1 {
+		f.Usage()
+		util.Fatalf("a container-id is required")
+	}
+	id := f.Arg(0)
 	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
 	if err != nil {
 		util.Fatalf("loading sandbox: %v", err)
 	}
 
+	e, err := ex.parseArgs(f, c.Spec.Process, conf.EnableRaw)
+	if err != nil {
+		util.Fatalf("parsing process spec: %v", err)
+	}
+
 	log.Debugf("Exec arguments: %+v", e)
 	log.Debugf("Exec capabilities: %+v", e.Capabilities)
 
-	// Replace empty settings with defaults from container.
-	if e.WorkingDirectory == "" {
-		e.WorkingDirectory = c.Spec.Process.Cwd
-	}
-	if e.Envv == nil {
-		e.Envv, err = specutils.ResolveEnvs(c.Spec.Process.Env, ex.env)
-		if err != nil {
-			util.Fatalf("getting environment variables: %v", err)
-		}
+	// Create the file descriptor map for the process in the container.
+	fdMap := map[int]*os.File{
+		0: os.Stdin,
+		1: os.Stdout,
+		2: os.Stderr,
 	}
 
-	if e.Capabilities == nil {
-		e.Capabilities, err = specutils.Capabilities(conf.EnableRaw, c.Spec.Process.Capabilities)
-		if err != nil {
-			util.Fatalf("creating capabilities: %v", err)
+	// Add custom file descriptors to the map.
+	for _, mapping := range ex.passFDs {
+		file := os.NewFile(uintptr(mapping.Host), "")
+		if file == nil {
+			util.Fatalf("failed to create file from file descriptor %d", mapping.Host)
 		}
-		log.Infof("Using exec capabilities from container: %+v", e.Capabilities)
+		fdMap[mapping.Guest] = file
 	}
+
+	var execFile *os.File
+	if ex.execFD >= 0 {
+		execFile = os.NewFile(uintptr(ex.execFD), "exec-fd")
+	}
+
+	// Close the underlying file descriptors after we have passed them.
+	defer func() {
+		for _, file := range fdMap {
+			fd := file.Fd()
+			if file.Close() != nil {
+				log.Debugf("Failed to close FD %d", fd)
+			}
+		}
+
+		if execFile != nil && execFile.Close() != nil {
+			log.Debugf("Failed to close exec FD")
+		}
+	}()
+
+	e.FilePayload = control.NewFilePayload(fdMap, execFile)
 
 	// containerd expects an actual process to represent the container being
 	// executed. If detach was specified, starts a child in non-detach mode,
@@ -167,7 +198,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	// Write the sandbox-internal pid if required.
 	if ex.internalPidFile != "" {
 		pidStr := []byte(strconv.Itoa(int(pid)))
-		if err := ioutil.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
+		if err := os.WriteFile(ex.internalPidFile, pidStr, 0644); err != nil {
 			return util.Errorf("writing internal pid file %q: %v", ex.internalPidFile, err)
 		}
 	}
@@ -176,7 +207,7 @@ func (ex *Exec) exec(conf *config.Config, c *container.Container, e *control.Exe
 	// users can safely assume that the internal pid file is ready after
 	// `runsc exec -d` returns.
 	if ex.pidFile != "" {
-		if err := ioutil.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
+		if err := os.WriteFile(ex.pidFile, []byte(strconv.Itoa(os.Getpid())), 0644); err != nil {
 			return util.Errorf("writing pid file: %v", err)
 		}
 	}
@@ -203,7 +234,7 @@ func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitSt
 	// filename in a temp directory.
 	pidFile := ex.pidFile
 	if pidFile == "" {
-		tmpDir, err := ioutil.TempDir("", "exec-pid-")
+		tmpDir, err := os.MkdirTemp("", "exec-pid-")
 		if err != nil {
 			util.Fatalf("creating TempDir: %v", err)
 		}
@@ -255,7 +286,7 @@ func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitSt
 	// '--process' file is deleted as soon as this process returns and the child
 	// may fail to read it.
 	ready := func() (bool, error) {
-		pidb, err := ioutil.ReadFile(pidFile)
+		pidb, err := os.ReadFile(pidFile)
 		if err == nil {
 			// File appeared, check whether pid is fully written.
 			pid, err := strconv.Atoi(string(pidb))
@@ -282,29 +313,30 @@ func (ex *Exec) execChildAndWait(waitStatus *unix.WaitStatus) subcommands.ExitSt
 }
 
 // parseArgs parses exec information from the command line or a JSON file
-// depending on whether the --process flag was used. Returns an ExecArgs and
-// the ID of the container to be used.
-func (ex *Exec) parseArgs(f *flag.FlagSet, enableRaw bool) (*control.ExecArgs, string, error) {
+// depending on whether the --process flag was used.
+func (ex *Exec) parseArgs(f *flag.FlagSet, p *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
 	if ex.processPath == "" {
 		// Requires at least a container ID and command.
 		if f.NArg() < 2 {
 			f.Usage()
-			return nil, "", fmt.Errorf("both a container-id and command are required")
+			return nil, fmt.Errorf("both a container-id and command are required")
 		}
-		e, err := ex.argsFromCLI(f.Args()[1:], enableRaw)
-		return e, f.Arg(0), err
+		return ex.argsFromCLI(p, f.Args()[1:], enableRaw)
 	}
 	// Requires only the container ID.
 	if f.NArg() != 1 {
 		f.Usage()
-		return nil, "", fmt.Errorf("a container-id is required")
+		return nil, fmt.Errorf("only the container-id is required")
 	}
-	e, err := ex.argsFromProcessFile(enableRaw)
-	return e, f.Arg(0), err
+	e, err := ex.argsFromProcessFile(p, enableRaw)
+	return e, err
 }
 
-func (ex *Exec) argsFromCLI(argv []string, enableRaw bool) (*control.ExecArgs, error) {
-	extraKGIDs := make([]auth.KGID, 0, len(ex.extraKGIDs))
+func (ex *Exec) argsFromCLI(p *specs.Process, argv []string, enableRaw bool) (*control.ExecArgs, error) {
+	extraKGIDs := make([]auth.KGID, 0, len(p.User.AdditionalGids)+len(ex.extraKGIDs))
+	for _, kgid := range p.User.AdditionalGids {
+		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
+	}
 	for _, s := range ex.extraKGIDs {
 		kgid, err := strconv.Atoi(s)
 		if err != nil {
@@ -313,28 +345,46 @@ func (ex *Exec) argsFromCLI(argv []string, enableRaw bool) (*control.ExecArgs, e
 		extraKGIDs = append(extraKGIDs, auth.KGID(kgid))
 	}
 
-	var caps *auth.TaskCapabilities
-	if len(ex.caps) > 0 {
-		var err error
-		caps, err = capabilities(ex.caps, enableRaw)
-		if err != nil {
-			return nil, fmt.Errorf("capabilities error: %v", err)
-		}
+	caps, err := capabilities(p, ex.caps, enableRaw)
+	if err != nil {
+		return nil, fmt.Errorf("capabilities error: %v", err)
+	}
+
+	cwd := p.Cwd
+	if ex.cwd != "" {
+		cwd = ex.cwd
+	}
+
+	envv := append(p.Env, ex.env...)
+
+	kuid := auth.KUID(p.User.UID)
+	if ex.user.kuidSet {
+		kuid = ex.user.kuid
+	}
+
+	kgid := auth.KGID(p.User.GID)
+	if ex.user.kgidSet {
+		kgid = ex.user.kgid
 	}
 
 	return &control.ExecArgs{
 		Argv:             argv,
-		WorkingDirectory: ex.cwd,
-		KUID:             ex.user.kuid,
-		KGID:             ex.user.kgid,
+		Envv:             envv,
+		WorkingDirectory: cwd,
+		KUID:             kuid,
+		KGID:             kgid,
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
-		StdioIsPty:       ex.consoleSocket != "",
-		FilePayload:      urpc.FilePayload{[]*os.File{os.Stdin, os.Stdout, os.Stderr}},
+		StdioIsPty:       ex.consoleSocket != "" || console.IsPty(os.Stdin.Fd()),
+		FilePayload: control.NewFilePayload(map[int]*os.File{
+			0: os.Stdin,
+			1: os.Stdout,
+			2: os.Stderr,
+		}, nil),
 	}, nil
 }
 
-func (ex *Exec) argsFromProcessFile(enableRaw bool) (*control.ExecArgs, error) {
+func (ex *Exec) argsFromProcessFile(specProc *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
 	f, err := os.Open(ex.processPath)
 	if err != nil {
 		return nil, fmt.Errorf("error opening process file: %s, %v", ex.processPath, err)
@@ -344,24 +394,42 @@ func (ex *Exec) argsFromProcessFile(enableRaw bool) (*control.ExecArgs, error) {
 	if err := json.NewDecoder(f).Decode(&p); err != nil {
 		return nil, fmt.Errorf("error parsing process file: %s, %v", ex.processPath, err)
 	}
-	return argsFromProcess(&p, enableRaw)
+	if validateProcessSpec(&p) != nil {
+		return nil, fmt.Errorf("invalid process spec: %w", err)
+	}
+	return argsFromProcess(specProc, &p, enableRaw)
+}
+
+func validateProcessSpec(p *specs.Process) error {
+	if p.Cwd == "" {
+		return fmt.Errorf("cwd must not be empty")
+	}
+	if !filepath.IsAbs(p.Cwd) {
+		return fmt.Errorf("cwd %q must be an absolute path", p.Cwd)
+	}
+	if len(p.Args) == 0 {
+		return fmt.Errorf("args must not be empty")
+	}
+	return nil
 }
 
 // argsFromProcess performs all the non-IO conversion from the Process struct
 // to ExecArgs.
-func argsFromProcess(p *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
+func argsFromProcess(specProc *specs.Process, p *specs.Process, enableRaw bool) (*control.ExecArgs, error) {
 	// Create capabilities.
-	var caps *auth.TaskCapabilities
-	if p.Capabilities != nil {
-		var err error
-		// Starting from Docker 19, capabilities are explicitly set for exec (instead
-		// of nil like before). So we can't distinguish 'exec' from
-		// 'exec --privileged', as both specify CAP_NET_RAW. Therefore, filter
-		// CAP_NET_RAW in the same way as container start.
-		caps, err = specutils.Capabilities(enableRaw, p.Capabilities)
-		if err != nil {
-			return nil, fmt.Errorf("error creating capabilities: %v", err)
-		}
+	procCaps := p.Capabilities
+	if procCaps == nil {
+		// If p doesn't have capabilities specified, fallback to the capabilities
+		// specified in the container spec.
+		procCaps = specProc.Capabilities
+	}
+	// Starting from Docker 19, capabilities are explicitly set for exec (instead
+	// of nil like before). So we can't distinguish 'exec' from
+	// 'exec --privileged', as both specify CAP_NET_RAW. Therefore, filter
+	// CAP_NET_RAW in the same way as container start.
+	caps, err := specutils.Capabilities(enableRaw, procCaps)
+	if err != nil {
+		return nil, fmt.Errorf("error creating capabilities: %v", err)
 	}
 
 	// Convert the spec's additional GIDs to KGIDs.
@@ -379,21 +447,28 @@ func argsFromProcess(p *specs.Process, enableRaw bool) (*control.ExecArgs, error
 		ExtraKGIDs:       extraKGIDs,
 		Capabilities:     caps,
 		StdioIsPty:       p.Terminal,
-		FilePayload:      urpc.FilePayload{Files: []*os.File{os.Stdin, os.Stdout, os.Stderr}},
+		FilePayload: control.NewFilePayload(map[int]*os.File{
+			0: os.Stdin,
+			1: os.Stdout,
+			2: os.Stderr,
+		}, nil),
 	}, nil
 }
 
 // capabilities takes a list of capabilities as strings and returns an
 // auth.TaskCapabilities struct with those capabilities in every capability set.
 // This mimics runc's behavior.
-func capabilities(cs []string, enableRaw bool) (*auth.TaskCapabilities, error) {
-	var specCaps specs.LinuxCapabilities
+func capabilities(p *specs.Process, cs []string, enableRaw bool) (*auth.TaskCapabilities, error) {
+	specCaps := *p.Capabilities
 	for _, cap := range cs {
-		specCaps.Ambient = append(specCaps.Ambient, cap)
 		specCaps.Bounding = append(specCaps.Bounding, cap)
 		specCaps.Effective = append(specCaps.Effective, cap)
-		specCaps.Inheritable = append(specCaps.Inheritable, cap)
 		specCaps.Permitted = append(specCaps.Permitted, cap)
+		// Consistent with runc, don't set inheritable. Only set ambient if we
+		// already have some inheritable bits set from spec.
+		if specCaps.Inheritable != nil {
+			specCaps.Ambient = append(specCaps.Ambient, cap)
+		}
 	}
 	// Starting from Docker 19, capabilities are explicitly set for exec (instead
 	// of nil like before). So we can't distinguish 'exec' from
@@ -410,35 +485,40 @@ type stringSlice []string
 
 // String implements flag.Value.String.
 func (ss *stringSlice) String() string {
-	return fmt.Sprintf("%v", *ss)
+	return strings.Join(*ss, ",")
 }
 
 // Get implements flag.Value.Get.
-func (ss *stringSlice) Get() interface{} {
+func (ss *stringSlice) Get() any {
 	return ss
 }
 
-// Set implements flag.Value.Set.
+// Set implements flag.Value.Set. Set(String()) should be idempotent.
 func (ss *stringSlice) Set(s string) error {
-	*ss = append(*ss, s)
+	*ss = append(*ss, strings.Split(s, ",")...)
 	return nil
 }
 
 // user allows -user to convey a UID and, optionally, a GID separated by a
 // colon.
 type user struct {
-	kuid auth.KUID
-	kgid auth.KGID
+	kuid    auth.KUID
+	kuidSet bool
+	kgid    auth.KGID
+	kgidSet bool
 }
 
+// String implements flag.Value.String.
 func (u *user) String() string {
-	return fmt.Sprintf("%+v", *u)
+	return fmt.Sprintf("%d:%d", u.kuid, u.kgid)
 }
 
-func (u *user) Get() interface{} {
+// Get implements flag.Value.Get.
+func (u *user) Get() any {
 	return u
 }
 
+// Set implements flag.Value.Set. Set(String()) should be idempotent.
 func (u *user) Set(s string) error {
 	parts := strings.SplitN(s, ":", 2)
 	kuid, err := strconv.Atoi(parts[0])
@@ -446,12 +526,14 @@ func (u *user) Set(s string) error {
 		return fmt.Errorf("couldn't parse UID: %s", parts[0])
 	}
 	u.kuid = auth.KUID(kuid)
+	u.kuidSet = true
 	if len(parts) > 1 {
 		kgid, err := strconv.Atoi(parts[1])
 		if err != nil {
 			return fmt.Errorf("couldn't parse GID: %s", parts[1])
 		}
 		u.kgid = auth.KGID(kgid)
+		u.kgidSet = true
 	}
 	return nil
 }

@@ -45,16 +45,14 @@ import (
 	"bytes"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -100,12 +98,10 @@ func main() {
 	remoteAddrName := os.Args[4]
 	remotePortName := os.Args[5]
 
-	rand.Seed(time.Now().UnixNano())
-
-	addr := tcpip.Address(net.ParseIP(addrName).To4())
+	addr := tcpip.AddrFromSlice(net.ParseIP(addrName).To4())
 	remote := tcpip.FullAddress{
 		NIC:  1,
-		Addr: tcpip.Address(net.ParseIP(remoteAddrName).To4()),
+		Addr: tcpip.AddrFromSlice(net.ParseIP(remoteAddrName).To4()),
 	}
 
 	var localPort uint16
@@ -171,7 +167,7 @@ func main() {
 
 	// Bind if a port is specified.
 	if localPort != 0 {
-		if err := ep.Bind(tcpip.FullAddress{0, "", localPort}); err != nil {
+		if err := ep.Bind(tcpip.FullAddress{Port: localPort}); err != nil {
 			log.Fatal("Bind failed: ", err)
 		}
 	}

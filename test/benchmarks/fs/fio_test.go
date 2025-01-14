@@ -25,45 +25,154 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
-// BenchmarkFio runs fio on the runtime under test. There are 4 basic test
+// Fio benchmarks run fio on the runtime under test. There are 4 basic test
 // cases each run on a tmpfs mount and a bind mount. Fio requires root so that
 // caches can be dropped.
-func BenchmarkFio(b *testing.B) {
+
+// BenchmarkFioWrite runs write operation benchmark cases.
+func BenchmarkFioWrite(b *testing.B) {
 	testCases := []tools.Fio{
 		{
-			Test:      "write",
-			BlockSize: 4,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineSync,
+			BlockSizeKB: 4,
+			IODepth:     1,
 		},
 		{
-			Test:      "write",
-			BlockSize: 1024,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineSync,
+			BlockSizeKB: 64,
+			IODepth:     1,
 		},
 		{
-			Test:      "read",
-			BlockSize: 4,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 1024,
+			IODepth:     4,
 		},
 		{
-			Test:      "read",
-			BlockSize: 1024,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 4,
+			IODepth:     4,
+			Direct:      true,
 		},
 		{
-			Test:      "randwrite",
-			BlockSize: 4,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 64,
+			IODepth:     4,
+			Direct:      true,
 		},
 		{
-			Test:      "randread",
-			BlockSize: 4,
-			IODepth:   4,
+			Test:        "write",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 1024,
+			IODepth:     4,
+			Direct:      true,
 		},
 	}
+	doFioBenchmark(b, testCases)
+}
 
+// BenchmarkFioRead runs read operation test cases.
+func BenchmarkFioRead(b *testing.B) {
+	testCases := []tools.Fio{
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 4,
+			IODepth:     4,
+		},
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 64,
+			IODepth:     4,
+		},
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 1024,
+			IODepth:     4,
+		},
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 4,
+			IODepth:     4,
+			Direct:      true,
+		},
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 64,
+			IODepth:     4,
+			Direct:      true,
+		},
+		{
+			Test:        "read",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 1024,
+			IODepth:     4,
+			Direct:      true,
+		},
+	}
+	doFioBenchmark(b, testCases)
+}
+
+// BenchmarkFioRandWrite runs randwrite test cases.
+func BenchmarkFioRandWrite(b *testing.B) {
+	testCases := []tools.Fio{
+		{
+			Test:        "randwrite",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 4,
+			IODepth:     4,
+		},
+		{
+			Test:        "randwrite",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 4,
+			IODepth:     4,
+			Direct:      true,
+		},
+	}
+	doFioBenchmark(b, testCases)
+}
+
+// BenchmarkFioRandRead runs randread test cases.
+func BenchmarkFioRandRead(b *testing.B) {
+	testCases := []tools.Fio{
+		{
+			Test:        "randread",
+			IOEngine:    tools.EngineLibAIO,
+			BlockSizeKB: 4,
+			IODepth:     4,
+		},
+		{
+			Test:        "randread",
+			IOEngine:    tools.EngineLibAIO,
+			Jobs:        8,
+			BlockSizeKB: 4,
+			IODepth:     4,
+			Direct:      true,
+		},
+	}
+	doFioBenchmark(b, testCases)
+}
+
+func doFioBenchmark(b *testing.B, testCases []tools.Fio) {
 	machine, err := harness.GetMachine()
 	if err != nil {
 		b.Fatalf("failed to get machine with: %v", err)
@@ -72,29 +181,19 @@ func BenchmarkFio(b *testing.B) {
 
 	for _, fsType := range []harness.FileSystemType{harness.BindFS, harness.TmpFS, harness.RootFS} {
 		for _, tc := range testCases {
-			operation := tools.Parameter{
-				Name:  "operation",
-				Value: tc.Test,
-			}
-			blockSize := tools.Parameter{
-				Name:  "blockSize",
-				Value: fmt.Sprintf("%dK", tc.BlockSize),
-			}
 			filesystem := tools.Parameter{
 				Name:  "filesystem",
 				Value: string(fsType),
 			}
-			name, err := tools.ParametersToName(operation, blockSize, filesystem)
-			if err != nil {
-				b.Fatalf("Failed to parser paramters: %v", err)
-			}
+			_, name := tc.Parameters(b, filesystem)
 			b.Run(name, func(b *testing.B) {
 				b.StopTimer()
-				tc.Size = b.N
+				tc.SizeMB = b.N
 
 				ctx := context.Background()
 				container := machine.GetContainer(ctx, b)
 				cu := cleanup.Make(func() {
+					metricsviz.FromContainerLogs(ctx, b, container)
 					container.CleanUp(ctx)
 				})
 				defer cu.Clean()
@@ -104,12 +203,13 @@ func BenchmarkFio(b *testing.B) {
 					b.Fatalf("failed to make mount: %v", err)
 				}
 
+				runOpts := dockerutil.RunOpts{
+					Image:  "benchmarks/fio",
+					Mounts: mnts,
+				}
 				// Start the container with the mount.
 				if err := container.Spawn(
-					ctx, dockerutil.RunOpts{
-						Image:  "benchmarks/fio",
-						Mounts: mnts,
-					},
+					ctx, runOpts,
 					// Sleep on the order of b.N.
 					"sleep", fmt.Sprintf("%d", 1000*b.N),
 				); err != nil {
@@ -121,12 +221,22 @@ func BenchmarkFio(b *testing.B) {
 					b.Fatalf("failed to copy directory: %v (%s)", err, out)
 				}
 
+				if fsType == harness.FuseFS {
+					container.CopyFiles(&runOpts, "/fusebin", "test/runner/fuse/fuse")
+					_, err := container.ExecProcess(ctx, dockerutil.ExecOpts{
+						Privileged: true,
+					}, "/fusebin/fuse", "--dir="+outdir, "--debug=false")
+					if err != nil {
+						b.Fatalf("starting fuse server failed with: %v", err)
+					}
+				}
+
 				// Directory and filename inside container where fio will read/write.
 				outfile := filepath.Join(outdir, "test.txt")
 
 				// For reads, we need a file to read so make one inside the container.
 				if strings.Contains(tc.Test, "read") {
-					fallocateCmd := fmt.Sprintf("fallocate -l %dK %s", tc.Size, outfile)
+					fallocateCmd := fmt.Sprintf("fallocate -l %dM %s", tc.SizeMB, outfile)
 					if out, err := container.Exec(ctx, dockerutil.ExecOpts{},
 						strings.Split(fallocateCmd, " ")...); err != nil {
 						b.Fatalf("failed to create readable file on mount: %v, %s", err, out)

@@ -44,7 +44,7 @@ type mockCopyContext struct {
 }
 
 // populate fills the task memory with the contents of val.
-func (t *mockCopyContext) populate(val interface{}) {
+func (t *mockCopyContext) populate(val any) {
 	var buf bytes.Buffer
 	// Use binary.Write so we aren't testing go-marshal against its own
 	// potentially buggy implementation.
@@ -120,7 +120,7 @@ func unsafeMemory(m marshal.Marshallable) []byte {
 // returned slice is related to m, the caller must ensure m lives long enough.
 //
 // Precondition: m must be a slice.
-func unsafeMemorySlice(m interface{}, elt marshal.Marshallable) []byte {
+func unsafeMemorySlice(m any, elt marshal.Marshallable) []byte {
 	kind := reflect.TypeOf(m).Kind()
 	if kind != reflect.Slice {
 		panic("unsafeMemorySlice called on non-slice")
@@ -222,6 +222,32 @@ func limitedCopyOut(t *testing.T, src marshal.Marshallable, limit int) {
 	compareMemory(t, expectedMem, actualMem, n)
 }
 
+// copyInN marshals src to task memory, requesting the marshalling to be
+// limited to limit bytes.
+func copyInN(t *testing.T, src, dst marshal.Marshallable, limit int) {
+	var cc mockCopyContext
+	cc.populate(src)
+	cc.setLimit(limit)
+
+	n, err := dst.CopyInN(&cc, hostarch.Addr(0), limit)
+	if err != nil {
+		t.Errorf("CopyInN returned unexpected error: %v", err)
+	}
+	if n != limit {
+		t.Errorf("CopyInN copied unexpected number of bytes, expected %d, got %d", limit, n)
+	}
+
+	expectedMem := unsafeMemory(src)
+	defer runtime.KeepAlive(src)
+	actualMem := unsafeMemory(dst)
+	defer runtime.KeepAlive(dst)
+
+	t.Logf("Expected: %v + %v\n", expectedMem[:n], expectedMem[n:])
+	t.Logf("Actual  : %v + %v\n", actualMem[:n], actualMem[n:])
+
+	compareMemory(t, expectedMem, actualMem, n)
+}
+
 // copyOutN marshals src to task memory, requesting the marshalling to be
 // limited to limit bytes.
 func copyOutN(t *testing.T, src marshal.Marshallable, limit int) {
@@ -296,6 +322,14 @@ func TestLimitedMarshalling(t *testing.T) {
 
 			copyOutN(t, expected, expected.SizeBytes()/2)
 		})
+
+		// Explicitly request partial copy-in.
+		t.Run(fmt.Sprintf("PartialCopyInN_%v", ty), func(t *testing.T) {
+			expected := reflect.New(ty).Interface().(marshal.Marshallable)
+			analysis.RandomizeValue(expected)
+
+			copyInN(t, expected, expected, expected.SizeBytes()/2)
+		})
 	}
 }
 
@@ -305,52 +339,52 @@ func TestLimitedMarshalling(t *testing.T) {
 func TestLimitedSliceMarshalling(t *testing.T) {
 	types := []struct {
 		arrayPtrType reflect.Type
-		copySliceIn  func(cc marshal.CopyContext, addr hostarch.Addr, dstSlice interface{}) (int, error)
-		copySliceOut func(cc marshal.CopyContext, addr hostarch.Addr, srcSlice interface{}) (int, error)
-		unsafeMemory func(arrPtr interface{}) []byte
+		copySliceIn  func(cc marshal.CopyContext, addr hostarch.Addr, dstSlice any) (int, error)
+		copySliceOut func(cc marshal.CopyContext, addr hostarch.Addr, srcSlice any) (int, error)
+		unsafeMemory func(arrPtr any) []byte
 	}{
 		// Packed types.
 		{
 			reflect.TypeOf((*[20]test.Stat)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[20]test.Stat)[:]
 				return test.CopyStatSliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[20]test.Stat)[:]
 				return test.CopyStatSliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[20]test.Stat)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
 		},
 		{
 			reflect.TypeOf((*[1]test.Stat)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[1]test.Stat)[:]
 				return test.CopyStatSliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[1]test.Stat)[:]
 				return test.CopyStatSliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[1]test.Stat)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
 		},
 		{
 			reflect.TypeOf((*[5]test.SignalSetAlias)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[5]test.SignalSetAlias)[:]
 				return test.CopySignalSetAliasSliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[5]test.SignalSetAlias)[:]
 				return test.CopySignalSetAliasSliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[5]test.SignalSetAlias)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
@@ -358,45 +392,45 @@ func TestLimitedSliceMarshalling(t *testing.T) {
 		// Non-packed types.
 		{
 			reflect.TypeOf((*[20]test.Type1)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[20]test.Type1)[:]
 				return test.CopyType1SliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[20]test.Type1)[:]
 				return test.CopyType1SliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[20]test.Type1)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
 		},
 		{
 			reflect.TypeOf((*[1]test.Type1)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[1]test.Type1)[:]
 				return test.CopyType1SliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[1]test.Type1)[:]
 				return test.CopyType1SliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[1]test.Type1)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
 		},
 		{
 			reflect.TypeOf((*[7]test.Type8)(nil)),
-			func(cc marshal.CopyContext, addr hostarch.Addr, dst interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, dst any) (int, error) {
 				slice := dst.(*[7]test.Type8)[:]
 				return test.CopyType8SliceIn(cc, addr, slice)
 			},
-			func(cc marshal.CopyContext, addr hostarch.Addr, src interface{}) (int, error) {
+			func(cc marshal.CopyContext, addr hostarch.Addr, src any) (int, error) {
 				slice := src.(*[7]test.Type8)[:]
 				return test.CopyType8SliceOut(cc, addr, slice)
 			},
-			func(a interface{}) []byte {
+			func(a any) []byte {
 				slice := a.(*[7]test.Type8)[:]
 				return unsafeMemorySlice(slice, &slice[0])
 			},
@@ -428,7 +462,7 @@ func TestLimitedSliceMarshalling(t *testing.T) {
 			elem := reflect.New(arrayTy.Elem()).Interface().(marshal.Marshallable)
 
 			// Equivalent:
-			// var expected, actual interface{}
+			// var expected, actual any
 			// expected = new([20]test.Stat)
 			// actual = new([20]test.Stat)
 			expected := reflect.New(arrayTy).Interface()
@@ -483,7 +517,7 @@ func TestLimitedSliceMarshalling(t *testing.T) {
 			elem := reflect.New(arrayTy.Elem()).Interface().(marshal.Marshallable)
 
 			// Equivalent:
-			// var expected, actual interface{}
+			// var expected, actual any
 			// expected = new([20]test.Stat)
 			// actual = new([20]test.Stat)
 			expected := reflect.New(arrayTy).Interface()

@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -30,6 +31,8 @@ import (
 // TTYFileDescription implements vfs.FileDescriptionImpl for a host file
 // descriptor that wraps a TTY FD.
 //
+// It implements kernel.TTYOperations.
+//
 // +stateify savable
 type TTYFileDescription struct {
 	fileDescription
@@ -37,44 +40,49 @@ type TTYFileDescription struct {
 	// mu protects the fields below.
 	mu sync.Mutex `state:"nosave"`
 
-	// session is the session attached to this TTYFileDescription.
-	session *kernel.Session
-
-	// fgProcessGroup is the foreground process group that is currently
-	// connected to this TTY.
-	fgProcessGroup *kernel.ProcessGroup
-
 	// termios contains the terminal attributes for this TTY.
 	termios linux.KernelTermios
+
+	// tty is the kernel.TTY associated with this host tty.
+	tty *kernel.TTY
 }
 
-// InitForegroundProcessGroup sets the foreground process group and session for
-// the TTY. This should only be called once, after the foreground process group
-// has been created, but before it has started running.
-func (t *TTYFileDescription) InitForegroundProcessGroup(pg *kernel.ProcessGroup) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if t.fgProcessGroup != nil {
-		panic("foreground process group is already set")
+// NewTTYFileDescription returns a new TTYFileDescription.
+func NewTTYFileDescription(i *inode) *TTYFileDescription {
+	fd := &TTYFileDescription{
+		fileDescription: fileDescription{inode: i},
+		termios:         linux.DefaultReplicaTermios,
 	}
-	t.fgProcessGroup = pg
-	t.session = pg.Session()
+	// Index does not matter here. This tty is not coming from a devpts
+	// mount, so it won't collide with any of the ptys created there.
+	fd.tty = kernel.NewTTY(0, fd)
+	return fd
 }
 
-// ForegroundProcessGroup returns the foreground process for the TTY.
-func (t *TTYFileDescription) ForegroundProcessGroup() *kernel.ProcessGroup {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.fgProcessGroup
+// Open re-opens the tty fd, for example via open(/dev/tty). See Linux's
+// tty_repoen().
+func (t *TTYFileDescription) Open(_ context.Context, _ *vfs.Mount, _ *vfs.Dentry, _ vfs.OpenOptions) (*vfs.FileDescription, error) {
+	t.vfsfd.IncRef()
+	return &t.vfsfd, nil
 }
 
 // Release implements fs.FileOperations.Release.
 func (t *TTYFileDescription) Release(ctx context.Context) {
-	t.mu.Lock()
-	t.fgProcessGroup = nil
-	t.mu.Unlock()
-
 	t.fileDescription.Release(ctx)
+}
+
+// TTY returns the kernel.TTY.
+func (t *TTYFileDescription) TTY() *kernel.TTY {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.tty
+}
+
+// ThreadGroup returns the kernel.ThreadGroup associated with this tty.
+func (t *TTYFileDescription) ThreadGroup() *kernel.ThreadGroup {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.tty.ThreadGroup()
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -144,7 +152,7 @@ func (t *TTYFileDescription) Write(ctx context.Context, src usermem.IOSequence, 
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
-func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	task := kernel.TaskFromContext(ctx)
 	if task == nil {
 		return 0, linuxerr.ENOTTY
@@ -154,6 +162,17 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 	fd := t.inode.hostFD
 	ioctl := args[1].Uint64()
 	switch ioctl {
+	case linux.FIONREAD:
+		v, err := ioctlFionread(fd)
+		if err != nil {
+			return 0, err
+		}
+
+		var buf [4]byte
+		hostarch.ByteOrder.PutUint32(buf[:], v)
+		_, err = io.CopyOut(ctx, args[2].Pointer(), buf[:], usermem.IOOpts{})
+		return 0, err
+
 	case linux.TCGETS:
 		termios, err := ioctlGetTermios(fd)
 		if err != nil {
@@ -194,9 +213,14 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		t.mu.Lock()
 		defer t.mu.Unlock()
 
+		fgpg, err := t.tty.ThreadGroup().ForegroundProcessGroup(t.tty)
+		if err != nil {
+			return 0, err
+		}
+
 		// Map the ProcessGroup into a ProcessGroupID in the task's PID namespace.
-		pgID := primitive.Int32(pidns.IDOfProcessGroup(t.fgProcessGroup))
-		_, err := pgID.CopyOut(task, args[2].Pointer())
+		pgID := primitive.Int32(pidns.IDOfProcessGroup(fgpg))
+		_, err = pgID.CopyOut(task, args[2].Pointer())
 		return 0, err
 
 	case linux.TIOCSPGRP:
@@ -218,7 +242,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		}
 
 		// Check that calling task's process group is in the TTY session.
-		if task.ThreadGroup().Session() != t.session {
+		if task.ThreadGroup().Session() != t.tty.ThreadGroup().Session() {
 			return 0, linuxerr.ENOTTY
 		}
 
@@ -227,25 +251,10 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 			return 0, err
 		}
 		pgID := kernel.ProcessGroupID(pgIDP)
-
-		// pgID must be non-negative.
-		if pgID < 0 {
-			return 0, linuxerr.EINVAL
+		if err := t.tty.ThreadGroup().SetForegroundProcessGroupID(t.tty, pgID); err != nil {
+			return 0, err
 		}
 
-		// Process group with pgID must exist in this PID namespace.
-		pidns := task.PIDNamespace()
-		pg := pidns.ProcessGroupWithID(pgID)
-		if pg == nil {
-			return 0, linuxerr.ESRCH
-		}
-
-		// Check that new process group is in the TTY session.
-		if pg.Session() != t.session {
-			return 0, linuxerr.EPERM
-		}
-
-		t.fgProcessGroup = pg
 		return 0, nil
 
 	case linux.TIOCGWINSZ:
@@ -299,7 +308,7 @@ func (t *TTYFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch
 		linux.TIOCSSERIAL,
 		linux.TIOCGPTPEER:
 
-		unimpl.EmitUnimplementedEvent(ctx)
+		unimpl.EmitUnimplementedEvent(ctx, sysno)
 		fallthrough
 	default:
 		return 0, linuxerr.ENOTTY
@@ -325,16 +334,17 @@ func (t *TTYFileDescription) checkChange(ctx context.Context, sig linux.Signal) 
 
 	tg := task.ThreadGroup()
 	pg := tg.ProcessGroup()
+	ttyTg := t.tty.ThreadGroup()
 
 	// If the session for the task is different than the session for the
 	// controlling TTY, then the change is allowed. Seems like a bad idea,
 	// but that's exactly what linux does.
-	if tg.Session() != t.fgProcessGroup.Session() {
+	if ttyTg == nil || tg.Session() != ttyTg.Session() {
 		return nil
 	}
 
 	// If we are the foreground process group, then the change is allowed.
-	if pg == t.fgProcessGroup {
+	if fgpg, _ := t.tty.ThreadGroup().ForegroundProcessGroup(t.tty); pg == fgpg {
 		return nil
 	}
 

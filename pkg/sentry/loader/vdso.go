@@ -42,7 +42,7 @@ type fileContext struct {
 	context.Context
 }
 
-func (f *fileContext) Value(key interface{}) interface{} {
+func (f *fileContext) Value(key any) any {
 	switch key {
 	case uniqueid.CtxGlobalUniqueID:
 		return uint64(0)
@@ -55,6 +55,7 @@ type byteFullReader struct {
 	data []byte
 }
 
+// ReadFull implements fullReader.ReadFull.
 func (b *byteFullReader) ReadFull(ctx context.Context, dst usermem.IOSequence, offset int64) (int64, error) {
 	if offset < 0 {
 		return 0, linuxerr.EINVAL
@@ -178,7 +179,7 @@ type VDSO struct {
 
 // PrepareVDSO validates the system VDSO and returns a VDSO, containing the
 // param page for updating by the kernel.
-func PrepareVDSO(mfp pgalloc.MemoryFileProvider) (*VDSO, error) {
+func PrepareVDSO(mf *pgalloc.MemoryFile) (*VDSO, error) {
 	vdsoFile := &byteFullReader{data: vdsodata.Binary}
 
 	// First make sure the VDSO is valid. vdsoFile does not use ctx, so a
@@ -194,7 +195,6 @@ func PrepareVDSO(mfp pgalloc.MemoryFileProvider) (*VDSO, error) {
 		return nil, fmt.Errorf("VDSO size overflows? %#x", len(vdsodata.Binary))
 	}
 
-	mf := mfp.MemoryFile()
 	vdso, err := mf.Allocate(uint64(size), pgalloc.AllocOpts{Kind: usage.System})
 	if err != nil {
 		return nil, fmt.Errorf("unable to allocate VDSO memory: %v", err)
@@ -220,11 +220,11 @@ func PrepareVDSO(mfp pgalloc.MemoryFileProvider) (*VDSO, error) {
 	}
 
 	return &VDSO{
-		ParamPage: mm.NewSpecialMappable("[vvar]", mfp, paramPage),
+		ParamPage: mm.NewSpecialMappable("[vvar]", mf, paramPage),
 		// TODO(gvisor.dev/issue/157): Don't advertise the VDSO, as
 		// some applications may not be able to handle multiple [vdso]
 		// hints.
-		vdso:  mm.NewSpecialMappable("", mfp, vdso),
+		vdso:  mm.NewSpecialMappable("", mf, vdso),
 		os:    info.os,
 		arch:  info.arch,
 		phdrs: info.phdrs,

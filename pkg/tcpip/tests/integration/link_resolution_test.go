@@ -25,11 +25,14 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/link/ethernet"
 	"gvisor.dev/gvisor/pkg/tcpip/link/pipe"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -44,10 +47,14 @@ import (
 )
 
 func setupStack(t *testing.T, stackOpts stack.Options, host1NICID, host2NICID tcpip.NICID) (*stack.Stack, *stack.Stack) {
+	return setupStackWithSeparateOpts(t, stackOpts, stackOpts, host1NICID, host2NICID)
+}
+
+func setupStackWithSeparateOpts(t *testing.T, stack1Opts stack.Options, stack2Opts stack.Options, host1NICID, host2NICID tcpip.NICID) (*stack.Stack, *stack.Stack) {
 	const maxFrameSize = header.IPv6MinimumMTU + header.EthernetMinimumSize
 
-	host1Stack := stack.New(stackOpts)
-	host2Stack := stack.New(stackOpts)
+	host1Stack := stack.New(stack1Opts)
+	host2Stack := stack.New(stack2Opts)
 
 	host1NIC, host2NIC := pipe.New(utils.LinkAddr1, utils.LinkAddr2, maxFrameSize)
 
@@ -95,7 +102,7 @@ func setupStack(t *testing.T, stackOpts stack.Options, host1NICID, host2NICID tc
 	return host1Stack, host2Stack
 }
 
-// TestPing tests that two hosts can ping eachother when link resolution is
+// TestPing tests that two hosts can ping each other when link resolution is
 // enabled.
 func TestPing(t *testing.T) {
 	const (
@@ -153,7 +160,9 @@ func TestPing(t *testing.T) {
 				TransportProtocols: []stack.TransportProtocolFactory{icmp.NewProtocol4, icmp.NewProtocol6},
 			}
 
-			host1Stack, _ := setupStack(t, stackOpts, host1NICID, host2NICID)
+			host1Stack, host2Stack := setupStack(t, stackOpts, host1NICID, host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 
 			var wq waiter.Queue
 			we, waiterCH := waiter.NewChannelEntry(waiter.ReadableEvents)
@@ -239,9 +248,9 @@ func TestTCPLinkResolutionFailure(t *testing.T) {
 			name:             "IPv4 without resolvable remote",
 			netProto:         ipv4.ProtocolNumber,
 			remoteAddr:       utils.Ipv4Addr3.AddressWithPrefix.Address,
-			expectedWriteErr: &tcpip.ErrNoRoute{},
+			expectedWriteErr: &tcpip.ErrHostUnreachable{},
 			sockError: tcpip.SockError{
-				Err: &tcpip.ErrNoRoute{},
+				Err: &tcpip.ErrHostUnreachable{},
 				Dst: tcpip.FullAddress{
 					NIC:  host1NICID,
 					Addr: utils.Ipv4Addr3.AddressWithPrefix.Address,
@@ -264,9 +273,9 @@ func TestTCPLinkResolutionFailure(t *testing.T) {
 			name:             "IPv6 without resolvable remote",
 			netProto:         ipv6.ProtocolNumber,
 			remoteAddr:       utils.Ipv6Addr3.AddressWithPrefix.Address,
-			expectedWriteErr: &tcpip.ErrNoRoute{},
+			expectedWriteErr: &tcpip.ErrHostUnreachable{},
 			sockError: tcpip.SockError{
-				Err: &tcpip.ErrNoRoute{},
+				Err: &tcpip.ErrHostUnreachable{},
 				Dst: tcpip.FullAddress{
 					NIC:  host1NICID,
 					Addr: utils.Ipv6Addr3.AddressWithPrefix.Address,
@@ -297,6 +306,8 @@ func TestTCPLinkResolutionFailure(t *testing.T) {
 			}
 
 			host1Stack, host2Stack := setupStack(t, stackOpts, host1NICID, host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 
 			var listenerWQ waiter.Queue
 			listenerEP, err := host2Stack.NewEndpoint(tcp.ProtocolNumber, test.netProto, &listenerWQ)
@@ -367,6 +378,7 @@ func TestTCPLinkResolutionFailure(t *testing.T) {
 			if sockErr == nil {
 				t.Fatalf("got sockOpts.DequeueErr() = nil, want = non-nil")
 			}
+			defer sockErr.Payload.Release()
 
 			sockErrCmpOpts := []cmp.Option{
 				cmpopts.IgnoreUnexported(tcpip.SockError{}),
@@ -438,17 +450,17 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 		if request.EgressRoute.RemoteLinkAddress != header.EthernetBroadcastAddress {
 			t.Errorf("got request.EgressRoute.RemoteLinkAddress = %s, want = %s", request.EgressRoute.RemoteLinkAddress, header.EthernetBroadcastAddress)
 		}
-		rep := header.ARP(request.NetworkHeader().View())
+		rep := header.ARP(request.NetworkHeader().Slice())
 		if got := rep.Op(); got != header.ARPRequest {
 			t.Errorf("got Op() = %d, want = %d", got, header.ARPRequest)
 		}
 		if got := tcpip.LinkAddress(rep.HardwareAddressSender()); got != outgoingLinkAddr {
 			t.Errorf("got HardwareAddressSender = %s, want = %s", got, outgoingLinkAddr)
 		}
-		if got := tcpip.Address(rep.ProtocolAddressSender()); got != src {
+		if got := tcpip.AddrFromSlice(rep.ProtocolAddressSender()); got != src {
 			t.Errorf("got ProtocolAddressSender = %s, want = %s", got, src)
 		}
-		if got := tcpip.Address(rep.ProtocolAddressTarget()); got != dst {
+		if got := tcpip.AddrFromSlice(rep.ProtocolAddressTarget()); got != dst {
 			t.Errorf("got ProtocolAddressTarget = %s, want = %s", got, dst)
 		}
 	}
@@ -463,7 +475,9 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 			t.Errorf("got remote link address = %s, want = %s", request.EgressRoute.RemoteLinkAddress, want)
 		}
 
-		checker.IPv6(t, stack.PayloadSince(request.NetworkHeader()),
+		payload := stack.PayloadSince(request.NetworkHeader())
+		defer payload.Release()
+		checker.IPv6(t, payload,
 			checker.SrcAddr(src),
 			checker.DstAddr(snmc),
 			checker.TTL(header.NDPHopLimit),
@@ -472,8 +486,8 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 			))
 	}
 
-	icmpv4Checker := func(t *testing.T, b []byte, src, dst tcpip.Address) {
-		checker.IPv4(t, b,
+	icmpv4Checker := func(t *testing.T, v *buffer.View, src, dst tcpip.Address) {
+		checker.IPv4(t, v,
 			checker.SrcAddr(src),
 			checker.DstAddr(dst),
 			checker.TTL(ipv4.DefaultTTL),
@@ -485,8 +499,8 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 		)
 	}
 
-	icmpv6Checker := func(t *testing.T, b []byte, src, dst tcpip.Address) {
-		checker.IPv6(t, b,
+	icmpv6Checker := func(t *testing.T, v *buffer.View, src, dst tcpip.Address) {
+		checker.IPv6(t, v,
 			checker.SrcAddr(src),
 			checker.DstAddr(dst),
 			checker.TTL(ipv6.DefaultTTL),
@@ -508,7 +522,7 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 		transportProtocol            func(*stack.Stack) stack.TransportProtocol
 		rx                           func(*channel.Endpoint, tcpip.Address, tcpip.Address)
 		linkResolutionRequestChecker func(*testing.T, *stack.PacketBuffer, tcpip.Address, tcpip.Address)
-		icmpReplyChecker             func(*testing.T, []byte, tcpip.Address, tcpip.Address)
+		icmpReplyChecker             func(*testing.T, *buffer.View, tcpip.Address, tcpip.Address)
 		mtu                          uint32
 	}{
 		{
@@ -518,11 +532,11 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 			sourceAddr:             tcptestutil.MustParse4("10.0.0.2"),
 			destAddr:               tcptestutil.MustParse4("11.0.0.2"),
 			incomingAddr: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("10.0.0.1").To4()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("10.0.0.1").To4()),
 				PrefixLen: 8,
 			},
 			outgoingAddr: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("11.0.0.1").To4()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("11.0.0.1").To4()),
 				PrefixLen: 8,
 			},
 			transportProtocol:            icmp.NewProtocol4,
@@ -538,11 +552,11 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 			sourceAddr:             tcptestutil.MustParse6("10::2"),
 			destAddr:               tcptestutil.MustParse6("11::2"),
 			incomingAddr: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("10::1").To16()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("10::1").To16()),
 				PrefixLen: 64,
 			},
 			outgoingAddr: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("11::1").To16()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("11::1").To16()),
 				PrefixLen: 64,
 			},
 			transportProtocol:            icmp.NewProtocol6,
@@ -561,6 +575,7 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 				TransportProtocols: []stack.TransportProtocolFactory{test.transportProtocol},
 				Clock:              clock,
 			})
+			defer s.Destroy()
 
 			// Set up endpoint through which we will receive packets.
 			incomingEndpoint := channel.New(1, test.mtu, "")
@@ -635,7 +650,9 @@ func TestForwardingWithLinkResolutionFailure(t *testing.T) {
 				t.Fatal("expected ICMP packet through incoming NIC")
 			}
 
-			test.icmpReplyChecker(t, stack.PayloadSince(reply.NetworkHeader()), test.incomingAddr.Address, test.sourceAddr)
+			payload := stack.PayloadSince(reply.NetworkHeader())
+			defer payload.Release()
+			test.icmpReplyChecker(t, payload, test.incomingAddr.Address, test.sourceAddr)
 			reply.DecRef()
 
 			// Since link resolution failed, we don't expect the packet to be
@@ -712,7 +729,9 @@ func TestGetLinkAddress(t *testing.T) {
 				Clock:            clock,
 			}
 
-			host1Stack, _ := setupStack(t, stackOpts, host1NICID, host2NICID)
+			host1Stack, host2Stack := setupStack(t, stackOpts, host1NICID, host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 
 			ch := make(chan stack.LinkResolutionResult, 1)
 			err := host1Stack.GetLinkAddress(host1NICID, test.remoteAddr, test.localAddr, test.netProto, func(r stack.LinkResolutionResult) {
@@ -821,7 +840,9 @@ func TestRouteResolvedFields(t *testing.T) {
 				Clock:            clock,
 			}
 
-			host1Stack, _ := setupStack(t, stackOpts, host1NICID, host2NICID)
+			host1Stack, host2Stack := setupStack(t, stackOpts, host1NICID, host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 			r, err := host1Stack.FindRoute(host1NICID, test.localAddr, test.remoteAddr, test.netProto, false /* multicastLoop */)
 			if err != nil {
 				t.Fatalf("host1Stack.FindRoute(%d, %s, %s, %d, false): %s", host1NICID, test.localAddr, test.remoteAddr, test.netProto, err)
@@ -923,6 +944,8 @@ func TestWritePacketsLinkResolution(t *testing.T) {
 			}
 
 			host1Stack, host2Stack := setupStack(t, stackOpts, host1NICID, host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 
 			var serverWQ waiter.Queue
 			serverWE, serverCH := waiter.NewChannelEntry(waiter.ReadableEvents)
@@ -938,7 +961,7 @@ func TestWritePacketsLinkResolution(t *testing.T) {
 				t.Fatalf("serverEP.Bind(%#v): %s", serverAddr, err)
 			}
 
-			r, err := host1Stack.FindRoute(host1NICID, "", test.remoteAddr, test.netProto, false /* multicastLoop */)
+			r, err := host1Stack.FindRoute(host1NICID, tcpip.Address{}, test.remoteAddr, test.netProto, false /* multicastLoop */)
 			if err != nil {
 				t.Fatalf("host1Stack.FindRoute(%d, '', %s, %d, false): %s", host1NICID, test.remoteAddr, test.netProto, err)
 			}
@@ -950,52 +973,48 @@ func TestWritePacketsLinkResolution(t *testing.T) {
 				TOS:      stack.DefaultTOS,
 			}
 			data := []byte{1, 2}
-			for _, d := range data {
-				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					ReserveHeaderBytes: header.UDPMinimumSize + int(r.MaxHeaderLength()),
-					Payload:            buffer.NewWithData([]byte{d}),
-				})
-				pkt.TransportProtocolNumber = udp.ProtocolNumber
-				length := uint16(pkt.Data().Size() + header.UDPMinimumSize)
-				udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
-				udpHdr.Encode(&header.UDPFields{
-					SrcPort: 5555,
-					DstPort: serverAddr.Port,
-					Length:  length,
-				})
-				xsum := r.PseudoHeaderChecksum(udp.ProtocolNumber, length)
-				xsum = header.ChecksumCombine(xsum, pkt.Data().AsRange().Checksum())
-				udpHdr.SetChecksum(^udpHdr.CalculateChecksum(xsum))
+			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+				ReserveHeaderBytes: header.UDPMinimumSize + int(r.MaxHeaderLength()),
+				Payload:            buffer.MakeWithData(data),
+			})
+			pkt.TransportProtocolNumber = udp.ProtocolNumber
+			length := uint16(pkt.Data().Size() + header.UDPMinimumSize)
+			udpHdr := header.UDP(pkt.TransportHeader().Push(header.UDPMinimumSize))
+			udpHdr.Encode(&header.UDPFields{
+				SrcPort: 5555,
+				DstPort: serverAddr.Port,
+				Length:  length,
+			})
+			xsum := r.PseudoHeaderChecksum(udp.ProtocolNumber, length)
+			xsum = checksum.Combine(xsum, pkt.Data().Checksum())
+			udpHdr.SetChecksum(^udpHdr.CalculateChecksum(xsum))
 
-				if err := r.WritePacket(params, pkt); err != nil {
-					t.Fatalf("WritePacket(...): %s", err)
-				}
-				pkt.DecRef()
+			if err := r.WritePacket(params, pkt); err != nil {
+				t.Fatalf("WritePacket(...): %s", err)
 			}
+			pkt.DecRef()
 
 			var writer bytes.Buffer
-			count := 0
 			for {
 				var rOpts tcpip.ReadOptions
 				res, err := serverEP.Read(&writer, rOpts)
 				if err != nil {
 					if _, ok := err.(*tcpip.ErrWouldBlock); ok {
-						// Should not have anymore bytes to read after we read the sent
-						// number of bytes.
-						if count == len(data) {
-							break
-						}
-
 						<-serverCH
 						continue
 					}
 
 					t.Fatalf("serverEP.Read(_, %#v): %s", rOpts, err)
 				}
-				count += res.Count
+
+				if res.Count != len(data) {
+					t.Fatalf("got res.Count = %d, want = %d", res.Count, len(data))
+				}
+
+				break
 			}
 
-			if got, want := host2Stack.Stats().UDP.PacketsReceived.Value(), uint64(len(data)); got != want {
+			if got, want := host2Stack.Stats().UDP.PacketsReceived.Value(), uint64(1); got != want {
 				t.Errorf("got host2Stack.Stats().UDP.PacketsReceived.Value() = %d, want = %d", got, want)
 			}
 			if diff := cmp.Diff(data, writer.Bytes()); diff != "" {
@@ -1070,15 +1089,10 @@ func (d *nudDispatcher) OnNeighborRemoved(nicID tcpip.NICID, entry stack.Neighbo
 }
 
 func (d *nudDispatcher) expectEvent(want eventInfo) error {
-	select {
-	case got := <-d.c:
-		if diff := cmp.Diff(want, got, cmp.AllowUnexported(eventInfo{}), cmpopts.IgnoreFields(stack.NeighborEntry{}, "UpdatedAt")); diff != "" {
-			return fmt.Errorf("got invalid event (-want +got):\n%s", diff)
-		}
-		return nil
-	default:
-		return fmt.Errorf("event didn't arrive")
+	if diff := cmp.Diff(want, <-d.c, cmp.AllowUnexported(eventInfo{}), cmpopts.IgnoreFields(stack.NeighborEntry{}, "UpdatedAt")); diff != "" {
+		return fmt.Errorf("got invalid event (-want +got):\n%s", diff)
 	}
+	return nil
 }
 
 // TestTCPConfirmNeighborReachability tests that TCP informs layers beneath it
@@ -1105,7 +1119,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host2Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv4.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1131,7 +1144,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host2Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv6.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1157,7 +1169,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("routerStack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv4.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1183,7 +1194,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("routerStack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv6.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1209,7 +1219,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host1Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv4.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1236,7 +1245,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host1Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv6.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1263,7 +1271,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host1Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv4.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1290,7 +1297,6 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 				if err != nil {
 					t.Fatalf("host1Stack.NewEndpoint(%d, %d, _): %s", tcp.ProtocolNumber, ipv6.ProtocolNumber, err)
 				}
-				t.Cleanup(listenerEP.Close)
 
 				var clientWQ waiter.Queue
 				clientWE, clientCH := waiter.NewChannelEntry(waiter.ReadableEvents | waiter.WritableEvents)
@@ -1321,14 +1327,17 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 			host1StackOpts.NUDDisp = &nudDisp
 
 			host1Stack := stack.New(host1StackOpts)
+			defer host1Stack.Destroy()
 			routerStack := stack.New(stackOpts)
+			defer routerStack.Destroy()
 			host2Stack := stack.New(stackOpts)
+			defer host2Stack.Destroy()
 			utils.SetupRoutedStacks(t, host1Stack, routerStack, host2Stack)
 
 			// Add a reachable dynamic entry to our neighbor table for the remote.
 			{
 				ch := make(chan stack.LinkResolutionResult, 1)
-				err := host1Stack.GetLinkAddress(utils.Host1NICID, test.neighborAddr, "", test.netProto, func(r stack.LinkResolutionResult) {
+				err := host1Stack.GetLinkAddress(utils.Host1NICID, test.neighborAddr, tcpip.Address{}, test.netProto, func(r stack.LinkResolutionResult) {
 					ch <- r
 				})
 				if _, ok := err.(*tcpip.ErrWouldBlock); !ok {
@@ -1374,13 +1383,26 @@ func TestTCPConfirmNeighborReachability(t *testing.T) {
 			}
 
 			listenerEP, listenerCH, clientEP, clientCH := test.getEndpoints(t, host1Stack, routerStack, host2Stack)
+			defer listenerEP.Close()
 			defer clientEP.Close()
 			listenerAddr := tcpip.FullAddress{Addr: test.remoteAddr, Port: 1234}
 			if err := listenerEP.Bind(listenerAddr); err != nil {
 				t.Fatalf("listenerEP.Bind(%#v): %s", listenerAddr, err)
 			}
-			if err := listenerEP.Listen(1); err != nil {
-				t.Fatalf("listenerEP.Listen(1): %s", err)
+			// A backlog of 1 results in SYN cookies being used for all passive
+			// connections to make sure the only spot in the accept queue is not
+			// taken by a connection that never completes the handshake. We use
+			// a backlog of 2 to make sure SYN cookies are not used.
+			//
+			// We avoid SYN cookies to make sure that an accepted endpoint is able
+			// to confirm the neighbor's reachability through the cached neighbor
+			// entry in the endpoint's route. When SYN cookies are used, the
+			// accepted endpoint is constructed when the handshake has already been
+			// established and such an endpoint's route will not have a cached
+			// neighbor entry as it was not used to send any of packets for the
+			// handshake.
+			if err := listenerEP.Listen(2); err != nil {
+				t.Fatalf("listenerEP.Listen(2): %s", err)
 			}
 			{
 				err := clientEP.Connect(listenerAddr)
@@ -1568,7 +1590,9 @@ func TestDAD(t *testing.T) {
 				},
 			}
 
-			host1Stack, _ := setupStack(t, stackOpts, utils.Host1NICID, utils.Host2NICID)
+			host1Stack, host2Stack := setupStack(t, stackOpts, utils.Host1NICID, utils.Host2NICID)
+			defer host1Stack.Destroy()
+			defer host2Stack.Destroy()
 
 			// DAD should be disabled by default.
 			if res, err := host1Stack.CheckDuplicateAddress(utils.Host1NICID, test.netProto, test.remoteAddr, func(r stack.DADResult) {
@@ -1636,5 +1660,180 @@ func TestDAD(t *testing.T) {
 			default:
 			}
 		})
+	}
+}
+
+type settableLinkEndpoint struct {
+	stack.LinkEndpoint
+	mu   sync.Mutex
+	addr tcpip.LinkAddress
+}
+
+func newSettableLinkEndpoint(e stack.LinkEndpoint) *settableLinkEndpoint {
+	return &settableLinkEndpoint{
+		LinkEndpoint: e,
+		addr:         e.LinkAddress(),
+	}
+}
+
+func (e *settableLinkEndpoint) setLinkAddress(addr tcpip.LinkAddress) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.addr = addr
+}
+
+func (e *settableLinkEndpoint) LinkAddress() tcpip.LinkAddress {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.addr
+}
+
+type monitorableLinkEndpoint struct {
+	stack.LinkEndpoint
+	ch chan tcpip.LinkAddress
+}
+
+func newMonitorableLinkEndpoint(e stack.LinkEndpoint) *monitorableLinkEndpoint {
+	return &monitorableLinkEndpoint{e, make(chan tcpip.LinkAddress, 1)}
+}
+
+func (e *monitorableLinkEndpoint) WritePackets(pkts stack.PacketBufferList) (int, tcpip.Error) {
+	for _, pkt := range pkts.AsSlice() {
+		dstAddr := header.Ethernet(pkt.LinkHeader().Slice()).DestinationAddress()
+		e.ch <- dstAddr
+	}
+	e.LinkEndpoint.WritePackets(pkts)
+
+	return 0, nil
+}
+
+func (e *monitorableLinkEndpoint) waitForLinkAddress(addr tcpip.LinkAddress, wait time.Duration) error {
+	c := time.After(wait)
+	for {
+		select {
+		case sentAddr := <-e.ch:
+			if addr == sentAddr {
+				return nil
+			}
+		case <-c:
+			return fmt.Errorf("timed out waiting for endpoint to send packet with destination address: %v", addr)
+		}
+	}
+}
+
+func TestUpdateCachedNeighborEntry(t *testing.T) {
+	d := []byte{1, 2}
+	params := stack.NetworkHeaderParams{
+		Protocol: udp.ProtocolNumber,
+		TTL:      64,
+		TOS:      stack.DefaultTOS,
+	}
+
+	writePacket := func(t *testing.T, r *stack.Route) {
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: header.UDPMinimumSize + int(r.MaxHeaderLength()),
+			Payload:            buffer.MakeWithData(d),
+		})
+		if err := r.WritePacket(params, pkt); err != nil {
+			t.Fatalf("WritePacket(...): %s", err)
+		}
+		pkt.DecRef()
+	}
+
+	const (
+		host1NICID = 1
+		host2NICID = 4
+	)
+	stackOpts := stack.Options{
+		NetworkProtocols: []stack.NetworkProtocolFactory{
+			arp.NewProtocol,
+			ipv4.NewProtocolWithOptions(ipv4.Options{
+				IGMP: ipv4.IGMPOptions{
+					Enabled: false,
+				},
+			}),
+			ipv6.NewProtocolWithOptions(ipv6.Options{
+				MLD: ipv6.MLDOptions{
+					Enabled: false,
+				},
+			}),
+		},
+		TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
+	}
+
+	const maxFrameSize = header.IPv6MinimumMTU + header.EthernetMinimumSize
+
+	host1Stack := stack.New(stackOpts)
+	host2Stack := stack.New(stackOpts)
+	defer host1Stack.Destroy()
+	defer host2Stack.Destroy()
+
+	host1Pipe, host2Pipe := pipe.New(utils.LinkAddr1, utils.LinkAddr2, maxFrameSize)
+
+	host1NICMonitorable := newMonitorableLinkEndpoint(ethernet.New(host1Pipe))
+	host2NICSettable := newSettableLinkEndpoint(host2Pipe)
+
+	if err := host1Stack.CreateNIC(host1NICID, host1NICMonitorable); err != nil {
+		t.Fatalf("host1Stack.CreateNIC(%d, _): %s", host1NICID, err)
+	}
+	if err := host2Stack.CreateNIC(host2NICID, ethernet.New(host2NICSettable)); err != nil {
+		t.Fatalf("host2Stack.CreateNIC(%d, _): %s", host2NICID, err)
+	}
+
+	if err := host1Stack.AddProtocolAddress(host1NICID, utils.Ipv4Addr1, stack.AddressProperties{}); err != nil {
+		t.Fatalf("host1Stack.AddProtocolAddress(%d, %+v, {}): %s", host1NICID, utils.Ipv4Addr1, err)
+	}
+	if err := host2Stack.AddProtocolAddress(host2NICID, utils.Ipv4Addr2, stack.AddressProperties{}); err != nil {
+		t.Fatalf("host2Stack.AddProtocolAddress(%d, %+v, {}): %s", host2NICID, utils.Ipv4Addr2, err)
+	}
+
+	host1Stack.SetRouteTable([]tcpip.Route{
+		{
+			Destination: utils.Ipv4Addr1.AddressWithPrefix.Subnet(),
+			NIC:         host1NICID,
+		},
+	})
+	host2Stack.SetRouteTable([]tcpip.Route{
+		{
+			Destination: utils.Ipv4Addr2.AddressWithPrefix.Subnet(),
+			NIC:         host2NICID,
+		},
+	})
+
+	localAddr := utils.Ipv4Addr1.AddressWithPrefix.Address
+	neighborAddr := utils.Ipv4Addr2.AddressWithPrefix.Address
+
+	// Obtain a route to a neighbor.
+	r, err := host1Stack.FindRoute(host1NICID, localAddr, neighborAddr, header.IPv4ProtocolNumber, false)
+	if err != nil {
+		t.Fatalf("host1Stack.FindRoute(...): %s", err)
+	}
+
+	// Send packet to neighbor (start link resolution & resolve, then send
+	// packet). Send twice to use cached address the second time.
+	for i := 0; i < 2; i++ {
+		go writePacket(t, r)
+		if err := host1NICMonitorable.waitForLinkAddress(utils.LinkAddr2, time.Second); err != nil {
+			t.Fatalf("host1NIC.waitForLinkAddress(%s): %s", utils.LinkAddr2, err)
+		}
+	}
+
+	// Neighbor no longer reachable, deleted from the neighbor cache.
+	host1Stack.RemoveNeighbor(host1NICID, header.IPv4ProtocolNumber, neighborAddr)
+	host2Stack.DisableNIC(host2NICID)
+
+	// Send a packet to the neighbor that's no longer reachable (should fail).
+	go writePacket(t, r)
+	if err := host1NICMonitorable.waitForLinkAddress(utils.LinkAddr2, time.Second); err == nil {
+		t.Fatalf("got host1NIC.waitForLinkAddress(%s) = nil, want err", utils.LinkAddr2)
+	}
+
+	// Neighbor reachable again with new MAC address.
+	host2Stack.EnableNIC(host2NICID)
+	host2NICSettable.setLinkAddress(utils.LinkAddr3)
+
+	// Pending packet should eventually reach the new neighbor.
+	if err := host1NICMonitorable.waitForLinkAddress(utils.LinkAddr3, 5*time.Second); err != nil {
+		t.Fatalf("host1NIC.waitForLinkAddress(%s): %s", utils.LinkAddr3, err)
 	}
 }

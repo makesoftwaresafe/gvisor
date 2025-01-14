@@ -17,6 +17,7 @@
 
 #include <errno.h>
 #include <netinet/ip.h>
+#include <netinet/ip6.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/udp.h>
 #include <sys/socket.h>
@@ -112,8 +113,8 @@ class SocketPair {
 // descriptors.
 class FDSocketPair : public SocketPair {
  public:
-  FDSocketPair(int first_fd, int second_fd)
-      : first_(first_fd), second_(second_fd) {}
+  FDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd)
+      : first_(std::move(first_fd)), second_(std::move(second_fd)) {}
   FDSocketPair(std::unique_ptr<FileDescriptor> first_fd,
                std::unique_ptr<FileDescriptor> second_fd)
       : first_(first_fd->release()), second_(second_fd->release()) {}
@@ -142,11 +143,11 @@ size_t CalculateUnixSockAddrLen(const char* sun_path);
 // descriptors in addition to a pair of socket addresses.
 class AddrFDSocketPair : public SocketPair {
  public:
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_un& first_address,
                    const struct sockaddr_un& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(CalculateUnixSockAddrLen(first_address.sun_path)),
@@ -154,11 +155,11 @@ class AddrFDSocketPair : public SocketPair {
         first_size_(sizeof(first_address)),
         second_size_(sizeof(second_address)) {}
 
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_in& first_address,
                    const struct sockaddr_in& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(sizeof(first_address)),
@@ -166,11 +167,11 @@ class AddrFDSocketPair : public SocketPair {
         first_size_(sizeof(first_address)),
         second_size_(sizeof(second_address)) {}
 
-  AddrFDSocketPair(int first_fd, int second_fd,
+  AddrFDSocketPair(FileDescriptor first_fd, FileDescriptor second_fd,
                    const struct sockaddr_in6& first_address,
                    const struct sockaddr_in6& second_address)
-      : first_(first_fd),
-        second_(second_fd),
+      : first_(std::move(first_fd)),
+        second_(std::move(second_fd)),
         first_addr_(to_storage(first_address)),
         second_addr_(to_storage(second_address)),
         first_len_(sizeof(first_address)),
@@ -400,9 +401,6 @@ SocketPairKind NoOp(SocketPairKind const& base);
 // ASSERT_NO_FATAL_FAILURE().
 void TransferTest(int fd1, int fd2);
 
-// Fills [buf, buf+len) with random bytes.
-void RandomizeBuffer(char* buf, size_t len);
-
 // Base test fixture for tests that operate on pairs of connected sockets.
 class SocketPairTest : public ::testing::TestWithParam<SocketPairKind> {
  protected:
@@ -546,6 +544,10 @@ uint16_t IPChecksum(struct iphdr ip);
 uint16_t UDPChecksum(struct iphdr iphdr, struct udphdr udphdr,
                      const char* payload, ssize_t payload_len);
 
+// Compute the internet checksum of a UDPv6 header.
+uint16_t UDPChecksum(struct ip6_hdr iphdr, struct udphdr udphdr,
+                     const char* payload, ssize_t payload_len);
+
 // Compute the internet checksum of an ICMP header.
 uint16_t ICMPChecksum(struct icmphdr icmphdr, const char* payload,
                       ssize_t payload_len);
@@ -579,6 +581,8 @@ inline const sockaddr* AsSockAddr(const sockaddr_un* s) {
 PosixErrorOr<uint16_t> AddrPort(int family, sockaddr_storage const& addr);
 
 PosixError SetAddrPort(int family, sockaddr_storage* addr, uint16_t port);
+
+sockaddr_storage InetLoopbackAddr(int family);
 
 // setupTimeWaitClose sets up a socket endpoint in TIME_WAIT state.
 // Callers can choose to perform active close on either ends of the connection

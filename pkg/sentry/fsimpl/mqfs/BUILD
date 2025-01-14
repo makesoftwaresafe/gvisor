@@ -1,14 +1,17 @@
 load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "root_inode_refs",
     out = "root_inode_refs.go",
     package = "mqfs",
     prefix = "rootInode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "rootInode",
     },
@@ -29,8 +32,7 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/context",
         "//pkg/errors/linuxerr",
-        "//pkg/refsvfs2",
-        "//pkg/sentry/fs",
+        "//pkg/refs",
         "//pkg/sentry/fsimpl/kernfs",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/ipc",

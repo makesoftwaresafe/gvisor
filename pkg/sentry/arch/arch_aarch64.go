@@ -39,7 +39,7 @@ type Registers struct {
 }
 
 const (
-	// SyscallWidth is the width of insturctions.
+	// SyscallWidth is the width of instructions.
 	SyscallWidth = 4
 )
 
@@ -196,6 +196,9 @@ func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
 		return 0, err
 	}
 	regs.UnmarshalUnsafe(buf)
+	if !regs.validRegs() {
+		return 0, linuxerr.EINVAL
+	}
 	s.Regs = regs
 	return ptraceRegistersSize, nil
 }
@@ -251,10 +254,10 @@ func (s *State) FullRestore() bool {
 }
 
 // New returns a new architecture context.
-func New(arch Arch) Context {
+func New(arch Arch) *Context64 {
 	switch arch {
 	case ARM64:
-		return &context64{
+		return &Context64{
 			State{
 				fpState: fpu.NewState(),
 			},

@@ -102,7 +102,7 @@ func copyOutNodemask(t *kernel.Task, addr hostarch.Addr, maxnode uint32, val uin
 }
 
 // GetMempolicy implements the syscall get_mempolicy(2).
-func GetMempolicy(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func GetMempolicy(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	mode := args[0].Pointer()
 	nodemask := args[1].Pointer()
 	maxnode := args[2].Uint()
@@ -216,7 +216,7 @@ func GetMempolicy(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 }
 
 // SetMempolicy implements the syscall set_mempolicy(2).
-func SetMempolicy(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func SetMempolicy(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	modeWithFlags := linux.NumaPolicy(args[0].Int())
 	nodemask := args[1].Pointer()
 	maxnode := args[2].Uint()
@@ -231,7 +231,7 @@ func SetMempolicy(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 }
 
 // Mbind implements the syscall mbind(2).
-func Mbind(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Mbind(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	length := args[1].Uint64()
 	mode := linux.NumaPolicy(args[2].Int())
@@ -294,16 +294,20 @@ func copyInMempolicyNodemask(t *kernel.Task, modeWithFlags linux.NumaPolicy, nod
 		}
 	case linux.MPOL_PREFERRED:
 		// This permits an empty nodemask, as long as no flags are set.
-		if nodemaskVal == 0 && flags != 0 {
-			return 0, 0, linuxerr.EINVAL
+		if nodemaskVal == 0 {
+			if flags != 0 {
+				return 0, 0, linuxerr.EINVAL
+			}
+			// On newer Linux versions, MPOL_PREFERRED is implemented as MPOL_LOCAL
+			// when node set is empty. See 7858d7bca7fb ("mm/mempolicy: don't handle
+			// MPOL_LOCAL like a fake MPOL_PREFERRED policy").
+			mode = linux.MPOL_LOCAL
 		}
 	case linux.MPOL_LOCAL:
-		// This requires an empty nodemask and no flags set ...
+		// This requires an empty nodemask and no flags set.
 		if nodemaskVal != 0 || flags != 0 {
 			return 0, 0, linuxerr.EINVAL
 		}
-		// ... and is implemented as MPOL_PREFERRED.
-		mode = linux.MPOL_PREFERRED
 	default:
 		// Unknown mode, which we should have rejected above.
 		panic(fmt.Sprintf("unknown mode: %v", mode))

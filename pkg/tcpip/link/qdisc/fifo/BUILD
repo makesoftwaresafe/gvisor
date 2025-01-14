@@ -1,10 +1,22 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
+
+declare_mutex(
+    name = "dispatcher_mutex",
+    out = "dispatcher_mutex.go",
+    package = "fifo",
+    prefix = "queueDispatcher",
+)
 
 go_library(
     name = "fifo",
     srcs = [
+        "dispatcher_mutex.go",
         "fifo.go",
         "packet_buffer_circular_list.go",
     ],
@@ -13,6 +25,7 @@ go_library(
         "//pkg/atomicbitops",
         "//pkg/sleep",
         "//pkg/sync",
+        "//pkg/sync/locking",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",
     ],
@@ -26,7 +39,6 @@ go_test(
         ":fifo",
         "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",

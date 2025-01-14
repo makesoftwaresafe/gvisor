@@ -4,6 +4,7 @@
 platforms = {
     "ptrace": [],
     "kvm": [],
+    "systrap": [],
 }
 
 # Capabilities that platforms may or may not support.
@@ -24,6 +25,13 @@ platform_capabilities = {
         _CAPABILITY_INT3: True,
         _CAPABILITY_VSYSCALL: True,
     },
+    "systrap": {
+        _CAPABILITY_32BIT: False,
+        _CAPABILITY_ALIGNMENT_CHECK: True,
+        _CAPABILITY_MULTIPROCESS: True,
+        _CAPABILITY_INT3: True,
+        _CAPABILITY_VSYSCALL: True,
+    },
     "kvm": {
         _CAPABILITY_32BIT: False,
         _CAPABILITY_ALIGNMENT_CHECK: True,
@@ -33,4 +41,5 @@ platform_capabilities = {
     },
 }
 
-default_platform = "ptrace"
+default_platform = "systrap"
+save_restore_platforms = ["systrap"]

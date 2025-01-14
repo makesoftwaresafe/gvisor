@@ -15,7 +15,7 @@
 package stack_test
 
 import (
-	"io/ioutil"
+	"io"
 	"math"
 	"math/rand"
 	"strconv"
@@ -23,6 +23,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -34,14 +35,16 @@ import (
 )
 
 const (
-	testSrcAddrV6 = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
-	testDstAddrV6 = tcpip.Address("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02")
-
-	testSrcAddrV4 = "\x0a\x00\x00\x01"
-	testDstAddrV4 = "\x0a\x00\x00\x02"
-
 	testDstPort = 1234
 	testSrcPort = 4096
+)
+
+var (
+	testDstAddrV6 = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"))
+	testSrcAddrV6 = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"))
+
+	testSrcAddrV4 = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x01"))
+	testDstAddrV4 = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x02"))
 )
 
 type testContext struct {
@@ -66,7 +69,7 @@ func newDualTestContextMultiNIC(t *testing.T, mtu uint32, linkEpIDs []tcpip.NICI
 
 		protocolAddrV4 := tcpip.ProtocolAddress{
 			Protocol:          ipv4.ProtocolNumber,
-			AddressWithPrefix: tcpip.Address(testDstAddrV4).WithPrefix(),
+			AddressWithPrefix: testDstAddrV4.WithPrefix(),
 		}
 		if err := s.AddProtocolAddress(linkEpID, protocolAddrV4, stack.AddressProperties{}); err != nil {
 			t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", linkEpID, protocolAddrV4, err)
@@ -134,12 +137,12 @@ func (c *testContext) sendV4Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, testSrcAddrV4, testDstAddrV4, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData(buf),
+		Payload: buffer.MakeWithData(buf),
 	})
 	c.linkEps[linkEpID].InjectInbound(ipv4.ProtocolNumber, pkt)
 }
@@ -171,12 +174,12 @@ func (c *testContext) sendV6Packet(payload []byte, h *headers, linkEpID tcpip.NI
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, testSrcAddrV6, testDstAddrV6, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	// Inject packet.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData(buf),
+		Payload: buffer.MakeWithData(buf),
 	})
 	c.linkEps[linkEpID].InjectInbound(ipv6.ProtocolNumber, pkt)
 }
@@ -421,7 +424,7 @@ func TestBindToDeviceDistribution(t *testing.T) {
 						}
 
 						ep := <-pollChannel
-						if _, err := ep.Read(ioutil.Discard, tcpip.ReadOptions{}); err != nil {
+						if _, err := ep.Read(io.Discard, tcpip.ReadOptions{}); err != nil {
 							t.Fatalf("Read on endpoint %d failed: %s", eps[ep], err)
 						}
 						stats[ep]++

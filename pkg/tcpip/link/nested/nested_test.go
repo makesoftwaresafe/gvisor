@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/nested"
@@ -34,6 +33,8 @@ var _ stack.LinkEndpoint = (*parentEndpoint)(nil)
 var _ stack.NetworkDispatcher = (*parentEndpoint)(nil)
 
 type childEndpoint struct {
+	mtu  uint32
+	addr tcpip.LinkAddress
 	stack.LinkEndpoint
 	dispatcher stack.NetworkDispatcher
 }
@@ -48,6 +49,22 @@ func (c *childEndpoint) IsAttached() bool {
 	return c.dispatcher != nil
 }
 
+func (c *childEndpoint) LinkAddress() tcpip.LinkAddress {
+	return c.addr
+}
+
+func (c *childEndpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	c.addr = addr
+}
+
+func (c *childEndpoint) MTU() uint32 {
+	return c.mtu
+}
+
+func (c *childEndpoint) SetMTU(mtu uint32) {
+	c.mtu = mtu
+}
+
 type counterDispatcher struct {
 	count int
 }
@@ -58,7 +75,7 @@ func (d *counterDispatcher) DeliverNetworkPacket(tcpip.NetworkProtocolNumber, *s
 	d.count++
 }
 
-func (*counterDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (*counterDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	panic("not implemented")
 }
 
@@ -116,9 +133,43 @@ func TestNestedLinkEndpoint(t *testing.T) {
 	}
 }
 
+func TestSetLinkAddress(t *testing.T) {
+	var (
+		childEP childEndpoint
+		ep      parentEndpoint
+		disp    counterDispatcher
+	)
+	addrs := []tcpip.LinkAddress{"abc", "def"}
+	ep.Endpoint.Init(&childEP, &disp)
+	for _, addr := range addrs {
+		ep.SetLinkAddress(addr)
+
+		if want, v := addr, ep.LinkAddress(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
+func TestMTU(t *testing.T) {
+	var (
+		childEP childEndpoint
+		ep      parentEndpoint
+		disp    counterDispatcher
+	)
+	mtus := []uint32{1500, 2000}
+	ep.Endpoint.Init(&childEP, &disp)
+	for _, mtu := range mtus {
+		ep.Endpoint.SetMTU(mtu)
+
+		if want, v := mtu, ep.MTU(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

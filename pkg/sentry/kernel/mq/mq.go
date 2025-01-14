@@ -23,7 +23,6 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
@@ -82,7 +81,7 @@ type Registry struct {
 // Registry to avoid dealing directly with the filesystem. RegistryImpl should
 // be implemented by mqfs and provided to Registry at initialization.
 type RegistryImpl interface {
-	// Get searchs for a queue with the given name, if it exists, the queue is
+	// Get searches for a queue with the given name, if it exists, the queue is
 	// used to create a new FD, return it and return true. If the queue  doesn't
 	// exist, return false and no error. An error is returned if creation fails.
 	Get(ctx context.Context, name string, access AccessType, block bool, flags uint32) (*vfs.FileDescription, bool, error)
@@ -171,6 +170,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, opts OpenOpts, mode linux.F
 		if opts.Create && opts.Exclusive {
 			// "Both O_CREAT and O_EXCL were specified in oflag, but a queue
 			//  with this name already exists."
+			fd.DecRef(ctx)
 			return nil, linuxerr.EEXIST
 		}
 		return fd, nil
@@ -182,7 +182,7 @@ func (r *Registry) FindOrCreate(ctx context.Context, opts OpenOpts, mode linux.F
 		return nil, linuxerr.ENOENT
 	}
 
-	q, err := r.newQueueLocked(auth.CredentialsFromContext(ctx), fs.FileOwnerFromContext(ctx), fs.FilePermsFromMode(mode), attr)
+	q, err := r.newQueueLocked(auth.CredentialsFromContext(ctx), mode, attr)
 	if err != nil {
 		return nil, err
 	}
@@ -192,11 +192,12 @@ func (r *Registry) FindOrCreate(ctx context.Context, opts OpenOpts, mode linux.F
 // newQueueLocked creates a new queue using the given attributes. If attr is nil
 // return a queue with default values, otherwise use attr to create a new queue,
 // and return an error if attributes are invalid.
-func (r *Registry) newQueueLocked(creds *auth.Credentials, owner fs.FileOwner, perms fs.FilePermissions, attr *linux.MqAttr) (*Queue, error) {
+func (r *Registry) newQueueLocked(creds *auth.Credentials, mode linux.FileMode, attr *linux.MqAttr) (*Queue, error) {
 	if attr == nil {
 		return &Queue{
-			owner:           owner,
-			perms:           perms,
+			ownerUID:        creds.EffectiveKUID,
+			ownerGID:        creds.EffectiveKGID,
+			mode:            mode,
 			maxMessageCount: int64(maxMsgDefault),
 			maxMessageSize:  uint64(msgSizeDefault),
 		}, nil
@@ -219,8 +220,9 @@ func (r *Registry) newQueueLocked(creds *auth.Credentials, owner fs.FileOwner, p
 	}
 
 	return &Queue{
-		owner:           owner,
-		perms:           perms,
+		ownerUID:        creds.EffectiveKUID,
+		ownerGID:        creds.EffectiveKGID,
+		mode:            mode,
 		maxMessageCount: attr.MqMaxmsg,
 		maxMessageSize:  uint64(attr.MqMsgsize),
 	}, nil
@@ -254,11 +256,14 @@ func (r *Registry) Impl() RegistryImpl {
 //
 // +stateify savable
 type Queue struct {
-	// owner is the registry's owner. Immutable.
-	owner fs.FileOwner
+	// ownerUID is the registry's owner's UID. Immutable.
+	ownerUID auth.KUID
 
-	// perms is the registry's access permissions. Immutable.
-	perms fs.FilePermissions
+	// ownerGID is the registry's owner's GID. Immutable.
+	ownerGID auth.KGID
+
+	// mode is the registry's access permissions. Immutable.
+	mode linux.FileMode
 
 	// mu protects all the fields below.
 	mu sync.Mutex `state:"nosave"`
@@ -288,7 +293,7 @@ type Queue struct {
 }
 
 // View is a view into a message queue. Views should only be used in file
-// descriptions, but not inodes, because we use inodes to retreive the actual
+// descriptions, but not inodes, because we use inodes to retrieve the actual
 // queue, and only FDs are responsible for providing user functionality.
 type View interface {
 	// TODO: Add Send and Receive when mq_timedsend(2) and mq_timedreceive(2)
@@ -303,6 +308,8 @@ type View interface {
 }
 
 // ReaderWriter provides a send and receive view into a queue.
+//
+// +stateify savable
 type ReaderWriter struct {
 	*Queue
 
@@ -310,6 +317,8 @@ type ReaderWriter struct {
 }
 
 // Reader provides a send-only view into a queue.
+//
+// +stateify savable
 type Reader struct {
 	*Queue
 
@@ -317,6 +326,8 @@ type Reader struct {
 }
 
 // Writer provides a receive-only view into a queue.
+//
+// +stateify savable
 type Writer struct {
 	*Queue
 
@@ -434,12 +445,13 @@ func (q *Queue) EventUnregister(e *waiter.Entry) {
 
 // HasPermissions returns true if the given credentials meet the access
 // permissions required by the queue.
-func (q *Queue) HasPermissions(creds *auth.Credentials, req fs.PermMask) bool {
-	p := q.perms.Other
-	if q.owner.UID == creds.EffectiveKUID {
-		p = q.perms.User
-	} else if creds.InGroup(q.owner.GID) {
-		p = q.perms.Group
+func (q *Queue) HasPermissions(creds *auth.Credentials, req vfs.AccessTypes) bool {
+	perms := uint16(q.mode.Permissions())
+	if q.ownerUID == creds.EffectiveKUID {
+		perms >>= 6
+	} else if creds.InGroup(q.ownerGID) {
+		perms >>= 3
 	}
-	return p.SupersetOf(req)
+
+	return uint16(req)&perms == uint16(req)
 }

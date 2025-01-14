@@ -23,8 +23,9 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/goid"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/sentry/hostcpu"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 )
@@ -58,13 +59,15 @@ type taskRunState interface {
 func (t *Task) run(threadID uintptr) {
 	t.goid.Store(goid.Get())
 
+	refs.CleanupSync.Add(1)
+	defer refs.CleanupSync.Done()
+
 	// Construct t.blockingTimer here. We do this here because we can't
 	// reconstruct t.blockingTimer during restore in Task.afterLoad(), because
 	// kernel.timekeeper.SetClocks() hasn't been called yet.
-	blockingTimerNotifier, blockingTimerChan := ktime.NewChannelNotifier()
-	t.blockingTimer = ktime.NewTimer(t.k.MonotonicClock(), blockingTimerNotifier)
+	t.blockingTimerListener, t.blockingTimerChan = ktime.NewChannelNotifier()
+	t.blockingTimer = ktime.NewSampledTimer(t.k.MonotonicClock(), t.blockingTimerListener)
 	defer t.blockingTimer.Destroy()
-	t.blockingTimerChan = blockingTimerChan
 
 	// Activate our address space.
 	t.Activate()
@@ -96,9 +99,16 @@ func (t *Task) run(threadID uintptr) {
 			t.accountTaskGoroutineEnter(TaskGoroutineNonexistent)
 			t.goroutineStopped.Done()
 			t.tg.liveGoroutines.Done()
-			t.tg.pidns.owner.liveGoroutines.Done()
-			t.tg.pidns.owner.runningGoroutines.Done()
 			t.p.Release()
+
+			ts := t.tg.pidns.owner
+			ts.mu.Lock()
+			ts.liveTasks--
+			if ts.liveTasks == 0 {
+				ts.zeroLiveTasksCond.Broadcast()
+			}
+			ts.mu.Unlock()
+			ts.runningGoroutines.Done()
 
 			// Deferring this store triggers a false positive in the race
 			// detector (https://github.com/golang/go/issues/42599).
@@ -168,6 +178,12 @@ func (app *runApp) execute(t *Task) taskRunState {
 	// a pending signal, causing another interruption, but that signal should
 	// not interact with the interrupted syscall.)
 	if t.haveSyscallReturn {
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.Warningf("Unable to pull a full state: %v", err)
+			t.PrepareExit(linux.WaitStatusExit(int32(ExtractErrno(err, -1))))
+			return (*runExit)(nil)
+		}
+
 		if sre, ok := linuxerr.SyscallRestartErrorFromReturn(t.Arch().Return()); ok {
 			if sre == linuxerr.ERESTART_RESTARTBLOCK {
 				t.Debugf("Restarting syscall %d with restart block: not interrupted by handled signal", t.Arch().SyscallNo())
@@ -191,26 +207,20 @@ func (app *runApp) execute(t *Task) taskRunState {
 	if t.rseqPreempted {
 		t.rseqPreempted = false
 		if t.rseqAddr != 0 || t.oldRSeqCPUAddr != 0 {
-			// Linux writes the CPU on every preemption. We only do
-			// so if it changed. Thus we may delay delivery of
-			// SIGSEGV if rseqAddr/oldRSeqCPUAddr is invalid.
-			cpu := int32(hostcpu.GetCPU())
-			if t.rseqCPU != cpu {
-				t.rseqCPU = cpu
-				if err := t.rseqCopyOutCPU(); err != nil {
-					t.Debugf("Failed to copy CPU to %#x for rseq: %v", t.rseqAddr, err)
-					t.forceSignal(linux.SIGSEGV, false)
-					t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
-					// Re-enter the task run loop for signal delivery.
-					return (*runApp)(nil)
-				}
-				if err := t.oldRSeqCopyOutCPU(); err != nil {
-					t.Debugf("Failed to copy CPU to %#x for old rseq: %v", t.oldRSeqCPUAddr, err)
-					t.forceSignal(linux.SIGSEGV, false)
-					t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
-					// Re-enter the task run loop for signal delivery.
-					return (*runApp)(nil)
-				}
+			t.rseqCPU = int32(hostcpu.GetCPU())
+			if err := t.rseqCopyOutCPU(); err != nil {
+				t.Debugf("Failed to copy CPU to %#x for rseq: %v", t.rseqAddr, err)
+				t.forceSignal(linux.SIGSEGV, false)
+				t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
+				// Re-enter the task run loop for signal delivery.
+				return (*runApp)(nil)
+			}
+			if err := t.oldRSeqCopyOutCPU(); err != nil {
+				t.Debugf("Failed to copy CPU to %#x for old rseq: %v", t.oldRSeqCPUAddr, err)
+				t.forceSignal(linux.SIGSEGV, false)
+				t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
+				// Re-enter the task run loop for signal delivery.
+				return (*runApp)(nil)
 			}
 		}
 		t.rseqInterrupt()
@@ -245,6 +255,12 @@ func (app *runApp) execute(t *Task) taskRunState {
 
 	if clearSinglestep {
 		t.Arch().ClearSingleStep()
+	}
+	if t.hasTracer() {
+		if e := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); e != nil {
+			t.Warningf("Unable to pull a full state: %v", e)
+			err = e
+		}
 	}
 
 	switch err {
@@ -375,5 +391,6 @@ func (tg *ThreadGroup) WaitExited() {
 // Yield yields the processor for the calling task.
 func (t *Task) Yield() {
 	t.yieldCount.Add(1)
+	t.tg.yieldCount.Add(1)
 	runtime.Gosched()
 }

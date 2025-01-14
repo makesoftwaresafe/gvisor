@@ -50,8 +50,8 @@ constexpr absl::Duration kPeriod = absl::Milliseconds(25);
 // Total amount of time to spend per thread.
 constexpr absl::Duration kTestDuration = absl::Seconds(20);
 // Amount of spin iterations to perform as the minimum work item per thread.
-// Chosen to be sub-millisecond range.
-constexpr int kIterations = 10000000;
+// Chosen to be sub-10ms (gVisor's CPU clock ticker period).
+constexpr int kIterations = 100000000;
 // Allow deviation in the number of samples.
 constexpr double kNumSamplesDeviationRatio = 0.2;
 
@@ -87,8 +87,7 @@ TEST(ItimerTest, ItimervalUpdatedBeforeExpiration) {
       << itv.it_value.tv_usec << " microseconds";
 }
 
-ABSL_CONST_INIT static thread_local std::atomic_int signal_test_num_samples =
-    ATOMIC_VAR_INIT(0);
+ABSL_CONST_INIT static thread_local std::atomic_int signal_test_num_samples(0);
 
 void SignalTestSignalHandler(int /*signum*/) { signal_test_num_samples++; }
 

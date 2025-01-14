@@ -239,6 +239,9 @@ const SockAddrMax = 128
 // +marshal
 type InetAddr [4]byte
 
+// SizeOfInetAddr is the size of InetAddr.
+var SizeOfInetAddr = uint32((*InetAddr)(nil).SizeBytes())
+
 // SockAddrInet is struct sockaddr_in, from uapi/linux/in.h.
 //
 // +marshal
@@ -346,7 +349,7 @@ const SizeOfLinger = 8
 // TCPInfo is a collection of TCP statistics.
 //
 // From uapi/linux/tcp.h. Newer versions of Linux continue to add new fields to
-// the end of this struct or within existing unusued space, so its size grows
+// the end of this struct or within existing unused space, so its size grows
 // over time. The current iteration is based on linux v4.17. New versions are
 // always backwards compatible.
 //
@@ -600,3 +603,6 @@ const SO_ACCEPTCON = 1 << 16
 type ICMP6Filter struct {
 	Filter [8]uint32
 }
+
+// SizeOfICMP6Filter is the size of ICMP6Filter struct.
+var SizeOfICMP6Filter = uint32((*ICMP6Filter)(nil).SizeBytes())

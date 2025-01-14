@@ -1,8 +1,44 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
-load("//pkg/sync/locking:locking.bzl", "declare_mutex", "declare_rwmutex")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
+
+go_template_instance(
+    name = "atomicptr_bucket_slice",
+    out = "atomicptr_bucket_slice_unsafe.go",
+    package = "kernel",
+    prefix = "descriptorBucketSlice",
+    template = "//pkg/sync/atomicptr:generic_atomicptr",
+    types = {
+        "Value": "descriptorBucketSlice",
+    },
+)
+
+go_template_instance(
+    name = "atomicptr_bucket",
+    out = "atomicptr_bucket_unsafe.go",
+    package = "kernel",
+    prefix = "descriptorBucket",
+    template = "//pkg/sync/atomicptr:generic_atomicptr",
+    types = {
+        "Value": "descriptorBucket",
+    },
+)
+
+go_template_instance(
+    name = "atomicptr_descriptor",
+    out = "atomicptr_descriptor_unsafe.go",
+    package = "kernel",
+    prefix = "descriptor",
+    template = "//pkg/sync/atomicptr:generic_atomicptr",
+    types = {
+        "Value": "descriptor",
+    },
+)
 
 declare_mutex(
     name = "user_counters_mutex",
@@ -21,8 +57,16 @@ declare_rwmutex(
 declare_mutex(
     name = "task_mutex",
     out = "task_mutex.go",
+    nested_lock_names = ["child"],
     package = "kernel",
     prefix = "task",
+)
+
+declare_mutex(
+    name = "task_work_mutex",
+    out = "task_work_mutex.go",
+    package = "kernel",
+    prefix = "taskWork",
 )
 
 declare_mutex(
@@ -49,6 +93,7 @@ declare_mutex(
 declare_mutex(
     name = "signal_handlers_mutex",
     out = "signal_handlers_mutex.go",
+    nested_lock_names = ["tg"],
     package = "kernel",
     prefix = "signalHandlers",
 )
@@ -58,6 +103,20 @@ declare_mutex(
     out = "thread_group_timer_mutex.go",
     package = "kernel",
     prefix = "threadGroupTimer",
+)
+
+declare_mutex(
+    name = "timekeeper_tcpip_timer_mutex",
+    out = "timekeeper_tcpip_timer_mutex.go",
+    package = "kernel",
+    prefix = "timekeeperTcpipTimer",
+)
+
+declare_mutex(
+    name = "cgroup_mounts_mutex",
+    out = "cgroup_mounts_mutex.go",
+    package = "kernel",
+    prefix = "cgroupMounts",
 )
 
 go_template_instance(
@@ -81,17 +140,6 @@ go_template_instance(
     types = {
         "Element": "*ProcessGroup",
         "Linker": "*ProcessGroup",
-    },
-)
-
-go_template_instance(
-    name = "seqatomic_taskgoroutineschedinfo",
-    out = "seqatomic_taskgoroutineschedinfo_unsafe.go",
-    package = "kernel",
-    suffix = "TaskGoroutineSchedInfo",
-    template = "//pkg/sync/seqatomic:generic_seqatomic",
-    types = {
-        "Value": "TaskGoroutineSchedInfo",
     },
 )
 
@@ -120,23 +168,11 @@ go_template_instance(
 )
 
 go_template_instance(
-    name = "socket_list",
-    out = "socket_list.go",
-    package = "kernel",
-    prefix = "socket",
-    template = "//pkg/ilist:generic_list",
-    types = {
-        "Element": "*SocketRecordVFS1",
-        "Linker": "*SocketRecordVFS1",
-    },
-)
-
-go_template_instance(
     name = "fd_table_refs",
     out = "fd_table_refs.go",
     package = "kernel",
     prefix = "FDTable",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "FDTable",
     },
@@ -147,20 +183,9 @@ go_template_instance(
     out = "fs_context_refs.go",
     package = "kernel",
     prefix = "FSContext",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "FSContext",
-    },
-)
-
-go_template_instance(
-    name = "ipc_namespace_refs",
-    out = "ipc_namespace_refs.go",
-    package = "kernel",
-    prefix = "IPCNamespace",
-    template = "//pkg/refsvfs2:refs_template",
-    types = {
-        "T": "IPCNamespace",
     },
 )
 
@@ -169,7 +194,7 @@ go_template_instance(
     out = "process_group_refs.go",
     package = "kernel",
     prefix = "ProcessGroup",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "ProcessGroup",
     },
@@ -180,7 +205,7 @@ go_template_instance(
     out = "session_refs.go",
     package = "kernel",
     prefix = "Session",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Session",
     },
@@ -196,9 +221,12 @@ proto_library(
 go_library(
     name = "kernel",
     srcs = [
-        "abstract_socket_namespace.go",
         "aio.go",
+        "atomicptr_bucket_slice_unsafe.go",
+        "atomicptr_bucket_unsafe.go",
+        "atomicptr_descriptor_unsafe.go",
         "cgroup.go",
+        "cgroup_mounts_mutex.go",
         "cgroup_mutex.go",
         "context.go",
         "fd_table.go",
@@ -208,11 +236,11 @@ go_library(
         "fs_context.go",
         "fs_context_refs.go",
         "ipc_namespace.go",
-        "ipc_namespace_refs.go",
         "kcov.go",
         "kcov_unsafe.go",
         "kernel.go",
         "kernel_opts.go",
+        "kernel_restore.go",
         "kernel_state.go",
         "pending_signals.go",
         "pending_signals_list.go",
@@ -227,14 +255,12 @@ go_library(
         "running_tasks_mutex.go",
         "seccheck.go",
         "seccomp.go",
-        "seqatomic_taskgoroutineschedinfo_unsafe.go",
         "session_list.go",
         "session_refs.go",
         "sessions.go",
         "signal.go",
         "signal_handlers.go",
         "signal_handlers_mutex.go",
-        "socket_list.go",
         "syscalls.go",
         "syscalls_state.go",
         "syslog.go",
@@ -249,6 +275,7 @@ go_library(
         "task_futex.go",
         "task_identity.go",
         "task_image.go",
+        "task_key.go",
         "task_list.go",
         "task_log.go",
         "task_mutex.go",
@@ -261,13 +288,16 @@ go_library(
         "task_syscall.go",
         "task_usermem.go",
         "task_work.go",
+        "task_work_mutex.go",
         "taskset_mutex.go",
         "thread_group.go",
         "thread_group_timer_mutex.go",
+        "thread_group_unsafe.go",
         "threads.go",
         "threads_impl.go",
         "timekeeper.go",
         "timekeeper_state.go",
+        "timekeeper_tcpip_timer_mutex.go",
         "tty.go",
         "user_counters_mutex.go",
         "uts_namespace.go",
@@ -276,7 +306,6 @@ go_library(
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/bpf",
-        "gvisor.dev/gvisor/pkg/sentry/device",
         "gvisor.dev/gvisor/pkg/tcpip",
     ],
     marshal = True,
@@ -286,6 +315,7 @@ go_library(
         "//pkg/abi",
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
+        "//pkg/abi/sentry",
         "//pkg/atomicbitops",
         "//pkg/bitmap",
         "//pkg/bits",
@@ -294,9 +324,11 @@ go_library(
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/cpuid",
+        "//pkg/devutil",
         "//pkg/errors",
         "//pkg/errors/linuxerr",
         "//pkg/eventchannel",
+        "//pkg/fd",
         "//pkg/fspath",
         "//pkg/goid",
         "//pkg/hostarch",
@@ -305,17 +337,13 @@ go_library(
         "//pkg/marshal/primitive",
         "//pkg/metric",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/secio",
         "//pkg/sentry/arch",
-        "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/lock",
-        "//pkg/sentry/fs/timerfd",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsimpl/mqfs",
+        "//pkg/sentry/fsimpl/nsfs",
         "//pkg/sentry/fsimpl/pipefs",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/fsimpl/timerfd",
@@ -330,7 +358,7 @@ go_library(
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/kernel/semaphore",
         "//pkg/sentry/kernel/shm",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader",
         "//pkg/sentry/memmap",
@@ -348,7 +376,6 @@ go_library(
         "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/state",
-        "//pkg/state/statefile",
         "//pkg/state/wire",
         "//pkg/sync",
         "//pkg/sync/locking",
@@ -379,13 +406,12 @@ go_test(
         "//pkg/hostarch",
         "//pkg/sentry/arch",
         "//pkg/sentry/contexttest",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/filetest",
         "//pkg/sentry/kernel/sched",
         "//pkg/sentry/limits",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/time",
         "//pkg/sentry/usage",
+        "//pkg/sentry/vfs",
         "//pkg/sync",
     ],
 )

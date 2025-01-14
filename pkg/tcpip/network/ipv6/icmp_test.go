@@ -24,9 +24,10 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"golang.org/x/time/rate"
 	"gvisor.dev/gvisor/pkg/buffer"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
+	"gvisor.dev/gvisor/pkg/refs"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -59,6 +60,10 @@ var (
 type stubLinkEndpoint struct {
 	stack.LinkEndpoint
 }
+
+func (*stubLinkEndpoint) Close() {}
+
+func (*stubLinkEndpoint) SetOnCloseAction(func()) {}
 
 func (*stubLinkEndpoint) MTU() uint32 {
 	return defaultMTU
@@ -190,8 +195,8 @@ func handleICMPInIPv6(ep stack.NetworkEndpoint, src, dst tcpip.Address, icmp hea
 		ExtensionHeaders:  extensionHeaders,
 	})
 
-	buf := buffer.NewWithData(ip)
-	buf.Append(icmp)
+	buf := buffer.MakeWithData(ip)
+	buf.Append(buffer.NewViewWithData([]byte(icmp)))
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		Payload: buf,
 	})
@@ -221,7 +226,7 @@ func (c *testContext) cleanup() {
 	// does not guarantee that all packets will reach refcount zero until
 	// after an asynchronous followup from neighborEntry.notifyCompletionLocked().
 	c.clock.RunImmediatelyScheduledJobs()
-	refsvfs2.DoRepeatedLeakCheck()
+	refs.DoRepeatedLeakCheck()
 }
 
 func TestICMPCounts(t *testing.T) {
@@ -233,7 +238,7 @@ func TestICMPCounts(t *testing.T) {
 		t.Fatalf("CreateNIC(_, _) = %s", err)
 	}
 	{
-		subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+		subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -348,6 +353,12 @@ func TestICMPCounts(t *testing.T) {
 			size:               header.MLDMinimumSize + header.ICMPv6HeaderSize,
 		},
 		{
+			typ:                header.ICMPv6MulticastListenerV2Report,
+			hopLimit:           header.MLDHopLimit,
+			includeRouterAlert: true,
+			size:               header.MLDv2ReportMinimumSize + header.ICMPv6HeaderSize,
+		},
+		{
 			typ:                header.ICMPv6MulticastListenerDone,
 			hopLimit:           header.MLDHopLimit,
 			includeRouterAlert: true,
@@ -367,7 +378,7 @@ func TestICMPCounts(t *testing.T) {
 			Header:      icmp[:typ.size],
 			Src:         lladdr0,
 			Dst:         lladdr1,
-			PayloadCsum: header.Checksum(typ.extraData, 0 /* initial */),
+			PayloadCsum: checksum.Checksum(typ.extraData, 0 /* initial */),
 			PayloadLen:  len(typ.extraData),
 		}))
 		handleICMPInIPv6(ep, lladdr1, lladdr0, icmp, typ.hopLimit, typ.includeRouterAlert)
@@ -466,7 +477,7 @@ func newMultiStackTestContext(t *testing.T) multiStackTestContext {
 		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, llProtocolAddr1, err)
 	}
 
-	subnet0, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+	subnet0, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -476,7 +487,7 @@ func newMultiStackTestContext(t *testing.T) multiStackTestContext {
 			NIC:         nicID,
 		}},
 	)
-	subnet1, err := tcpip.NewSubnet(lladdr0, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr0))))
+	subnet1, err := tcpip.NewSubnet(lladdr0, tcpip.MaskFrom(strings.Repeat("\xff", lladdr0.Len())))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +538,7 @@ func routeICMPv6Packet(t *testing.T, clock *faketime.ManualClock, args routeArgs
 
 	{
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-			Payload: pi.Buffer(),
+			Payload: pi.ToBuffer(),
 		})
 		args.dst.InjectInbound(pi.NetworkProtocolNumber, pkt)
 		pkt.DecRef()
@@ -544,7 +555,9 @@ func routeICMPv6Packet(t *testing.T, clock *faketime.ManualClock, args routeArgs
 
 	// Pull the full payload since network header. Needed for header.IPv6 to
 	// extract its payload.
-	ipv6 := header.IPv6(stack.PayloadSince(pi.NetworkHeader()))
+	payload := stack.PayloadSince(pi.NetworkHeader())
+	defer payload.Release()
+	ipv6 := header.IPv6(payload.AsSlice())
 	transProto := tcpip.TransportProtocolNumber(ipv6.NextHeader())
 	if transProto != header.ICMPv6ProtocolNumber {
 		t.Errorf("unexpected transport protocol number %d", transProto)
@@ -599,7 +612,7 @@ func TestLinkResolution(t *testing.T) {
 		{src: c.linkEP1, dst: c.linkEP0, typ: header.ICMPv6NeighborAdvert},
 	} {
 		routeICMPv6Packet(t, c.clock, args, func(t *testing.T, icmpv6 header.ICMPv6) {
-			if got, want := tcpip.Address(icmpv6[8:][:16]), lladdr1; got != want {
+			if got, want := tcpip.AddrFromSlice(icmpv6[8:][:16]), lladdr1; got != want {
 				t.Errorf("%d: got target = %s, want = %s", icmpv6.Type(), got, want)
 			}
 		})
@@ -754,7 +767,7 @@ func TestICMPChecksumValidationSimple(t *testing.T) {
 					t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 				}
 				{
-					subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+					subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -785,7 +798,7 @@ func TestICMPChecksumValidationSimple(t *testing.T) {
 						SrcAddr:           lladdr1,
 						DstAddr:           lladdr0,
 					})
-					buf := buffer.NewWithData(append(ip, icmp...))
+					buf := buffer.MakeWithData(append(ip, icmp...))
 					pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 						Payload: buf,
 					})
@@ -955,7 +968,7 @@ func TestICMPChecksumValidationWithPayload(t *testing.T) {
 				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 			{
-				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -991,7 +1004,7 @@ func TestICMPChecksumValidationWithPayload(t *testing.T) {
 					DstAddr:           lladdr0,
 				})
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(hdr.View()),
+					Payload: buffer.MakeWithData(hdr.View()),
 				})
 				e.InjectInbound(ProtocolNumber, pkt)
 				pkt.DecRef()
@@ -1144,7 +1157,7 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 				t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nicID, protocolAddr, err)
 			}
 			{
-				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1156,7 +1169,7 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 				)
 			}
 
-			handleIPv6Payload := func(typ header.ICMPv6Type, size, payloadSize int, payloadFn func([]byte), checksum bool) {
+			handleIPv6Payload := func(typ header.ICMPv6Type, size, payloadSize int, payloadFn func([]byte), xsum bool) {
 				hdr := prependable.New(header.IPv6MinimumSize + size)
 				icmpHdr := header.ICMPv6(hdr.Prepend(size))
 				icmpHdr.SetType(typ)
@@ -1164,12 +1177,12 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 				payload := make([]byte, payloadSize)
 				payloadFn(payload)
 
-				if checksum {
+				if xsum {
 					icmpHdr.SetChecksum(header.ICMPv6Checksum(header.ICMPv6ChecksumParams{
 						Header:      icmpHdr,
 						Src:         lladdr1,
 						Dst:         lladdr0,
-						PayloadCsum: header.Checksum(payload, 0 /* initial */),
+						PayloadCsum: checksum.Checksum(payload, 0 /* initial */),
 						PayloadLen:  len(payload),
 					}))
 				}
@@ -1182,7 +1195,7 @@ func TestICMPChecksumValidationWithPayloadMultipleViews(t *testing.T) {
 					SrcAddr:           lladdr1,
 					DstAddr:           lladdr0,
 				})
-				buf := buffer.NewWithData(append(hdr.View(), payload...))
+				buf := buffer.MakeWithData(append(hdr.View(), payload...))
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 					Payload: buf,
 				})
@@ -1316,7 +1329,7 @@ func TestLinkAddressRequest(t *testing.T) {
 				t.Fatalf("expected %T to implement stack.LinkAddressResolver", ep)
 			}
 
-			if len(test.nicAddr) != 0 {
+			if test.nicAddr.Len() != 0 {
 				protocolAddr := tcpip.ProtocolAddress{
 					Protocol:          ProtocolNumber,
 					AddressWithPrefix: test.nicAddr.WithPrefix(),
@@ -1350,7 +1363,9 @@ func TestLinkAddressRequest(t *testing.T) {
 			if diff := cmp.Diff(want, pkt.EgressRoute, cmp.AllowUnexported(want)); diff != "" {
 				t.Errorf("route info mismatch (-want +got):\n%s", diff)
 			}
-			checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()),
+			payload := stack.PayloadSince(pkt.NetworkHeader())
+			defer payload.Release()
+			checker.IPv6(t, payload,
 				checker.SrcAddr(lladdr1),
 				checker.DstAddr(test.expectedRemoteAddr),
 				checker.TTL(header.NDPHopLimit),
@@ -1372,14 +1387,14 @@ func TestPacketQueing(t *testing.T) {
 		host1IPv6Addr = tcpip.ProtocolAddress{
 			Protocol: ProtocolNumber,
 			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("a::1").To16()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("a::1").To16()),
 				PrefixLen: 64,
 			},
 		}
 		host2IPv6Addr = tcpip.ProtocolAddress{
 			Protocol: ProtocolNumber,
 			AddressWithPrefix: tcpip.AddressWithPrefix{
-				Address:   tcpip.Address(net.ParseIP("a::2").To16()),
+				Address:   tcpip.AddrFromSlice(net.ParseIP("a::2").To16()),
 				PrefixLen: 64,
 			},
 		}
@@ -1401,7 +1416,7 @@ func TestPacketQueing(t *testing.T) {
 					Length:  header.UDPMinimumSize,
 				})
 				sum := header.PseudoHeaderChecksum(udp.ProtocolNumber, host2IPv6Addr.AddressWithPrefix.Address, host1IPv6Addr.AddressWithPrefix.Address, header.UDPMinimumSize)
-				sum = header.Checksum(nil, sum)
+				sum = checksum.Checksum(nil, sum)
 				u.SetChecksum(^u.CalculateChecksum(sum))
 				payloadLength := hdr.UsedLength()
 				ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
@@ -1413,7 +1428,7 @@ func TestPacketQueing(t *testing.T) {
 					DstAddr:           host1IPv6Addr.AddressWithPrefix.Address,
 				})
 				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(hdr.View()),
+					Payload: buffer.MakeWithData(hdr.View()),
 				})
 				e.InjectInbound(ProtocolNumber, pkt)
 				pkt.DecRef()
@@ -1430,7 +1445,9 @@ func TestPacketQueing(t *testing.T) {
 				if p.EgressRoute.RemoteLinkAddress != host2NICLinkAddr {
 					t.Errorf("got p.EgressRoute.RemoteLinkAddress = %s, want = %s", p.EgressRoute.RemoteLinkAddress, host2NICLinkAddr)
 				}
-				checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
 					checker.SrcAddr(host1IPv6Addr.AddressWithPrefix.Address),
 					checker.DstAddr(host2IPv6Addr.AddressWithPrefix.Address),
 					checker.ICMPv6(
@@ -1462,7 +1479,7 @@ func TestPacketQueing(t *testing.T) {
 					DstAddr:           host1IPv6Addr.AddressWithPrefix.Address,
 				})
 				pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(hdr.View()),
+					Payload: buffer.MakeWithData(hdr.View()),
 				})
 				e.InjectInbound(header.IPv6ProtocolNumber, pktBuf)
 				pktBuf.DecRef()
@@ -1479,7 +1496,9 @@ func TestPacketQueing(t *testing.T) {
 				if p.EgressRoute.RemoteLinkAddress != host2NICLinkAddr {
 					t.Errorf("got p.EgressRoute.RemoteLinkAddress = %s, want = %s", p.EgressRoute.RemoteLinkAddress, host2NICLinkAddr)
 				}
-				checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
 					checker.SrcAddr(host1IPv6Addr.AddressWithPrefix.Address),
 					checker.DstAddr(host2IPv6Addr.AddressWithPrefix.Address),
 					checker.ICMPv6(
@@ -1532,7 +1551,9 @@ func TestPacketQueing(t *testing.T) {
 				if want := header.EthernetAddressFromMulticastIPv6Address(snmc); p.EgressRoute.RemoteLinkAddress != want {
 					t.Errorf("got p.EgressRoute.RemoteLinkAddress = %s, want = %s", p.EgressRoute.RemoteLinkAddress, want)
 				}
-				checker.IPv6(t, stack.PayloadSince(p.NetworkHeader()),
+				payload := stack.PayloadSince(p.NetworkHeader())
+				defer payload.Release()
+				checker.IPv6(t, payload,
 					checker.SrcAddr(host1IPv6Addr.AddressWithPrefix.Address),
 					checker.DstAddr(snmc),
 					checker.TTL(header.NDPHopLimit),
@@ -1571,7 +1592,7 @@ func TestPacketQueing(t *testing.T) {
 					DstAddr:           host1IPv6Addr.AddressWithPrefix.Address,
 				})
 				pktBuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-					Payload: buffer.NewWithData(hdr.View()),
+					Payload: buffer.MakeWithData(hdr.View()),
 				})
 				e.InjectInbound(ProtocolNumber, pktBuf)
 				pktBuf.DecRef()
@@ -1769,7 +1790,7 @@ func TestCallsToNeighborCache(t *testing.T) {
 				}
 			}
 			{
-				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.AddressMask(strings.Repeat("\xff", len(lladdr1))))
+				subnet, err := tcpip.NewSubnet(lladdr1, tcpip.MaskFrom(strings.Repeat("\xff", lladdr1.Len())))
 				if err != nil {
 					t.Fatal(err)
 				}

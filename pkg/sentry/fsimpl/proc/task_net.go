@@ -43,7 +43,12 @@ func (fs *filesystem) newTaskNetDir(ctx context.Context, task *kernel.Task) kern
 	root := auth.NewRootCredentials(pidns.UserNamespace())
 
 	var contents map[string]kernfs.Inode
-	if stack := task.NetworkNamespace().Stack(); stack != nil {
+	var stack inet.Stack
+	if netns := task.GetNetworkNamespace(); netns != nil {
+		netns.DecRef(ctx)
+		stack = netns.Stack()
+	}
+	if stack != nil {
 		const (
 			arp       = "IP address       HW type     Flags       HW address            Mask     Device\n"
 			netlink   = "sk       Eth Pid    Groups   Rmem     Wmem     Dump     Locks     Drops     Inode\n"
@@ -206,17 +211,17 @@ var _ dynamicInode = (*netUnixData)(nil)
 func (n *netUnixData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("Num       RefCount Protocol Flags    Type St Inode Path\n")
 	for _, se := range n.kernel.ListSockets() {
-		s := se.SockVFS2
+		s := se.Sock
 		if !s.TryIncRef() {
 			// Racing with socket destruction, this is ok.
 			continue
 		}
-		if family, _, _ := s.Impl().(socket.SocketVFS2).Type(); family != linux.AF_UNIX {
+		if family, _, _ := s.Impl().(socket.Socket).Type(); family != linux.AF_UNIX {
 			s.DecRef(ctx)
 			// Not a unix socket.
 			continue
 		}
-		sops := s.Impl().(*unix.SocketVFS2)
+		sops := s.Impl().(*unix.Socket)
 
 		addr, err := sops.Endpoint().GetLocalAddress()
 		if err != nil {
@@ -263,13 +268,13 @@ func (n *netUnixData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		//
 		// For now, we always redact this pointer.
 		fmt.Fprintf(buf, "%#016p: %08X %08X %08X %04X %02X %8d",
-			(*unix.SocketOperations)(nil), // Num, pointer to kernel socket struct.
-			s.ReadRefs()-1,                // RefCount, don't count our own ref.
-			0,                             // Protocol, always 0 for UDS.
-			sockFlags,                     // Flags.
-			sops.Endpoint().Type(),        // Type.
-			sops.State(),                  // State.
-			ino,                           // Inode.
+			(*unix.Socket)(nil),    // Num, pointer to kernel socket struct.
+			s.ReadRefs()-1,         // RefCount, don't count our own ref.
+			0,                      // Protocol, always 0 for UDS.
+			sockFlags,              // Flags.
+			sops.Endpoint().Type(), // Type.
+			sops.State(),           // State.
+			ino,                    // Inode.
 		)
 
 		// Path
@@ -351,12 +356,12 @@ func commonGenerateTCP(ctx context.Context, buf *bytes.Buffer, k *kernel.Kernel,
 	t := kernel.TaskFromContext(ctx)
 
 	for _, se := range k.ListSockets() {
-		s := se.SockVFS2
+		s := se.Sock
 		if !s.TryIncRef() {
 			// Racing with socket destruction, this is ok.
 			continue
 		}
-		sops, ok := s.Impl().(socket.SocketVFS2)
+		sops, ok := s.Impl().(socket.Socket)
 		if !ok {
 			panic(fmt.Sprintf("Found non-socket file in socket table: %+v", s))
 		}
@@ -430,7 +435,7 @@ func commonGenerateTCP(ctx context.Context, buf *bytes.Buffer, k *kernel.Kernel,
 			fmt.Fprintf(buf, "%8d ", stat.Ino)
 		}
 
-		// Field: refcount. Don't count the ref we obtain while deferencing
+		// Field: refcount. Don't count the ref we obtain while dereferencing
 		// the weakref to this socket.
 		fmt.Fprintf(buf, "%d ", s.ReadRefs()-1)
 
@@ -516,12 +521,12 @@ func (d *netUDPData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	buf.WriteString("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops             \n")
 
 	for _, se := range d.kernel.ListSockets() {
-		s := se.SockVFS2
+		s := se.Sock
 		if !s.TryIncRef() {
 			// Racing with socket destruction, this is ok.
 			continue
 		}
-		sops, ok := s.Impl().(socket.SocketVFS2)
+		sops, ok := s.Impl().(socket.Socket)
 		if !ok {
 			panic(fmt.Sprintf("Found non-socket file in socket table: %+v", s))
 		}
@@ -590,7 +595,7 @@ func (d *netUDPData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 		}
 
 		// Field: ref; reference count on the socket inode. Don't count the ref
-		// we obtain while deferencing the weakref to this socket.
+		// we obtain while dereferencing the weakref to this socket.
 		fmt.Fprintf(buf, "%d ", s.ReadRefs()-1)
 
 		// Field: Socket struct address. Redacted due to the same reason as
@@ -650,7 +655,7 @@ var snmp = []snmpLine{
 	},
 }
 
-func toSlice(a interface{}) []uint64 {
+func toSlice(a any) []uint64 {
 	v := reflect.Indirect(reflect.ValueOf(a))
 	return v.Slice(0, v.Len()).Interface().([]uint64)
 }
@@ -665,7 +670,7 @@ func sprintSlice(s []uint64) string {
 
 // Generate implements vfs.DynamicBytesSource.Generate.
 func (d *netSnmpData) Generate(ctx context.Context, buf *bytes.Buffer) error {
-	types := []interface{}{
+	types := []any{
 		&inet.StatSNMPIP{},
 		&inet.StatSNMPICMP{},
 		nil, // TODO(gvisor.dev/issue/628): Support IcmpMsg stats.

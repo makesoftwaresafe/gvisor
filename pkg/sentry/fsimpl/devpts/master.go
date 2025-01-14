@@ -36,8 +36,11 @@ type masterInode struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeFSOwned
+	kernfs.InodeWatches
 
 	locks vfs.FileLocks
 
@@ -134,7 +137,7 @@ func (mfd *masterFileDescription) Write(ctx context.Context, src usermem.IOSeque
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
-func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		// ioctl(2) may only be called from a task goroutine.
@@ -154,14 +157,19 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, args
 		// of the replica end.
 		return mfd.t.ld.setTermios(t, args)
 	case linux.TCSETSW:
-		// TODO(b/29356795): This should drain the output queue first.
+		// Note that this should drain the output queue first, but we
+		// don't implement that yet.
+		return mfd.t.ld.setTermios(t, args)
+	case linux.TCSETSF:
+		// This should drain the output queue and clear the input queue
+		// first, but we don't implement that yet.
 		return mfd.t.ld.setTermios(t, args)
 	case linux.TIOCGPTN:
 		nP := primitive.Uint32(mfd.t.n)
 		_, err := nP.CopyOut(t, args[2].Pointer())
 		return 0, err
 	case linux.TIOCSPTLCK:
-		// TODO(b/29356795): Implement pty locking. For now just pretend we do.
+		// For now just pretend we implement pty locking.
 		return 0, nil
 	case linux.TIOCGWINSZ:
 		return 0, mfd.t.ld.windowSize(t, args)
@@ -171,18 +179,28 @@ func (mfd *masterFileDescription) Ioctl(ctx context.Context, io usermem.IO, args
 		// Make the given terminal the controlling terminal of the
 		// calling process.
 		steal := args[2].Int() == 1
-		return 0, mfd.t.setControllingTTY(ctx, steal, true /* isMaster */, mfd.vfsfd.IsReadable())
+		return 0, t.ThreadGroup().SetControllingTTY(ctx, mfd.t.masterKTTY, steal, mfd.vfsfd.IsReadable())
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, mfd.t.releaseControllingTTY(ctx, true /* isMaster */)
+		return 0, t.ThreadGroup().ReleaseControllingTTY(mfd.t.masterKTTY)
 	case linux.TIOCGPGRP:
-		// Get the foreground process group.
-		return mfd.t.foregroundProcessGroup(ctx, args, true /* isMaster */)
+		// Get the foreground process group id.
+		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(mfd.t.masterKTTY)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(pgid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
 	case linux.TIOCSPGRP:
-		// Set the foreground process group.
-		return mfd.t.setForegroundProcessGroup(ctx, args, true /* isMaster */)
+		// Set the foreground process group id.
+		var pgid primitive.Int32
+		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		return 0, t.ThreadGroup().SetForegroundProcessGroupID(mfd.t.masterKTTY, kernel.ProcessGroupID(pgid))
 	default:
-		maybeEmitUnimplementedEvent(ctx, cmd)
+		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
 		return 0, linuxerr.ENOTTY
 	}
 }
@@ -201,7 +219,7 @@ func (mfd *masterFileDescription) Stat(ctx context.Context, opts vfs.StatOptions
 }
 
 // maybeEmitUnimplementedEvent emits unimplemented event if cmd is valid.
-func maybeEmitUnimplementedEvent(ctx context.Context, cmd uint32) {
+func maybeEmitUnimplementedEvent(ctx context.Context, sysno uintptr, cmd uint32) {
 	switch cmd {
 	case linux.TCGETS,
 		linux.TCSETS,
@@ -233,6 +251,6 @@ func maybeEmitUnimplementedEvent(ctx context.Context, cmd uint32) {
 		linux.TIOCSSERIAL,
 		linux.TIOCGPTPEER:
 
-		unimpl.EmitUnimplementedEvent(ctx)
+		unimpl.EmitUnimplementedEvent(ctx, sysno)
 	}
 }

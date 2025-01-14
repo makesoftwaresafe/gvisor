@@ -23,6 +23,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 )
 
 // tPacketHdrlen is the TPACKET_HDRLEN variable defined in <linux/if_packet.h>.
@@ -46,13 +47,13 @@ func (t tPacketHdr) setTPStatus(status uint32) {
 	(*atomicbitops.Uint32)(statusPtr).Store(status)
 }
 
-func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
-	stopFd, err := newStopFd()
+func newPacketMMapDispatcher(fd int, e *endpoint, opts *Options) (linkDispatcher, error) {
+	stopFD, err := stopfd.New()
 	if err != nil {
 		return nil, err
 	}
 	d := &packetMMapDispatcher{
-		stopFd: stopFd,
+		StopFD: stopFD,
 		fd:     fd,
 		e:      e,
 	}
@@ -76,6 +77,8 @@ func newPacketMMapDispatcher(fd int, e *endpoint) (linkDispatcher, error) {
 	if err != nil {
 		return nil, fmt.Errorf("unix.Mmap(...,0, %v, ...) failed = %v", sz, err)
 	}
+	d.mgr = newProcessorManager(opts, e)
+	d.mgr.start()
 	d.ringBuffer = buf
 	return d, nil
 }

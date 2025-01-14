@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.1
-// +build go1.1
+//go:build !false
+// +build !false
 
 package flipcall
 
@@ -166,7 +166,7 @@ func (ep *Endpoint) exitFutexWait() {
 		return
 	case epsShutdown:
 		// ep.ctrlShutdown() was called while we were blocked, so we are
-		// repsonsible for indicating connection shutdown.
+		// responsible for indicating connection shutdown.
 		ep.shutdownConn()
 	default:
 		panic(fmt.Sprintf("invalid flipcall.Endpoint.ctrl.state after flipcall.Endpoint.exitFutexWait(): %v", eps+epsBlocked))

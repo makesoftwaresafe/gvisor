@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.12
-// +build go1.12
+//go:build go1.18
+// +build go1.18
 
 // //go:linkname directives type-checked by checklinkname. Any other
 // non-linkname assumptions outside the Go 1 compatibility guarantee should
@@ -25,6 +25,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
@@ -59,7 +60,7 @@ func bluepillArchContext(context unsafe.Pointer) *arch.SignalContext64 {
 	return &((*arch.UContext64)(context).MContext)
 }
 
-// bluepillHandleHlt is reponsible for handling VM-Exit.
+// bluepillHandleHlt is responsible for handling VM-Exit.
 //
 //go:nosplit
 func bluepillGuestExit(c *vCPU, context unsafe.Pointer) {
@@ -78,6 +79,21 @@ func bluepillGuestExit(c *vCPU, context unsafe.Pointer) {
 	default:
 		throw("invalid state")
 	}
+}
+
+var hexSyms = []byte("0123456789abcdef")
+
+//go:nosplit
+func printHex(title []byte, val uint64) {
+	var str [18]byte
+	for i := 0; i < 16; i++ {
+		str[16-i] = hexSyms[val&0xf]
+		val = val >> 4
+	}
+	str[0] = ' '
+	str[17] = '\n'
+	hostsyscall.RawSyscallErrno(unix.SYS_WRITE, uintptr(unix.Stderr), uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
+	hostsyscall.RawSyscallErrno(unix.SYS_WRITE, uintptr(unix.Stderr), uintptr(unsafe.Pointer(&str)), 18)
 }
 
 // bluepillHandler is called from the signal stub.
@@ -111,7 +127,7 @@ func bluepillHandler(context unsafe.Pointer) {
 
 	for {
 		hostExitCounter.Increment()
-		_, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(c.fd), _KVM_RUN, 0) // escapes: no.
+		errno := hostsyscall.RawSyscallErrno(unix.SYS_IOCTL, uintptr(c.fd), KVM_RUN, 0) // escapes: no.
 		switch errno {
 		case 0: // Expected case.
 		case unix.EINTR:
@@ -121,7 +137,7 @@ func bluepillHandler(context unsafe.Pointer) {
 			// currently, all signals are masked and the signal
 			// must have been delivered directly to this thread.
 			timeout := unix.Timespec{}
-			sig, _, errno := unix.RawSyscall6( // escapes: no.
+			sig, errno := hostsyscall.RawSyscall6( // escapes: no.
 				unix.SYS_RT_SIGTIMEDWAIT,
 				uintptr(unsafe.Pointer(&bounceSignalMask)),
 				0,                                 // siginfo.
@@ -185,6 +201,7 @@ func bluepillHandler(context unsafe.Pointer) {
 			c.die(bluepillArchContext(context), "debug")
 			return
 		case _KVM_EXIT_HLT:
+			c.hltSanityCheck()
 			bluepillGuestExit(c, context)
 			return
 		case _KVM_EXIT_MMIO:

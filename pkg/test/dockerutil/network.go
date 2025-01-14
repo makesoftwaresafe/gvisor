@@ -20,7 +20,7 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
 
@@ -65,8 +65,7 @@ func (n *Network) networkCreate() types.NetworkCreate {
 	}
 
 	return types.NetworkCreate{
-		CheckDuplicate: true,
-		IPAM:           &ipam,
+		IPAM: &ipam,
 	}
 }
 

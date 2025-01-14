@@ -19,7 +19,6 @@ import (
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -44,7 +43,7 @@ func (e *countedEndpoint) DeliverNetworkPacket(protocol tcpip.NetworkProtocolNum
 	e.dispatchCount++
 }
 
-func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (*countedEndpoint) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	panic("not implemented")
 }
 
@@ -62,6 +61,10 @@ func (e *countedEndpoint) MTU() uint32 {
 	return e.mtu
 }
 
+func (e *countedEndpoint) SetMTU(mtu uint32) {
+	e.mtu = mtu
+}
+
 func (e *countedEndpoint) Capabilities() stack.LinkEndpointCapabilities {
 	return e.capabilities
 }
@@ -72,6 +75,10 @@ func (e *countedEndpoint) MaxHeaderLength() uint16 {
 
 func (e *countedEndpoint) LinkAddress() tcpip.LinkAddress {
 	return e.linkAddr
+}
+
+func (e *countedEndpoint) SetLinkAddress(addr tcpip.LinkAddress) {
+	e.linkAddr = addr
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
@@ -92,6 +99,17 @@ func (*countedEndpoint) Wait() {}
 func (*countedEndpoint) AddHeader(*stack.PacketBuffer) {
 	panic("unimplemented")
 }
+
+// ParseHeader implements stack.LinkEndpoint.ParseHeader.
+func (*countedEndpoint) ParseHeader(*stack.PacketBuffer) bool {
+	panic("unimplemented")
+}
+
+// Close implements stack.LinkEndpoint.
+func (*countedEndpoint) Close() {}
+
+// SetOnCloseAction implements stack.LinkEndpoint.SetOnCloseAction.
+func (*countedEndpoint) SetOnCloseAction(func()) {}
 
 func TestWaitWrite(t *testing.T) {
 	ep := &countedEndpoint{}
@@ -221,6 +239,6 @@ func TestOtherMethods(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

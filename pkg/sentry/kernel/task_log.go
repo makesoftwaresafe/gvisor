@@ -35,23 +35,23 @@ const (
 )
 
 // Infof logs an formatted info message by calling log.Infof.
-func (t *Task) Infof(fmt string, v ...interface{}) {
+func (t *Task) Infof(fmt string, v ...any) {
 	if log.IsLogging(log.Info) {
-		log.InfofAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
+		log.InfofAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
 // Warningf logs a warning string by calling log.Warningf.
-func (t *Task) Warningf(fmt string, v ...interface{}) {
+func (t *Task) Warningf(fmt string, v ...any) {
 	if log.IsLogging(log.Warning) {
-		log.WarningfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
+		log.WarningfAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
 // Debugf creates a debug string that includes the task ID.
-func (t *Task) Debugf(fmt string, v ...interface{}) {
+func (t *Task) Debugf(fmt string, v ...any) {
 	if log.IsLogging(log.Debug) {
-		log.DebugfAtDepth(1, t.logPrefix.Load().(string)+fmt, v...)
+		log.DebugfAtDepth(1, *t.logPrefix.Load()+fmt, v...)
 	}
 }
 
@@ -190,12 +190,20 @@ const (
 //
 // Preconditions: The task's owning TaskSet.mu must be locked.
 func (t *Task) updateInfoLocked() {
-	// Use the task's TID and PID in the root PID namespace for logging.
-	pid := t.tg.pidns.owner.Root.tgids[t.tg]
-	tid := t.tg.pidns.owner.Root.tids[t]
-	t.logPrefix.Store(fmt.Sprintf("[% 4d:% 4d] ", pid, tid))
+	// Log the TID and PID in root pidns and t's pidns.
+	rootPID := t.tg.pidns.owner.Root.tgids[t.tg]
+	rootTID := t.tg.pidns.owner.Root.tids[t]
+	pid := t.tg.pidns.tgids[t.tg]
+	tid := t.tg.pidns.tids[t]
+	if rootPID == pid && rootTID == tid {
+		prefix := fmt.Sprintf("[% 4d:% 4d] ", pid, tid)
+		t.logPrefix.Store(&prefix)
+	} else {
+		prefix := fmt.Sprintf("[% 4d(%4d):% 4d(%4d)] ", rootPID, pid, rootTID, tid)
+		t.logPrefix.Store(&prefix)
+	}
 
-	t.rebuildTraceContext(tid)
+	t.rebuildTraceContext(rootTID)
 }
 
 // rebuildTraceContext rebuilds the trace context.
@@ -253,6 +261,6 @@ func (t *Task) traceExecEvent(image *TaskImage) {
 
 	// traceExecEvent function may be called before the task goroutine
 	// starts, so we must use the async context.
-	name := file.PathnameWithDeleted(t.AsyncContext())
+	name := file.MappedName(t.AsyncContext())
 	trace.Logf(t.traceContext, traceCategory, "exec: %s", name)
 }

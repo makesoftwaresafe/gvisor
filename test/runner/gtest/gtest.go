@@ -33,6 +33,9 @@ var (
 
 	// filterBenchmarkFlag is the flag that will run specified benchmarks.
 	filterBenchmarkFlag = "--benchmark_filter"
+
+	// TestFlags is the flags that are set for all tests.
+	TestFlags = []string{}
 )
 
 // TestCase is a single gtest test case.
@@ -141,7 +144,7 @@ func ParseTestCases(testBin string, benchmarks bool, extraArgs ...string) ([]Tes
 	return t, nil
 }
 
-// ParseBenchmarks returns each benchmark in a third_party/benchmark binary's list as a single test case.
+// ParseBenchmarks returns each benchmark in the binary's list as a single test case.
 func ParseBenchmarks(binary string, extraArgs ...string) ([]TestCase, error) {
 	var t []TestCase
 	args := append([]string{listBenchmarkFlag}, extraArgs...)
@@ -178,4 +181,37 @@ func ParseBenchmarks(binary string, extraArgs ...string) ([]TestCase, error) {
 		})
 	}
 	return t, nil
+}
+
+// BuildTestArgs builds arguments to be passed to the test binary to execute
+// only the test cases in `indices`.
+func BuildTestArgs(indices []int, testCases []TestCase) []string {
+	var testFilter, benchFilter string
+	for _, tci := range indices {
+		tc := testCases[tci]
+		if tc.all {
+			// No argument will make all tests run.
+			return nil
+		}
+		if tc.benchmark {
+			if len(benchFilter) > 0 {
+				benchFilter += "|"
+			}
+			benchFilter += "^" + tc.Name + "$"
+		} else {
+			if len(testFilter) > 0 {
+				testFilter += ":"
+			}
+			testFilter += tc.FullName()
+		}
+	}
+
+	var args []string
+	if len(testFilter) > 0 {
+		args = append(args, fmt.Sprintf("%s=%s", filterTestFlag, testFilter))
+	}
+	if len(benchFilter) > 0 {
+		args = append(args, fmt.Sprintf("%s=%s", filterBenchmarkFlag, benchFilter))
+	}
+	return args
 }

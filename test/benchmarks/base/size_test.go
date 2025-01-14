@@ -24,6 +24,7 @@ import (
 	"gvisor.dev/gvisor/test/benchmarks/base"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 // BenchmarkSizeEmpty creates N empty containers and reads memory usage from
@@ -57,6 +58,9 @@ func BenchmarkSizeEmpty(b *testing.B) {
 		}, "sh", "-c", "echo Hello && sleep 1000"); err != nil {
 			base.CleanUpContainers(ctx, containers)
 			b.Fatalf("failed to run container: %v", err)
+		}
+		if i == 0 {
+			defer metricsviz.FromContainerLogs(ctx, b, container)
 		}
 		if _, err := container.WaitForOutputSubmatch(ctx, "Hello", 5*time.Second); err != nil {
 			base.CleanUpContainers(ctx, containers)
@@ -110,6 +114,9 @@ func BenchmarkSizeNginx(b *testing.B) {
 			Cmd:     []string{"nginx", "-c", "/etc/nginx/nginx_gofer.conf"},
 		})
 	defer base.CleanUpContainers(ctx, servers)
+	if len(servers) > 0 {
+		defer metricsviz.FromContainerLogs(ctx, b, servers[0])
+	}
 
 	// DropCaches after servers are created.
 	harness.DropCaches(machine)
@@ -132,7 +139,7 @@ func BenchmarkSizeNode(b *testing.B) {
 
 	// Make a redis instance for Node to connect.
 	ctx := context.Background()
-	redis, redisIP := base.RedisInstance(ctx, b, machine)
+	redis := base.RedisInstance(ctx, b, machine)
 	defer redis.CleanUp(ctx)
 
 	// DropCaches after redis is created.
@@ -152,7 +159,7 @@ func BenchmarkSizeNode(b *testing.B) {
 		WorkDir: "/usr/src/app",
 		Links:   []string{redis.MakeLink("redis")},
 	}
-	nodeCmd := []string{"node", "index.js", redisIP.String()}
+	nodeCmd := []string{"node", "index.js", "redis"}
 	const port = 8080
 	servers := base.StartServers(ctx, b,
 		base.ServerArgs{
@@ -162,6 +169,9 @@ func BenchmarkSizeNode(b *testing.B) {
 			Cmd:     nodeCmd,
 		})
 	defer base.CleanUpContainers(ctx, servers)
+	if len(servers) > 0 {
+		defer metricsviz.FromContainerLogs(ctx, b, servers[0])
+	}
 
 	// DropCaches after servers are created.
 	harness.DropCaches(machine)

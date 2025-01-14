@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "check",
@@ -14,8 +17,8 @@ go_library(
     deps = [
         "//runsc/flag",
         "//tools/checkaligned",
+        "//tools/checkconst",
         "//tools/checkescape",
-        "//tools/checkinfo",
         "//tools/checklinkname",
         "//tools/checklocks",
         "//tools/checkunsafe",

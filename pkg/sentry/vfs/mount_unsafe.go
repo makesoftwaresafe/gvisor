@@ -153,8 +153,7 @@ func (mt *mountTable) Init() {
 
 func newMountTableSlots(cap uintptr) unsafe.Pointer {
 	slice := make([]mountSlot, cap, cap)
-	hdr := (*gohacks.SliceHeader)(unsafe.Pointer(&slice))
-	return hdr.Data
+	return unsafe.Pointer(&slice[0])
 }
 
 // Lookup returns the Mount with the given parent, mounted at the given point.
@@ -329,7 +328,9 @@ func mtInsertLocked(slots unsafe.Pointer, cap uintptr, value unsafe.Pointer, has
 
 // Remove removes the given mount from mt.
 //
-// Preconditions: mt must contain mount.
+// Preconditions:
+//   - mt must contain mount.
+//   - mount.key should be valid.
 func (mt *mountTable) Remove(mount *Mount) {
 	mt.seq.BeginWrite()
 	mt.removeSeqed(mount)
@@ -338,9 +339,8 @@ func (mt *mountTable) Remove(mount *Mount) {
 
 // removeSeqed removes the given mount from mt.
 //
-// Preconditions:
+// Preconditions same as Remove() plus:
 //   - mt.seq must be in a writer critical section.
-//   - mt must contain mount.
 func (mt *mountTable) removeSeqed(mount *Mount) {
 	hash := mount.key.hash()
 	tcap := uintptr(1) << (mt.size.RacyLoad() & mtSizeOrderMask)

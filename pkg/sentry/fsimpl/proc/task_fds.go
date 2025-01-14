@@ -36,19 +36,20 @@ func getTaskFD(t *kernel.Task, fd int32) (*vfs.FileDescription, kernel.FDFlags) 
 	)
 	t.WithMuLocked(func(t *kernel.Task) {
 		if fdt := t.FDTable(); fdt != nil {
-			file, flags = fdt.GetVFS2(fd)
+			file, flags = fdt.Get(fd)
 		}
 	})
 	return file, flags
 }
 
 func taskFDExists(ctx context.Context, fs *filesystem, t *kernel.Task, fd int32) bool {
-	file, _ := getTaskFD(t, fd)
-	if file == nil {
-		return false
-	}
-	fs.SafeDecRefFD(ctx, file)
-	return true
+	var exists bool
+	t.WithMuLocked(func(task *kernel.Task) {
+		if fdt := t.FDTable(); fdt != nil {
+			exists = fdt.Exists(fd)
+		}
+	})
+	return exists
 }
 
 // +stateify savable
@@ -112,9 +113,12 @@ type fdDirInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 }
 
 var _ kernfs.Inode = (*fdDirInode)(nil)
@@ -196,7 +200,10 @@ type fdSymlink struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeSymlink
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	fs   *filesystem
 	task *kernel.Task
@@ -240,7 +247,7 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (s *fdSymlink) Valid(ctx context.Context) bool {
+func (s *fdSymlink) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, s.fs, s.task, s.fd)
 }
 
@@ -254,9 +261,12 @@ type fdInfoDirInode struct {
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 }
 
 var _ kernfs.Inode = (*fdInfoDirInode)(nil)
@@ -342,6 +352,6 @@ func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (d *fdInfoData) Valid(ctx context.Context) bool {
+func (d *fdInfoData) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return taskFDExists(ctx, d.fs, d.task, d.fd)
 }

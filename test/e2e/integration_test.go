@@ -22,10 +22,10 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/mount"
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 )
@@ -177,7 +178,7 @@ func TestPauseResume(t *testing.T) {
 
 func TestCheckpointRestore(t *testing.T) {
 	if !testutil.IsCheckpointSupported() {
-		t.Skip("Pause/resume is not supported.")
+		t.Skip("Checkpoint is not supported.")
 	}
 	dockerutil.EnsureDockerExperimentalEnabled()
 
@@ -231,8 +232,8 @@ func TestConnectToSelf(t *testing.T) {
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
 
-	// Creates server that replies "server" and exists. Sleeps at the end because
-	// 'docker exec' gets killed if the init process exists before it can finish.
+	// Creates server that replies "server" and exits. Sleeps at the end because
+	// 'docker exec' gets killed if the init process exits before it can finish.
 	if err := d.Spawn(ctx, dockerutil.RunOpts{
 		Image: "basic/ubuntu",
 	}, "/bin/sh", "-c", "echo server | nc -l -p 8080 && sleep 1"); err != nil {
@@ -436,12 +437,12 @@ func TestTmpFile(t *testing.T) {
 
 // TestTmpMount checks that mounts inside '/tmp' are not overridden.
 func TestTmpMount(t *testing.T) {
-	dir, err := ioutil.TempDir(testutil.TmpDir(), "tmp-mount")
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "tmp-mount")
 	if err != nil {
 		t.Fatalf("TempDir(): %v", err)
 	}
 	const want = "123"
-	if err := ioutil.WriteFile(filepath.Join(dir, "file.txt"), []byte("123"), 0666); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "file.txt"), []byte("123"), 0666); err != nil {
 		t.Fatalf("WriteFile(): %v", err)
 	}
 	ctx := context.Background()
@@ -470,9 +471,9 @@ func TestTmpMount(t *testing.T) {
 // Test that it is allowed to mount a file on top of /dev files, e.g.
 // /dev/random.
 func TestMountOverDev(t *testing.T) {
-	random, err := ioutil.TempFile(testutil.TmpDir(), "random")
+	random, err := os.CreateTemp(testutil.TmpDir(), "random")
 	if err != nil {
-		t.Fatal("ioutil.TempFile() failed:", err)
+		t.Fatal("os.CreateTemp() failed:", err)
 	}
 	const want = "123"
 	if _, err := random.WriteString(want); err != nil {
@@ -567,12 +568,6 @@ func TestLink(t *testing.T) {
 
 // This test ensures we can run ping without errors.
 func TestPing4Loopback(t *testing.T) {
-	if testutil.IsRunningWithHostNet() {
-		// TODO(gvisor.dev/issue/5011): support ICMP sockets in hostnet and enable
-		// this test.
-		t.Skip("hostnet only supports TCP/UDP sockets, so ping is not supported.")
-	}
-
 	runIntegrationTest(t, nil, "./ping4.sh")
 }
 
@@ -602,7 +597,32 @@ func TestStickyDir(t *testing.T) {
 }
 
 func TestHostFD(t *testing.T) {
-	runIntegrationTest(t, nil, "./host_fd")
+	t.Run("regular", func(t *testing.T) {
+		runIntegrationTest(t, nil, "./host_fd")
+	})
+	t.Run("tty", func(t *testing.T) {
+		ctx := context.Background()
+		d := dockerutil.MakeContainer(ctx, t)
+		defer d.CleanUp(ctx)
+
+		// Start the container with an attached PTY.
+		p, err := d.SpawnProcess(ctx, dockerutil.RunOpts{
+			Image:   "basic/integrationtest",
+			WorkDir: "/root",
+		}, "./host_fd", "-t")
+		if err != nil {
+			t.Fatalf("docker run failed: %v", err)
+		}
+
+		if err := d.Wait(ctx); err != nil {
+			t.Fatalf("Wait failed: %v", err)
+		}
+		if out, err := p.Logs(); err != nil {
+			t.Fatal(err)
+		} else if len(out) > 0 {
+			t.Errorf("test failed:\n%s", out)
+		}
+	})
 }
 
 func runIntegrationTest(t *testing.T, capAdd []string, args ...string) {
@@ -734,7 +754,7 @@ func TestUnmount(t *testing.T) {
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
 
-	dir, err := ioutil.TempDir(testutil.TmpDir(), "sub-mount")
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "sub-mount")
 	if err != nil {
 		t.Fatalf("TempDir(): %v", err)
 	}
@@ -755,10 +775,6 @@ func TestUnmount(t *testing.T) {
 }
 
 func TestDeleteInterface(t *testing.T) {
-	if testutil.IsRunningWithHostNet() {
-		t.Skip("not able to remove interfaces on hostnet")
-	}
-
 	ctx := context.Background()
 	d := dockerutil.MakeContainer(ctx, t)
 	defer d.CleanUp(ctx)
@@ -801,7 +817,7 @@ func TestDeleteInterface(t *testing.T) {
 }
 
 func TestProductName(t *testing.T) {
-	want, err := ioutil.ReadFile("/sys/devices/virtual/dmi/id/product_name")
+	want, err := os.ReadFile("/sys/devices/virtual/dmi/id/product_name")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -840,7 +856,7 @@ func TestRevalidateSymlinkChain(t *testing.T) {
 	//  + sym1 -> sym2
 	//  + sym2 -> gen1
 	//
-	dir, err := ioutil.TempDir(testutil.TmpDir(), "sub-mount")
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "sub-mount")
 	if err != nil {
 		t.Fatalf("TempDir(): %v", err)
 	}
@@ -944,7 +960,7 @@ func TestTmpMountWithSize(t *testing.T) {
 	}
 	echoOutput, err := d.Exec(ctx, dockerutil.ExecOpts{}, "/bin/sh", "-c", "echo world > /tmp/foo/test2.txt")
 	if err == nil {
-		t.Fatalf("docker exec size check failed: %v", err)
+		t.Fatalf("docker exec size check unexpectedly succeeded (output: %v)", echoOutput)
 	}
 	wantErr := "No space left on device"
 	if !strings.Contains(echoOutput, wantErr) {
@@ -996,4 +1012,304 @@ func TestNonSearchableWorkingDirectory(t *testing.T) {
 	if wantErrorMsg := "Permission denied"; !strings.Contains(got, wantErrorMsg) {
 		t.Errorf("ls error message not found, want: %q, got: %q", wantErrorMsg, got)
 	}
+}
+
+func TestCharDevice(t *testing.T) {
+	if testutil.IsRunningWithOverlay() {
+		t.Skip("files are not available outside the sandbox with overlay.")
+	}
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "tmp-mount")
+	if err != nil {
+		t.Fatalf("MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	opts := dockerutil.RunOpts{
+		Image: "basic/alpine",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: "/dev/zero",
+				Target: "/test/zero",
+			},
+			{
+				Type:   mount.TypeBind,
+				Source: dir,
+				Target: "/out",
+			},
+		},
+	}
+
+	const size = 1024 * 1024
+
+	// `docker logs` encodes the string, making it hard to compare. Write the
+	// result to a file that is available to the test.
+	cmd := fmt.Sprintf("head -c %d /test/zero > /out/result", size)
+	if _, err := d.Run(ctx, opts, "sh", "-c", cmd); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "result"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := [size]byte{}; !bytes.Equal(want[:], got) {
+		t.Errorf("Wrong bytes, want: [all zeros], got: %v", got)
+	}
+}
+
+func TestBlockHostUds(t *testing.T) {
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	dir, err := os.MkdirTemp(testutil.TmpDir(), "tmp-mount")
+	if err != nil {
+		t.Fatalf("MkdirTemp() failed: %v", err)
+	}
+	defer os.RemoveAll(dir)
+
+	dirFD, err := unix.Open(dir, unix.O_PATH, 0)
+	if err != nil {
+		t.Fatalf("failed to open %s: %v", dir, err)
+	}
+	defer unix.Close(dirFD)
+	// Use /proc/self/fd to generate path to avoid EINVAL on large path.
+	l, err := net.Listen("unix", filepath.Join("/proc/self/fd", strconv.Itoa(dirFD), "test.sock"))
+	if err != nil {
+		t.Fatalf("listen error: %v", err)
+	}
+	defer l.Close()
+
+	opts := dockerutil.RunOpts{
+		Image:   "basic/integrationtest",
+		WorkDir: "/root",
+		Mounts: []mount.Mount{
+			{
+				Type:   mount.TypeBind,
+				Source: dir,
+				Target: "/dir",
+			},
+		},
+	}
+	if err := d.Spawn(ctx, opts, "sleep", "infinity"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+	// Application should be able to walk/stat the UDS ...
+	if got, err := d.Exec(ctx, dockerutil.ExecOpts{}, "stat", "/dir/test.sock"); err != nil {
+		t.Fatalf("stat(2)-ing the UDS failed: output = %q, err = %v", got, err)
+	}
+	// ... but not connect to it.
+	const want = "connect: Connection refused"
+	if got, err := d.Exec(ctx, dockerutil.ExecOpts{}, "./host_connect", "/dir/test.sock"); err == nil || !strings.Contains(got, want) {
+		t.Errorf("err should be non-nil and output should contain %q, but got err = %v and output = %q", want, err, got)
+	}
+}
+
+func readLogs(logs string, position int) (int, error) {
+	if len(logs) == 0 {
+		return 0, fmt.Errorf("error no content was read")
+	}
+
+	nums := strings.Split(logs, "\n")
+	if position >= len(nums) {
+		return 0, fmt.Errorf("position %v is not within the length of content %v", position, nums)
+	}
+	if position == -1 {
+		// Expectation of newline at the end of last position.
+		position = len(nums) - 2
+	}
+	num, err := strconv.Atoi(nums[position])
+	if err != nil {
+		return 0, fmt.Errorf("error getting number from file: %v", err)
+	}
+
+	return num, nil
+}
+
+func checkLogs(logs string, oldPos int) error {
+	if len(logs) == 0 {
+		return fmt.Errorf("error no content was read")
+	}
+
+	nums := strings.Split(logs, "\n")
+	// Expectation of newline at the end of last position.
+	if oldPos >= len(nums)-2 {
+		return fmt.Errorf("oldPos %v is not within the length of content %v", oldPos, nums)
+	}
+	for i := oldPos + 1; i < len(nums)-1; i++ {
+		num, err := strconv.Atoi(nums[i])
+		if err != nil {
+			return fmt.Errorf("error getting number from file: %v", err)
+		}
+		if num != oldPos+1 {
+			return fmt.Errorf("error in save/resume, numbers not in order, previous: %d, next: %d", oldPos, num)
+		}
+		oldPos++
+	}
+	return nil
+}
+
+// Checkpoint the container and continue running.
+func TestCheckpointResume(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint is not supported.")
+	}
+	dockerutil.EnsureDockerExperimentalEnabled()
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	defer d.CleanUp(ctx)
+
+	// Start the container.
+	if err := d.Spawn(ctx, dockerutil.RunOpts{
+		Image: "basic/alpine",
+	}, "sh", "-c", "i=0; while true; do echo \"$i\"; i=\"$(expr \"$i\" + 1)\"; sleep .01; done"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	time.Sleep(2 * time.Second)
+
+	// Get the logs before checkpointing.
+	logs, err := d.Logs(ctx)
+	if err != nil {
+		t.Fatalf("docker logs failed: %v", err)
+	}
+
+	// Get the last position of the logs printed.
+	pos, err := readLogs(logs, -1)
+	if err != nil {
+		t.Fatalf("readLogs failed: %v", err)
+	}
+
+	// Create a snapshot and continue running.
+	if err := d.CheckpointResume(ctx, "test"); err != nil {
+		t.Fatalf("docker checkpoint failed: %v", err)
+	}
+
+	var newLogs string
+	// Wait for the container to resume running and print new logs.
+	if err := testutil.Poll(func() error {
+		// Get the logs after checkpointing to check if the container resumed.
+		newLogs, err = d.Logs(ctx)
+		if err != nil {
+			t.Fatalf("docker logs failed: %v", err)
+		}
+		return nil
+	}, defaultWait); err != nil {
+		t.Fatalf("container read logs failed after resume: %v", err)
+	}
+
+	if err := checkLogs(newLogs, pos); err != nil {
+		t.Fatalf("checkLogs failed: %v", err)
+	}
+	if err := d.Kill(ctx); err != nil {
+		t.Fatalf("docker kill failed: %v", err)
+	}
+}
+
+func testCheckpointRestoreListeningConnection(ctx context.Context, t *testing.T, d *dockerutil.Container) {
+	defer d.CleanUp(ctx)
+
+	const port = 9000
+	opts := dockerutil.RunOpts{
+		Image: "basic/integrationtest",
+		Ports: []int{port},
+	}
+
+	// Start the tcp server.
+	if err := d.Spawn(ctx, opts, "./tcp_server"); err != nil {
+		t.Fatalf("docker run failed: %v", err)
+	}
+
+	var (
+		ip   net.IP
+		err  error
+		conn net.Conn
+	)
+	ip, err = d.FindIP(ctx, false)
+	if err != nil {
+		t.Fatalf("docker.FindIP failed: %v", err)
+	}
+	serverIP := ip.String() + ":" + strconv.Itoa(port)
+	const timeout = 1 * time.Minute
+	for {
+		conn, err = net.DialTimeout("tcp", serverIP, timeout)
+		if err == nil {
+			break
+		}
+	}
+	conn.Close()
+
+	// Create a snapshot.
+	const checkpointFile = "networktest"
+	if err := d.Checkpoint(ctx, checkpointFile); err != nil {
+		t.Fatalf("docker checkpoint failed: %v", err)
+	}
+	if err := d.WaitTimeout(ctx, defaultWait); err != nil {
+		t.Fatalf("wait failed: %v", err)
+	}
+	// TODO(b/143498576): Remove Poll after github.com/moby/moby/issues/38963 is fixed.
+	if err := testutil.Poll(func() error { return d.Restore(ctx, checkpointFile) }, defaultWait); err != nil {
+		t.Fatalf("docker restore failed: %v", err)
+	}
+
+	var (
+		newIP   net.IP
+		newConn net.Conn
+	)
+	newIP, err = d.FindIP(ctx, false)
+	if err != nil {
+		t.Fatalf("docker.FindIP failed: %v", err)
+	}
+	newserverIP := newIP.String() + ":" + strconv.Itoa(port)
+	newConn, err = net.DialTimeout("tcp", newserverIP, timeout)
+	if err != nil {
+		t.Fatalf("Error connecting to server: %v", err)
+	}
+	defer newConn.Close()
+
+	readBuf := make([]byte, 32)
+	if _, err := newConn.Read(readBuf); err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	if _, err := newConn.Write([]byte("Hello!")); err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	if err := d.Wait(ctx); err != nil {
+		t.Fatalf("Wait failed: %v", err)
+	}
+}
+
+// Test to check restore of a TCP listening connection.
+func TestRestoreListenConn(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint is not supported.")
+	}
+	dockerutil.EnsureDockerExperimentalEnabled()
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainer(ctx, t)
+	testCheckpointRestoreListeningConnection(ctx, t, d)
+}
+
+// Test to check restore of a TCP listening connection with netstack S/R.
+func TestRestoreListenConnWithNetstackSR(t *testing.T) {
+	if !testutil.IsCheckpointSupported() {
+		t.Skip("Checkpoint is not supported.")
+	}
+	if !testutil.IsRunningWithSaveRestoreNetstack() {
+		t.Skip("Netstack save restore is not supported.")
+	}
+	dockerutil.EnsureDockerExperimentalEnabled()
+
+	ctx := context.Background()
+	d := dockerutil.MakeContainerWithRuntime(ctx, t, "-TESTONLY-save-restore-netstack")
+	testCheckpointRestoreListeningConnection(ctx, t, d)
 }

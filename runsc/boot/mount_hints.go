@@ -16,29 +16,37 @@ package boot
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/erofs"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/tmpfs"
-	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-// MountPrefix is the annotation prefix for mount hints.
-const MountPrefix = "dev.gvisor.spec.mount."
+const (
+	// MountPrefix is the annotation prefix for mount hints applied at the pod level.
+	MountPrefix = "dev.gvisor.spec.mount."
 
-type shareType int
+	// RootfsPrefix is the annotation prefix for rootfs hint applied at the container level.
+	RootfsPrefix = "dev.gvisor.spec.rootfs."
+)
+
+// ShareType indicates who can access/mutate the volume contents.
+type ShareType int
 
 const (
-	invalid shareType = iota
+	invalid ShareType = iota
 
-	// container shareType indicates that the mount is used by a single container.
+	// container shareType indicates that the mount is used by a single
+	// container. There are no external observers.
 	container
 
 	// pod shareType indicates that the mount is used by more than one container
-	// inside the pod.
+	// inside the pod. There are no external observers.
 	pod
 
 	// shared shareType indicates that the mount can also be shared with a process
@@ -46,20 +54,7 @@ const (
 	shared
 )
 
-func parseShare(val string) (shareType, error) {
-	switch val {
-	case "container":
-		return container, nil
-	case "pod":
-		return pod, nil
-	case "shared":
-		return shared, nil
-	default:
-		return 0, fmt.Errorf("invalid share value %q", val)
-	}
-}
-
-func (s shareType) String() string {
+func (s ShareType) String() string {
 	switch s {
 	case invalid:
 		return "invalid"
@@ -74,13 +69,14 @@ func (s shareType) String() string {
 	}
 }
 
-// podMountHints contains a collection of mountHints for the pod.
-type podMountHints struct {
-	mounts map[string]*mountHint
+// PodMountHints contains a collection of mountHints for the pod.
+type PodMountHints struct {
+	Mounts map[string]*MountHint `json:"mounts"`
 }
 
-func newPodMountHints(spec *specs.Spec) (*podMountHints, error) {
-	mnts := make(map[string]*mountHint)
+// NewPodMountHints instantiates PodMountHints using spec.
+func NewPodMountHints(spec *specs.Spec) (*PodMountHints, error) {
+	mnts := make(map[string]*MountHint)
 	for k, v := range spec.Annotations {
 		// Look for 'dev.gvisor.spec.mount' annotations and parse them.
 		if strings.HasPrefix(k, MountPrefix) {
@@ -95,104 +91,106 @@ func newPodMountHints(spec *specs.Spec) (*podMountHints, error) {
 			}
 			mnt := mnts[name]
 			if mnt == nil {
-				mnt = &mountHint{name: name}
+				mnt = &MountHint{Name: name}
 				mnts[name] = mnt
 			}
 			if err := mnt.setField(parts[1], v); err != nil {
-				return nil, err
+				log.Warningf("ignoring invalid mount annotation (name = %q, key = %q, value = %q): %v", name, parts[1], v, err)
 			}
 		}
 	}
 
-	// Validate all hints after done parsing.
+	// Validate all the parsed hints.
 	for name, m := range mnts {
-		log.Infof("Mount annotation found, name: %s, source: %q, type: %s, share: %v", name, m.mount.Source, m.mount.Type, m.share)
-		if m.share == invalid {
-			return nil, fmt.Errorf("share field for %q has not been set", m.name)
-		}
-		if len(m.mount.Source) == 0 {
-			return nil, fmt.Errorf("source field for %q has not been set", m.name)
-		}
-		if len(m.mount.Type) == 0 {
-			return nil, fmt.Errorf("type field for %q has not been set", m.name)
+		log.Infof("Mount annotation found, name: %s, source: %q, type: %s, share: %v", name, m.Mount.Source, m.Mount.Type, m.Share)
+		if m.Share == invalid || len(m.Mount.Source) == 0 || len(m.Mount.Type) == 0 {
+			log.Warningf("ignoring mount annotations for %q because of missing required field(s)", name)
+			delete(mnts, name)
+			continue
 		}
 
 		// Check for duplicate mount sources.
 		for name2, m2 := range mnts {
-			if name != name2 && m.mount.Source == m2.mount.Source {
-				return nil, fmt.Errorf("mounts %q and %q have the same mount source %q", m.name, m2.name, m.mount.Source)
+			if name != name2 && m.Mount.Source == m2.Mount.Source {
+				return nil, fmt.Errorf("mounts %q and %q have the same mount source %q", m.Name, m2.Name, m.Mount.Source)
 			}
 		}
 	}
 
-	return &podMountHints{mounts: mnts}, nil
+	return &PodMountHints{Mounts: mnts}, nil
 }
 
-// mountHint represents extra information about mounts that are provided via
+// MountHint represents extra information about mounts that are provided via
 // annotations. They can override mount type, and provide sharing information
 // so that mounts can be correctly shared inside the pod.
-type mountHint struct {
-	name  string
-	share shareType
-	mount specs.Mount
-
-	// vfsMount is the master mount for the volume. For mounts with 'pod' share
-	// the master volume is bind mounted inside the containers.
-	vfsMount *vfs.Mount
+// It is part of the sandbox.Sandbox struct, so it must be serializable.
+type MountHint struct {
+	Name  string      `json:"name"`
+	Share ShareType   `json:"share"`
+	Mount specs.Mount `json:"mount"`
 }
 
-func (m *mountHint) setField(key, val string) error {
+func (m *MountHint) setField(key, val string) error {
 	switch key {
 	case "source":
 		if len(val) == 0 {
 			return fmt.Errorf("source cannot be empty")
 		}
-		m.mount.Source = val
+		m.Mount.Source = val
 	case "type":
 		return m.setType(val)
 	case "share":
-		share, err := parseShare(val)
-		if err != nil {
-			return err
-		}
-		m.share = share
+		return m.setShare(val)
 	case "options":
-		return m.setOptions(val)
+		m.Mount.Options = specutils.FilterMountOptions(strings.Split(val, ","))
 	default:
 		return fmt.Errorf("invalid mount annotation: %s=%s", key, val)
 	}
 	return nil
 }
 
-func (m *mountHint) setType(val string) error {
+func (m *MountHint) setType(val string) error {
 	switch val {
-	case "tmpfs", "bind":
-		m.mount.Type = val
+	case tmpfs.Name, Bind:
+		m.Mount.Type = val
 	default:
 		return fmt.Errorf("invalid type %q", val)
 	}
 	return nil
 }
 
-func (m *mountHint) setOptions(val string) error {
-	opts := strings.Split(val, ",")
-	if err := specutils.ValidateMountOptions(opts); err != nil {
-		return err
+func (m *MountHint) setShare(val string) error {
+	switch val {
+	case container.String():
+		m.Share = container
+	case pod.String():
+		m.Share = pod
+	case shared.String():
+		m.Share = shared
+	default:
+		return fmt.Errorf("invalid share value %q", val)
 	}
-	m.mount.Options = opts
 	return nil
 }
 
-func (m *mountHint) isSupported() bool {
-	return m.mount.Type == tmpfs.Name && m.share == pod
+// ShouldShareMount returns true if this mount should be configured as a shared
+// mount that is shared among multiple containers in a pod.
+func (m *MountHint) ShouldShareMount() bool {
+	// Only support tmpfs for now. Bind mounts require a common gofer to mount
+	// all shared volumes.
+	return m.Mount.Type == tmpfs.Name &&
+		// A shared mount should be configured for share=container too so:
+		// 1. Restarting the container does not lose the tmpfs data.
+		// 2. Repeated mounts in the container reuse the same tmpfs instance.
+		(m.Share == container || m.Share == pod)
 }
 
 // checkCompatible verifies that shared mount is compatible with master.
 // Master options must be the same or less restrictive than the container mount,
 // e.g. master can be 'rw' while container mounts as 'ro'.
-func (m *mountHint) checkCompatible(replica *specs.Mount) error {
-	masterOpts := parseMountOptions(m.mount.Options)
-	replicaOpts := parseMountOptions(replica.Options)
+func (m *MountHint) checkCompatible(replica *specs.Mount) error {
+	masterOpts := ParseMountOptions(m.Mount.Options)
+	replicaOpts := ParseMountOptions(replica.Options)
 
 	if masterOpts.ReadOnly && !replicaOpts.ReadOnly {
 		return fmt.Errorf("cannot mount read-write shared mount because master is read-only, mount: %+v", replica)
@@ -206,18 +204,90 @@ func (m *mountHint) checkCompatible(replica *specs.Mount) error {
 	return nil
 }
 
-func (m *mountHint) fileAccessType() config.FileAccessType {
-	if m.share == container {
+func (m *MountHint) fileAccessType() config.FileAccessType {
+	if m.Share == shared {
+		return config.FileAccessShared
+	}
+	if m.ShouldShareMount() {
+		return config.FileAccessExclusive
+	}
+	if m.Share == container {
 		return config.FileAccessExclusive
 	}
 	return config.FileAccessShared
 }
 
-func (p *podMountHints) findMount(mount *specs.Mount) *mountHint {
-	for _, m := range p.mounts {
-		if m.mount.Source == mount.Source {
+// FindMount finds the MountHint that applies to this mount.
+func (p *PodMountHints) FindMount(mountSrc string) *MountHint {
+	for _, m := range p.Mounts {
+		if m.Mount.Source == mountSrc {
 			return m
 		}
 	}
 	return nil
+}
+
+// RootfsHint represents extra information about rootfs that are provided via
+// annotations. They can provide mount source, mount type and overlay config.
+type RootfsHint struct {
+	Mount   specs.Mount
+	Overlay config.OverlayMedium
+}
+
+func (r *RootfsHint) setSource(val string) error {
+	if !filepath.IsAbs(val) {
+		return fmt.Errorf("source should be an absolute path, got %q", val)
+	}
+	r.Mount.Source = val
+	return nil
+}
+
+func (r *RootfsHint) setType(val string) error {
+	switch val {
+	case erofs.Name, Bind:
+		r.Mount.Type = val
+	default:
+		return fmt.Errorf("invalid type %q", val)
+	}
+	return nil
+}
+
+func (r *RootfsHint) setField(key, val string) error {
+	switch key {
+	case "source":
+		return r.setSource(val)
+	case "type":
+		return r.setType(val)
+	case "overlay":
+		return r.Overlay.Set(val)
+	default:
+		return fmt.Errorf("invalid rootfs annotation: %s=%s", key, val)
+	}
+}
+
+// NewRootfsHint instantiates RootfsHint using spec.
+func NewRootfsHint(spec *specs.Spec) (*RootfsHint, error) {
+	var hint *RootfsHint
+	for k, v := range spec.Annotations {
+		// Look for 'dev.gvisor.spec.rootfs' annotations and parse them.
+		if !strings.HasPrefix(k, RootfsPrefix) {
+			continue
+		}
+		// Remove the prefix.
+		k = k[len(RootfsPrefix):]
+		if hint == nil {
+			hint = &RootfsHint{}
+		}
+		if err := hint.setField(k, v); err != nil {
+			return nil, fmt.Errorf("invalid rootfs annotation (key = %q, value = %q): %v", k, v, err)
+		}
+	}
+	// Validate the parsed hint.
+	if hint != nil {
+		log.Infof("Rootfs annotations found, source: %q, type: %q, overlay: %q", hint.Mount.Source, hint.Mount.Type, hint.Overlay)
+		if len(hint.Mount.Source) == 0 || len(hint.Mount.Type) == 0 {
+			return nil, fmt.Errorf("rootfs annotations missing required field(s): %+v", hint)
+		}
+	}
+	return hint, nil
 }

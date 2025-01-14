@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "state",
@@ -14,9 +17,11 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/fd",
         "//pkg/log",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
+        "//pkg/sentry/pgalloc",
         "//pkg/sentry/time",
         "//pkg/sentry/vfs",
         "//pkg/sentry/watchdog",

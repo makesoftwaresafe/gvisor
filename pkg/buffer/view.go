@@ -1,4 +1,4 @@
-// Copyright 2020 The gVisor Authors.
+// Copyright 2022 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,609 +15,352 @@
 package buffer
 
 import (
-	"bytes"
 	"fmt"
 	"io"
+
+	"gvisor.dev/gvisor/pkg/sync"
 )
 
-// Buffer is an alias to View.
-type Buffer = View
+// ReadSize is the default amount that a View's size is increased by when an
+// io.Reader has more data than a View can hold during calls to ReadFrom.
+const ReadSize = 512
 
-// View is a non-linear buffer.
+var viewPool = sync.Pool{
+	New: func() any {
+		return &View{}
+	},
+}
+
+// View is a window into a shared chunk. Views are held by Buffers in
+// viewLists to represent contiguous memory.
 //
-// All methods are thread compatible.
+// A View must be created with NewView, NewViewWithData, or Clone. Owners are
+// responsible for maintaining ownership over their views. When Views need to be
+// shared or copied, the owner should create a new View with Clone. Clone must
+// only ever be called on a owned View, not a borrowed one.
+//
+// Users are responsible for calling Release when finished with their View so
+// that its resources can be returned to the pool.
+//
+// Users must not write directly to slices returned by AsSlice. Instead, they
+// must use Write/WriteAt/CopyIn to modify the underlying View. This preserves
+// the safety guarantees of copy-on-write.
 //
 // +stateify savable
 type View struct {
-	data bufferList
-	size int64
-	pool pool
+	ViewEntry `state:"nosave"`
+	read      int
+	write     int
+	chunk     *chunk
 }
 
-// NewWithData creates a new view initialized with given data.
-func NewWithData(b []byte) View {
-	v := View{
-		size: int64(len(b)),
-	}
-	if len(b) > 0 {
-		buf := v.pool.getNoInit()
-		buf.initWithData(b)
-		v.data.PushBack(buf)
-	}
+// NewView creates a new view with capacity at least as big as cap. It is
+// analogous to make([]byte, 0, cap).
+func NewView(cap int) *View {
+	c := newChunk(cap)
+	v := viewPool.Get().(*View)
+	*v = View{chunk: c}
 	return v
 }
 
-// TrimFront removes the first count bytes from the buffer.
-func (v *View) TrimFront(count int64) {
-	if count >= v.size {
-		v.advanceRead(v.size)
-	} else {
-		v.advanceRead(count)
-	}
+// NewViewSize creates a new view with capacity at least as big as size and
+// length that is exactly size. It is analogous to make([]byte, size).
+func NewViewSize(size int) *View {
+	v := NewView(size)
+	v.Grow(size)
+	return v
 }
 
-// Remove deletes data at specified location in v. It returns false if specified
-// range does not fully reside in v.
-func (v *View) Remove(offset, length int) bool {
-	if offset < 0 || length < 0 {
-		return false
-	}
-	tgt := Range{begin: offset, end: offset + length}
-	if tgt.Len() != tgt.Intersect(Range{end: int(v.size)}).Len() {
-		return false
-	}
-
-	// Scan through each buffer and remove intersections.
-	var curr Range
-	for buf := v.data.Front(); buf != nil; {
-		origLen := buf.ReadSize()
-		curr.end = curr.begin + origLen
-
-		if x := curr.Intersect(tgt); x.Len() > 0 {
-			if !buf.Remove(x.Offset(-curr.begin)) {
-				panic("buf.Remove() failed")
-			}
-			if buf.ReadSize() == 0 {
-				// buf fully removed, removing it from the list.
-				oldBuf := buf
-				buf = buf.Next()
-				v.data.Remove(oldBuf)
-				v.pool.put(oldBuf)
-			} else {
-				// Only partial data intersects, moving on to next one.
-				buf = buf.Next()
-			}
-			v.size -= int64(x.Len())
-		} else {
-			// This buffer is not in range, moving on to next one.
-			buf = buf.Next()
-		}
-
-		curr.begin += origLen
-		if curr.begin >= tgt.end {
-			break
-		}
-	}
-	return true
+// NewViewWithData creates a new view and initializes it with data. This
+// function should be used with caution to avoid unnecessary []byte allocations.
+// When in doubt use NewWithView to maximize chunk reuse in production
+// environments.
+func NewViewWithData(data []byte) *View {
+	c := newChunk(len(data))
+	v := viewPool.Get().(*View)
+	*v = View{chunk: c}
+	v.Write(data)
+	return v
 }
 
-// ReadAt implements io.ReaderAt.ReadAt.
-func (v *View) ReadAt(p []byte, offset int64) (int, error) {
-	var (
-		skipped int64
-		done    int64
-	)
-	for buf := v.data.Front(); buf != nil && done < int64(len(p)); buf = buf.Next() {
-		needToSkip := int(offset - skipped)
-		if sz := buf.ReadSize(); sz <= needToSkip {
-			skipped += int64(sz)
-			continue
-		}
-
-		// Actually read data.
-		n := copy(p[done:], buf.ReadSlice()[needToSkip:])
-		skipped += int64(needToSkip)
-		done += int64(n)
-	}
-	if int(done) < len(p) || offset+done == v.size {
-		return int(done), io.EOF
-	}
-	return int(done), nil
-}
-
-// advanceRead advances the view's read index.
+// Clone creates a shallow clone of v where the underlying chunk is shared.
 //
-// Precondition: there must be sufficient bytes in the buffer.
-func (v *View) advanceRead(count int64) {
-	for buf := v.data.Front(); buf != nil && count > 0; {
-		sz := int64(buf.ReadSize())
-		if sz > count {
-			// There is still data for reading.
-			buf.ReadMove(int(count))
-			v.size -= count
-			count = 0
-			break
-		}
-
-		// Consume the whole buffer.
-		oldBuf := buf
-		buf = buf.Next() // Iterate.
-		v.data.Remove(oldBuf)
-		v.pool.put(oldBuf)
-
-		// Update counts.
-		count -= sz
-		v.size -= sz
+// The caller must own the View to call Clone. It is not safe to call Clone
+// on a borrowed or shared View because it can race with other View methods.
+func (v *View) Clone() *View {
+	if v == nil {
+		panic("cannot clone a nil view")
 	}
-	if count > 0 {
-		panic(fmt.Sprintf("advanceRead still has %d bytes remaining", count))
-	}
+	v.chunk.IncRef()
+	newV := viewPool.Get().(*View)
+	newV.chunk = v.chunk
+	newV.read = v.read
+	newV.write = v.write
+	return newV
 }
 
-// Truncate truncates the view to the given bytes.
+// Release releases the chunk held by v and returns v to the pool.
+func (v *View) Release() {
+	if v == nil {
+		panic("cannot release a nil view")
+	}
+	v.chunk.DecRef()
+	*v = View{}
+	viewPool.Put(v)
+}
+
+// Reset sets the view's read and write indices back to zero.
+func (v *View) Reset() {
+	if v == nil {
+		panic("cannot reset a nil view")
+	}
+	v.read = 0
+	v.write = 0
+}
+
+func (v *View) sharesChunk() bool {
+	return v.chunk.refCount.Load() > 1
+}
+
+// Full indicates the chunk is full.
 //
-// This will not grow the view, only shrink it. If a length is passed that is
-// greater than the current size of the view, then nothing will happen.
+// This indicates there is no capacity left to write.
+func (v *View) Full() bool {
+	return v == nil || v.write == len(v.chunk.data)
+}
+
+// Capacity returns the total size of this view's chunk.
+func (v *View) Capacity() int {
+	if v == nil {
+		return 0
+	}
+	return len(v.chunk.data)
+}
+
+// Size returns the size of data written to the view.
+func (v *View) Size() int {
+	if v == nil {
+		return 0
+	}
+	return v.write - v.read
+}
+
+// TrimFront advances the read index by the given amount.
+func (v *View) TrimFront(n int) {
+	if v.read+n > v.write {
+		panic("cannot trim past the end of a view")
+	}
+	v.read += n
+}
+
+// AsSlice returns a slice of the data written to this view.
+func (v *View) AsSlice() []byte {
+	if v.Size() == 0 {
+		return nil
+	}
+	return v.chunk.data[v.read:v.write]
+}
+
+// ToSlice returns an owned copy of the data in this view.
+func (v *View) ToSlice() []byte {
+	if v.Size() == 0 {
+		return nil
+	}
+	s := make([]byte, v.Size())
+	copy(s, v.AsSlice())
+	return s
+}
+
+// AvailableSize returns the number of bytes available for writing.
+func (v *View) AvailableSize() int {
+	if v == nil {
+		return 0
+	}
+	return len(v.chunk.data) - v.write
+}
+
+// Read reads v's data into p.
 //
-// Precondition: length must be >= 0.
-func (v *View) Truncate(length int64) {
-	if length < 0 {
-		panic("negative length provided")
+// Implements the io.Reader interface.
+func (v *View) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
 	}
-	if length >= v.size {
-		return // Nothing to do.
+	if v.Size() == 0 {
+		return 0, io.EOF
 	}
-	for buf := v.data.Back(); buf != nil && v.size > length; buf = v.data.Back() {
-		sz := int64(buf.ReadSize())
-		if after := v.size - sz; after < length {
-			// Truncate the buffer locally.
-			left := (length - after)
-			buf.write = buf.read + int(left)
-			v.size = length
-			break
-		}
-
-		// Drop the buffer completely; see above.
-		v.data.Remove(buf)
-		v.pool.put(buf)
-		v.size -= sz
-	}
+	n := copy(p, v.AsSlice())
+	v.TrimFront(n)
+	return n, nil
 }
 
-// Grow grows the given view to the number of bytes, which will be appended. If
-// zero is true, all these bytes will be zero. If zero is false, then this is
-// the caller's responsibility.
+// ReadByte implements the io.ByteReader interface.
+func (v *View) ReadByte() (byte, error) {
+	if v.Size() == 0 {
+		return 0, io.EOF
+	}
+	b := v.AsSlice()[0]
+	v.read++
+	return b, nil
+}
+
+// WriteTo writes data to w until the view is empty or an error occurs. The
+// return value n is the number of bytes written.
 //
-// Precondition: length must be >= 0.
-func (v *View) Grow(length int64, zero bool) {
-	if length < 0 {
-		panic("negative length provided")
+// WriteTo implements the io.WriterTo interface.
+func (v *View) WriteTo(w io.Writer) (n int64, err error) {
+	if v.Size() > 0 {
+		sz := v.Size()
+		m, e := w.Write(v.AsSlice())
+		v.TrimFront(m)
+		n = int64(m)
+		if e != nil {
+			return n, e
+		}
+		if m != sz {
+			return n, io.ErrShortWrite
+		}
 	}
-	for v.size < length {
-		buf := v.data.Back()
-
-		// Is there some space in the last buffer?
-		if buf == nil || buf.Full() {
-			buf = v.pool.get()
-			v.data.PushBack(buf)
-		}
-
-		// Write up to length bytes.
-		sz := buf.WriteSize()
-		if int64(sz) > length-v.size {
-			sz = int(length - v.size)
-		}
-
-		// Zero the written section; note that this pattern is
-		// specifically recognized and optimized by the compiler.
-		if zero {
-			for i := buf.write; i < buf.write+sz; i++ {
-				buf.data[i] = 0
-			}
-		}
-
-		// Advance the index.
-		buf.WriteMove(sz)
-		v.size += int64(sz)
-	}
+	return n, nil
 }
 
-// Prepend prepends the given data.
-func (v *View) Prepend(data []byte) {
-	// Is there any space in the first buffer?
-	if buf := v.data.Front(); buf != nil && buf.read > 0 {
-		// Fill up before the first write.
-		avail := buf.read
-		bStart := 0
-		dStart := len(data) - avail
-		if avail > len(data) {
-			bStart = avail - len(data)
-			dStart = 0
-		}
-		n := copy(buf.data[bStart:], data[dStart:])
-		data = data[:dStart]
-		v.size += int64(n)
-		buf.read -= n
-	}
-
-	for len(data) > 0 {
-		// Do we need an empty buffer?
-		buf := v.pool.get()
-		v.data.PushFront(buf)
-
-		// The buffer is empty; copy last chunk.
-		avail := len(buf.data)
-		bStart := 0
-		dStart := len(data) - avail
-		if avail > len(data) {
-			bStart = avail - len(data)
-			dStart = 0
-		}
-
-		// We have to put the data at the end of the current
-		// buffer in order to ensure that the next prepend will
-		// correctly fill up the beginning of this buffer.
-		n := copy(buf.data[bStart:], data[dStart:])
-		data = data[:dStart]
-		v.size += int64(n)
-		buf.read = len(buf.data) - n
-		buf.write = len(buf.data)
-	}
-}
-
-// Append appends the given data.
-func (v *View) Append(data []byte) {
-	for done := 0; done < len(data); {
-		buf := v.data.Back()
-
-		// Ensure there's a buffer with space.
-		if buf == nil || buf.Full() {
-			buf = v.pool.get()
-			v.data.PushBack(buf)
-		}
-
-		// Copy in to the given buffer.
-		n := copy(buf.WriteSlice(), data[done:])
-		done += n
-		buf.WriteMove(n)
-		v.size += int64(n)
-	}
-}
-
-// AppendOwned takes ownership of data and appends it to v.
-func (v *View) AppendOwned(data []byte) {
-	if len(data) > 0 {
-		buf := v.pool.getNoInit()
-		buf.initWithData(data)
-		v.data.PushBack(buf)
-		v.size += int64(len(data))
-	}
-}
-
-// PrependOwned takes ownership of data and prepends it to v.
-func (v *View) PrependOwned(data []byte) {
-	if len(data) > 0 {
-		buf := v.pool.getNoInit()
-		buf.initWithData(data)
-		v.data.PushFront(buf)
-		v.size += int64(len(data))
-	}
-}
-
-// PullUp makes the specified range contiguous and returns the backing memory.
-func (v *View) PullUp(offset, length int) ([]byte, bool) {
-	if length == 0 {
-		return nil, true
-	}
-	tgt := Range{begin: offset, end: offset + length}
-	if tgt.Intersect(Range{end: int(v.size)}).Len() != length {
-		return nil, false
-	}
-
-	curr := Range{}
-	buf := v.data.Front()
-	for ; buf != nil; buf = buf.Next() {
-		origLen := buf.ReadSize()
-		curr.end = curr.begin + origLen
-
-		if x := curr.Intersect(tgt); x.Len() == tgt.Len() {
-			// buf covers the whole requested target range.
-			sub := x.Offset(-curr.begin)
-			return buf.ReadSlice()[sub.begin:sub.end], true
-		} else if x.Len() > 0 {
-			// buf is pointing at the starting buffer we want to merge.
-			break
-		}
-
-		curr.begin += origLen
-	}
-
-	// Calculate the total merged length.
-	totLen := 0
-	for n := buf; n != nil; n = n.Next() {
-		totLen += n.ReadSize()
-		if curr.begin+totLen >= tgt.end {
-			break
-		}
-	}
-
-	// Merge the buffers.
-	data := make([]byte, totLen)
-	off := 0
-	for n := buf; n != nil && off < totLen; {
-		copy(data[off:], n.ReadSlice())
-		off += n.ReadSize()
-
-		// Remove buffers except for the first one, which will be reused.
-		if n == buf {
-			n = n.Next()
-		} else {
-			old := n
-			n = n.Next()
-			v.data.Remove(old)
-			v.pool.put(old)
-		}
-	}
-
-	// Update the first buffer with merged data.
-	buf.initWithData(data)
-
-	r := tgt.Offset(-curr.begin)
-	return buf.data[r.begin:r.end], true
-}
-
-// Flatten returns a flattened copy of this data.
+// ReadAt reads data to the p starting at offset.
 //
-// This method should not be used in any performance-sensitive paths. It may
-// allocate a fresh byte slice sufficiently large to contain all the data in
-// the buffer. This is principally for debugging.
+// Implements the io.ReaderAt interface.
+func (v *View) ReadAt(p []byte, off int) (int, error) {
+	if off < 0 || off > v.Size() {
+		return 0, fmt.Errorf("ReadAt(): offset out of bounds: want 0 < off < %d, got off=%d", v.Size(), off)
+	}
+	n := copy(p, v.AsSlice()[off:])
+	return n, nil
+}
+
+// Write writes data to the view's chunk starting at the v.write index. If the
+// view's chunk has a reference count greater than 1, the chunk is copied first
+// and then written to.
 //
-// N.B. Tee data still belongs to this view, as if there is a single buffer
-// present, then it will be returned directly. This should be used for
-// temporary use only, and a reference to the given slice should not be held.
-func (v *View) Flatten() []byte {
-	if buf := v.data.Front(); buf == nil {
-		return nil // No data at all.
-	} else if buf.Next() == nil {
-		return buf.ReadSlice() // Only one buffer.
+// Implements the io.Writer interface.
+func (v *View) Write(p []byte) (int, error) {
+	if v == nil {
+		panic("cannot write to a nil view")
 	}
-	data := make([]byte, 0, v.size) // Need to flatten.
-	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
-		// Copy to the allocated slice.
-		data = append(data, buf.ReadSlice()...)
+	if v.AvailableSize() < len(p) {
+		v.growCap(len(p) - v.AvailableSize())
+	} else if v.sharesChunk() {
+		defer v.chunk.DecRef()
+		v.chunk = v.chunk.Clone()
 	}
-	return data
+	n := copy(v.chunk.data[v.write:], p)
+	v.write += n
+	if n < len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
 }
 
-// Size indicates the total amount of data available in this view.
-func (v *View) Size() int64 {
-	return v.size
-}
-
-// Copy makes a strict copy of this view.
-func (v *View) Copy() (other View) {
-	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
-		other.Append(buf.ReadSlice())
-	}
-	return
-}
-
-// Clone makes a more shallow copy compared to Copy. The underlying payload
-// slice (buffer.data) is shared but the buffers themselves are copied.
-func (v *View) Clone() View {
-	other := View{
-		size: v.size,
-	}
-	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
-		// Copy the buffer structs itself as they are stateful and
-		// should not be shared between Views.
-		//
-		// TODO(gvisor.dev/issue/7158): revisit need for View.pool.
-		newBuf := other.pool.getNoInit()
-		*newBuf = *buf
-		other.data.PushBack(newBuf)
-	}
-	return other
-}
-
-// Apply applies the given function across all valid data.
-func (v *View) Apply(fn func([]byte)) {
-	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
-		fn(buf.ReadSlice())
-	}
-}
-
-// SubApply applies fn to a given range of data in v. Any part of the range
-// outside of v is ignored.
-func (v *View) SubApply(offset, length int, fn func([]byte)) {
-	for buf := v.data.Front(); length > 0 && buf != nil; buf = buf.Next() {
-		d := buf.ReadSlice()
-		if offset >= len(d) {
-			offset -= len(d)
-			continue
-		}
-		if offset > 0 {
-			d = d[offset:]
-			offset = 0
-		}
-		if length < len(d) {
-			d = d[:length]
-		}
-		fn(d)
-		length -= len(d)
-	}
-}
-
-// Merge merges the provided View with this one.
+// ReadFrom reads data from r until EOF and appends it to the buffer, growing
+// the buffer as needed. The return value n is the number of bytes read. Any
+// error except io.EOF encountered during the read is also returned.
 //
-// The other view will be appended to v, and other will be empty after this
-// operation completes.
-func (v *View) Merge(other *View) {
-	// Copy over all buffers.
-	for buf := other.data.Front(); buf != nil; buf = other.data.Front() {
-		other.data.Remove(buf)
-		// Copy the buffer structs itself as they are stateful and
-		// should not be shared between Views.
-		//
-		// TODO(gvisor.dev/issue/7158): revisit need for View.pool.
-		newBuf := v.pool.getNoInit()
-		*newBuf = *buf
-		v.data.PushBack(newBuf)
+// ReadFrom implements the io.ReaderFrom interface.
+func (v *View) ReadFrom(r io.Reader) (n int64, err error) {
+	if v == nil {
+		panic("cannot write to a nil view")
 	}
+	if v.sharesChunk() {
+		defer v.chunk.DecRef()
+		v.chunk = v.chunk.Clone()
+	}
+	for {
+		// Check for EOF to avoid an unnnecesary allocation.
+		if _, e := r.Read(nil); e == io.EOF {
+			return n, nil
+		}
+		if v.AvailableSize() == 0 {
+			v.growCap(ReadSize)
+		}
+		m, e := r.Read(v.availableSlice())
+		v.write += m
+		n += int64(m)
 
-	// Adjust sizes.
-	v.size += other.size
-	other.size = 0
+		if e == io.EOF {
+			return n, nil
+		}
+		if e != nil {
+			return n, e
+		}
+	}
 }
 
-// WriteFromReader writes to the buffer from an io.Reader.
+// WriteAt writes data to the views's chunk starting at start. If the
+// view's chunk has a reference count greater than 1, the chunk is copied first
+// and then written to.
 //
-// A minimum read size equal to unsafe.Sizeof(unintptr) is enforced,
-// provided that count is greater than or equal to unsafe.Sizeof(uintptr).
-func (v *View) WriteFromReader(r io.Reader, count int64) (int64, error) {
-	var (
-		done int64
-		n    int
-		err  error
-	)
-	for done < count {
-		buf := v.data.Back()
-
-		// Ensure we have an empty buffer.
-		if buf == nil || buf.Full() {
-			buf = v.pool.get()
-			v.data.PushBack(buf)
-		}
-
-		// Is this less than the minimum batch?
-		if buf.WriteSize() < minBatch && (count-done) >= int64(minBatch) {
-			tmp := make([]byte, minBatch)
-			n, err = r.Read(tmp)
-			v.Append(tmp[:n])
-			done += int64(n)
-			if err != nil {
-				break
-			}
-			continue
-		}
-
-		// Limit the read, if necessary.
-		sz := buf.WriteSize()
-		if left := count - done; int64(sz) > left {
-			sz = int(left)
-		}
-
-		// Pass the relevant portion of the buffer.
-		n, err = r.Read(buf.WriteSlice()[:sz])
-		buf.WriteMove(n)
-		done += int64(n)
-		v.size += int64(n)
-		if err == io.EOF {
-			err = nil // Short write allowed.
-			break
-		} else if err != nil {
-			break
-		}
+// Implements the io.WriterAt interface.
+func (v *View) WriteAt(p []byte, off int) (int, error) {
+	if v == nil {
+		panic("cannot write to a nil view")
 	}
-	return done, err
+	if off < 0 || off > v.Size() {
+		return 0, fmt.Errorf("write offset out of bounds: want 0 < off < %d, got off=%d", v.Size(), off)
+	}
+	if v.sharesChunk() {
+		defer v.chunk.DecRef()
+		v.chunk = v.chunk.Clone()
+	}
+	n := copy(v.AsSlice()[off:], p)
+	if n < len(p) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
 }
 
-// ReadToWriter reads from the buffer into an io.Writer.
-//
-// N.B. This does not consume the bytes read. TrimFront should
-// be called appropriately after this call in order to do so.
-//
-// A minimum write size equal to unsafe.Sizeof(unintptr) is enforced,
-// provided that count is greater than or equal to unsafe.Sizeof(uintptr).
-func (v *View) ReadToWriter(w io.Writer, count int64) (int64, error) {
-	var (
-		done int64
-		n    int
-		err  error
-	)
-	offset := 0 // Spill-over for batching.
-	for buf := v.data.Front(); buf != nil && done < count; buf = buf.Next() {
-		// Has this been consumed? Skip it.
-		sz := buf.ReadSize()
-		if sz <= offset {
-			offset -= sz
-			continue
-		}
-		sz -= offset
-
-		// Is this less than the minimum batch?
-		left := count - done
-		if sz < minBatch && left >= int64(minBatch) && (v.size-done) >= int64(minBatch) {
-			tmp := make([]byte, minBatch)
-			n, err = v.ReadAt(tmp, done)
-			w.Write(tmp[:n])
-			done += int64(n)
-			offset = n - sz // Reset below.
-			if err != nil {
-				break
-			}
-			continue
-		}
-
-		// Limit the write if necessary.
-		if int64(sz) >= left {
-			sz = int(left)
-		}
-
-		// Perform the actual write.
-		n, err = w.Write(buf.ReadSlice()[offset : offset+sz])
-		done += int64(n)
-		if err != nil {
-			break
-		}
-
-		// Reset spill-over.
-		offset = 0
+// Grow increases the size of the view. If the new size is greater than the
+// view's current capacity, Grow will reallocate the view with an increased
+// capacity.
+func (v *View) Grow(n int) {
+	if v == nil {
+		panic("cannot grow a nil view")
 	}
-	return done, err
+	if v.write+n > v.Capacity() {
+		v.growCap(n)
+	}
+	v.write += n
 }
 
-// A Range specifies a range of buffer.
-type Range struct {
-	begin int
-	end   int
+// growCap increases the capacity of the view by at least n.
+func (v *View) growCap(n int) {
+	if v == nil {
+		panic("cannot grow a nil view")
+	}
+	defer v.chunk.DecRef()
+	old := v.AsSlice()
+	v.chunk = newChunk(v.Capacity() + n)
+	copy(v.chunk.data, old)
+	v.read = 0
+	v.write = len(old)
 }
 
-// Intersect returns the intersection of x and y.
-func (x Range) Intersect(y Range) Range {
-	if x.begin < y.begin {
-		x.begin = y.begin
+// CapLength caps the length of the view's read slice to n. If n > v.Size(),
+// the function is a no-op.
+func (v *View) CapLength(n int) {
+	if v == nil {
+		panic("cannot resize a nil view")
 	}
-	if x.end > y.end {
-		x.end = y.end
+	if n < 0 {
+		panic("n must be >= 0")
 	}
-	if x.begin >= x.end {
-		return Range{}
+	if n > v.Size() {
+		n = v.Size()
 	}
-	return x
+	v.write = v.read + n
 }
 
-// Offset returns x offset by off.
-func (x Range) Offset(off int) Range {
-	x.begin += off
-	x.end += off
-	return x
-}
-
-// Len returns the length of x.
-func (x Range) Len() int {
-	l := x.end - x.begin
-	if l < 0 {
-		l = 0
+func (v *View) availableSlice() []byte {
+	if v.sharesChunk() {
+		defer v.chunk.DecRef()
+		c := v.chunk.Clone()
+		v.chunk = c
 	}
-	return l
-}
-
-// Readers returns a bytes.Reader for each of bufs's underlying buffers.
-func (v *View) Readers() []bytes.Reader {
-	readers := make([]bytes.Reader, 0, v.data.Len())
-	for buf := v.data.Front(); buf != nil; buf = buf.Next() {
-		readers = append(readers, buf.Reader())
-	}
-	return readers
+	return v.chunk.data[v.write:]
 }

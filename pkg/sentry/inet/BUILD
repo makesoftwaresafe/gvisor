@@ -1,7 +1,9 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -11,27 +13,24 @@ go_template_instance(
     out = "namespace_refs.go",
     package = "inet",
     prefix = "namespace",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Namespace",
     },
 )
 
-go_template_instance(
-    name = "atomicptr_netns",
-    out = "atomicptr_netns_unsafe.go",
+declare_mutex(
+    name = "abstract_socket_namespace_mutex",
+    out = "abstract_socket_namespace_mutex.go",
     package = "inet",
-    prefix = "Namespace",
-    template = "//pkg/sync/atomicptr:generic_atomicptr",
-    types = {
-        "Value": "Namespace",
-    },
+    prefix = "abstractSocketNamespace",
 )
 
 go_library(
     name = "inet",
     srcs = [
-        "atomicptr_netns_unsafe.go",
+        "abstract_socket_namespace.go",
+        "abstract_socket_namespace_mutex.go",
         "context.go",
         "inet.go",
         "namespace.go",
@@ -42,7 +41,14 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
         "//pkg/context",
-        "//pkg/refsvfs2",
+        "//pkg/refs",
+        "//pkg/sentry/fsimpl/nsfs",
+        "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/socket/netlink/nlmsg",
+        "//pkg/sentry/socket/unix/transport",
+        "//pkg/sync",
+        "//pkg/sync/locking",
+        "//pkg/syserr",
         "//pkg/tcpip",
         "//pkg/tcpip/stack",
     ],

@@ -26,10 +26,11 @@ package analysis
 
 import (
 	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
 	"unsafe"
+
+	"gvisor.dev/gvisor/pkg/rand"
 )
 
 // RandomizeValue assigns random value(s) to an abitrary type. This is intended
@@ -47,7 +48,7 @@ import (
 // pointers to active go objects (pointer fields aren't allowed in ABI
 // structs anyways), or we'd be violating the go runtime contract and
 // the GC may malfunction.
-func RandomizeValue(x interface{}) {
+func RandomizeValue(x any) {
 	v := reflect.Indirect(reflect.ValueOf(x))
 	if !v.CanSet() {
 		panic("RandomizeType() called with an unaddressable value. You probably need to pass a pointer to the argument")
@@ -81,9 +82,7 @@ func RandomizeValue(x interface{}) {
 // This is used for zeroing padding fields after calling RandomizeValue.
 func reflectZeroPaddingFields(r reflect.Type, data []byte, zero bool) {
 	if zero {
-		for i := range data {
-			data[i] = 0
-		}
+		clear(data)
 	}
 	switch r.Kind() {
 	case reflect.Int8, reflect.Uint8, reflect.Int16, reflect.Uint16, reflect.Int32, reflect.Uint32, reflect.Int64, reflect.Uint64:

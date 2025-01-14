@@ -20,7 +20,6 @@ import (
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -46,13 +45,15 @@ var zeroMAC [6]byte
 type Device struct {
 	waiter.Queue
 
-	mu           sync.RWMutex `state:"nosave"`
+	mu           deviceRWMutex `state:"nosave"`
 	endpoint     *tunEndpoint
 	notifyHandle *channel.NotificationHandle
 	flags        Flags
 }
 
 // Flags set properties of a Device
+//
+// +stateify savable
 type Flags struct {
 	TUN          bool
 	TAP          bool
@@ -138,7 +139,7 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 		}
 
 		// 2. Creating a new NIC.
-		id := tcpip.NICID(s.UniqueID())
+		id := s.NextNICID()
 		endpoint := &tunEndpoint{
 			Endpoint: channel.New(defaultDevOutQueueLen, defaultDevMtu, ""),
 			stack:    s,
@@ -166,7 +167,7 @@ func attachOrCreateNIC(s *stack.Stack, name, prefix string, linkCaps stack.LinkE
 	}
 }
 
-// MTU returns the tun enpoint MTU (maximum transmission unit).
+// MTU returns the tun endpoint MTU (maximum transmission unit).
 func (d *Device) MTU() (uint32, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
@@ -181,7 +182,7 @@ func (d *Device) MTU() (uint32, error) {
 }
 
 // Write inject one inbound packet to the network interface.
-func (d *Device) Write(data []byte) (int64, error) {
+func (d *Device) Write(data *buffer.View) (int64, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
@@ -192,28 +193,34 @@ func (d *Device) Write(data []byte) (int64, error) {
 		return 0, linuxerr.EIO
 	}
 
-	dataLen := int64(len(data))
+	dataLen := int64(data.Size())
 
 	// Packet information.
 	var pktInfoHdr PacketInfoHeader
 	if !d.flags.NoPacketInfo {
-		if len(data) < PacketInfoHeaderSize {
+		if dataLen < PacketInfoHeaderSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		pktInfoHdr = PacketInfoHeader(data[:PacketInfoHeaderSize])
-		data = data[PacketInfoHeaderSize:]
+		pktInfoHdrView := data.Clone()
+		defer pktInfoHdrView.Release()
+		pktInfoHdrView.CapLength(PacketInfoHeaderSize)
+		pktInfoHdr = PacketInfoHeader(pktInfoHdrView.AsSlice())
+		data.TrimFront(PacketInfoHeaderSize)
 	}
 
 	// Ethernet header (TAP only).
 	var ethHdr header.Ethernet
 	if d.flags.TAP {
-		if len(data) < header.EthernetMinimumSize {
+		if data.Size() < header.EthernetMinimumSize {
 			// Ignore bad packet.
 			return dataLen, nil
 		}
-		ethHdr = header.Ethernet(data[:header.EthernetMinimumSize])
-		data = data[header.EthernetMinimumSize:]
+		ethHdrView := data.Clone()
+		defer ethHdrView.Release()
+		ethHdrView.CapLength(header.EthernetMinimumSize)
+		ethHdr = header.Ethernet(ethHdrView.AsSlice())
+		data.TrimFront(header.EthernetMinimumSize)
 	}
 
 	// Try to determine network protocol number, default zero.
@@ -226,7 +233,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 	case d.flags.TUN:
 		// TUN interface with IFF_NO_PI enabled, thus
 		// we need to determine protocol from version field
-		version := data[0] >> 4
+		version := data.AsSlice()[0] >> 4
 		if version == 4 {
 			protocol = header.IPv4ProtocolNumber
 		} else if version == 6 {
@@ -236,7 +243,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: len(ethHdr),
-		Payload:            buffer.NewWithData(data),
+		Payload:            buffer.MakeWithView(data.Clone()),
 	})
 	defer pkt.DecRef()
 	copy(pkt.LinkHeader().Push(len(ethHdr)), ethHdr)
@@ -245,7 +252,7 @@ func (d *Device) Write(data []byte) (int64, error) {
 }
 
 // Read reads one outgoing packet from the network interface.
-func (d *Device) Read() ([]byte, error) {
+func (d *Device) Read() (*buffer.View, error) {
 	d.mu.RLock()
 	endpoint := d.endpoint
 	d.mu.RUnlock()
@@ -253,39 +260,35 @@ func (d *Device) Read() ([]byte, error) {
 		return nil, linuxerr.EBADFD
 	}
 
-	for {
-		pkt := endpoint.Read()
-		if pkt == nil {
-			return nil, linuxerr.ErrWouldBlock
-		}
-
-		v, ok := d.encodePkt(pkt)
-		pkt.DecRef()
-		if !ok {
-			// Ignore unsupported packet.
-			continue
-		}
-		return v, nil
+	pkt := endpoint.Read()
+	if pkt == nil {
+		return nil, linuxerr.ErrWouldBlock
 	}
+	v := d.encodePkt(pkt)
+	pkt.DecRef()
+	return v, nil
 }
 
 // encodePkt encodes packet for fd side.
-func (d *Device) encodePkt(pkt *stack.PacketBuffer) ([]byte, bool) {
-	var buf buffer.Buffer
+func (d *Device) encodePkt(pkt *stack.PacketBuffer) *buffer.View {
+	var view *buffer.View
 
 	// Packet information.
 	if !d.flags.NoPacketInfo {
-		hdr := make(PacketInfoHeader, PacketInfoHeaderSize)
+		view = buffer.NewView(PacketInfoHeaderSize + pkt.Size())
+		view.Grow(PacketInfoHeaderSize)
+		hdr := PacketInfoHeader(view.AsSlice())
 		hdr.Encode(&PacketInfoFields{
 			Protocol: pkt.NetworkProtocolNumber,
 		})
-		buf.AppendOwned(hdr)
+		pktView := pkt.ToView()
+		view.Write(pktView.AsSlice())
+		pktView.Release()
+	} else {
+		view = pkt.ToView()
 	}
 
-	pktBuf := pkt.Buffer()
-	buf.Merge(&pktBuf)
-
-	return buf.Flatten(), true
+	return view
 }
 
 // Name returns the name of the attached network interface. Empty string if
@@ -328,6 +331,8 @@ func (d *Device) WriteNotify() {
 //
 // It is ref-counted as multiple opening files can attach to the same NIC.
 // The last owner is responsible for deleting the NIC.
+//
+// +stateify savable
 type tunEndpoint struct {
 	tunEndpointRefs
 	*channel.Endpoint

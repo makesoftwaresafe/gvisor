@@ -3,9 +3,14 @@
 #   normal system VDSO (time, gettimeofday, clock_gettimeofday) but which uses
 #   timekeeping parameters managed by the sandbox kernel.
 
-load("//tools:defs.bzl", "cc_flags_supplier", "cc_toolchain", "select_arch", "vdso_linker_option")
+# Placeholder: load py_test
+load("//tools:arch.bzl", "select_arch")
+load("//tools:defs.bzl", "cc_flags_supplier", "cc_toolchain", "vdso_linker_option")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 exports_files(["check_vdso.py"])
 
@@ -36,10 +41,6 @@ genrule(
           # VDSO has no hooks to handle failures.
           "-fno-stack-protector " +
           vdso_linker_option +
-          select_arch(
-              amd64 = "-m64 ",
-              arm64 = "",
-          ) +
           "-shared " +
           "-nostdlib " +
           "-Wl,-soname=linux-vdso.so.1 " +

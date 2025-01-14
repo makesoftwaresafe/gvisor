@@ -1,51 +1,58 @@
-load("//tools:defs.bzl", "go_library")
+load("//tools:defs.bzl", "go_library", "proto_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "netstack",
     srcs = [
-        "device.go",
         "netstack.go",
         "netstack_state.go",
-        "netstack_vfs2.go",
         "provider.go",
-        "provider_vfs2.go",
         "save_restore.go",
+        "socketopt_custom.go",
         "stack.go",
         "tun.go",
+    ],
+    imports = [
+        "gvisor.dev/gvisor/pkg/tcpip/stack",
     ],
     visibility = [
         "//pkg/sentry:internal",
     ],
     deps = [
+        ":events_go_proto",
         "//pkg/abi/linux",
         "//pkg/abi/linux/errno",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/eventchannel",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/metric",
+        "//pkg/refs",
         "//pkg/sentry/arch",
-        "//pkg/sentry/device",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/fsutil",
         "//pkg/sentry/fsimpl/sockfs",
         "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/socket",
         "//pkg/sentry/socket/netfilter",
-        "//pkg/sentry/unimpl",
+        "//pkg/sentry/socket/netlink/nlmsg",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/syserr",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
+        "//pkg/tcpip/link/ethernet",
+        "//pkg/tcpip/link/packetsocket",
         "//pkg/tcpip/link/tun",
+        "//pkg/tcpip/link/veth",
         "//pkg/tcpip/network/ipv4",
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
@@ -54,6 +61,13 @@ go_library(
         "//pkg/tcpip/transport/udp",
         "//pkg/usermem",
         "//pkg/waiter",
+        "@org_golang_google_protobuf//proto:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
     ],
+)
+
+proto_library(
+    name = "events",
+    srcs = ["events.proto"],
+    visibility = ["//visibility:public"],
 )

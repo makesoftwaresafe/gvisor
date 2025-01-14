@@ -146,10 +146,8 @@ func (tg *ThreadGroup) discardSpecificLocked(sig linux.Signal) {
 
 // PendingSignals returns the set of pending signals.
 func (t *Task) PendingSignals() linux.SignalSet {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
+	sh := t.tg.signalLock()
+	defer sh.mu.Unlock()
 	return t.pendingSignals.pendingSet | t.tg.pendingSignals.pendingSet
 }
 
@@ -173,7 +171,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 				case sre == linuxerr.ERESTART_RESTARTBLOCK:
 					fallthrough
 				case (sre == linuxerr.ERESTARTSYS && act.Flags&linux.SA_RESTART == 0):
-					t.Debugf("Not restarting syscall %d after errno %d: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
+					t.Debugf("Not restarting syscall %d after error %v: interrupted by signal %d", t.Arch().SyscallNo(), sre, info.Signo)
 					t.Arch().SetReturn(uintptr(-ExtractErrno(linuxerr.EINTR, -1)))
 				default:
 					t.Debugf("Restarting syscall %d: interrupted by signal %d", t.Arch().SyscallNo(), info.Signo)
@@ -186,7 +184,6 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 	switch sigact {
 	case SignalActionTerm, SignalActionCore:
 		// "Default action is to terminate the process." - signal(7)
-		t.Debugf("Signal %d: terminating thread group", info.Signo)
 
 		// Emit an event channel messages related to this uncaught signal.
 		ucs := &ucspb.UncaughtSignal{
@@ -202,6 +199,7 @@ func (t *Task) deliverSignal(info *linux.SignalInfo, act linux.SigAction) taskRu
 			ucs.FaultAddr = info.Addr()
 		}
 
+		t.Debugf("Signal %d, PID: %d, TID: %d, fault addr: %#x: terminating thread group", info.Signo, ucs.Pid, ucs.Tid, ucs.FaultAddr)
 		eventchannel.Emit(ucs)
 
 		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(sig))
@@ -305,6 +303,10 @@ func (t *Task) SignalReturn(rt bool) (*SyscallControl, error) {
 	st := t.Stack()
 	sigset, alt, err := t.Arch().SignalRestore(st, rt, t.k.featureSet)
 	if err != nil {
+		// sigreturn syscalls never return errors.
+		t.Debugf("failed to restore from a signal frame: %v", err)
+		t.forceSignal(linux.SIGSEGV, false /* unconditional */)
+		t.SendSignal(SignalInfoPriv(linux.SIGSEGV))
 		return nil, err
 	}
 
@@ -373,19 +375,15 @@ func (t *Task) Sigtimedwait(set linux.SignalSet, timeout time.Duration) (*linux.
 //	linuxerr.EINVAL - The signal is not valid.
 //	linuxerr.EAGAIN - THe signal is realtime, and cannot be queued.
 func (t *Task) SendSignal(info *linux.SignalInfo) error {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
+	sh := t.tg.signalLock()
+	defer sh.mu.Unlock()
 	return t.sendSignalLocked(info, false /* group */)
 }
 
 // SendGroupSignal sends the given signal to t's thread group.
 func (t *Task) SendGroupSignal(info *linux.SignalInfo) error {
-	t.tg.pidns.owner.mu.RLock()
-	defer t.tg.pidns.owner.mu.RUnlock()
-	t.tg.signalHandlers.mu.Lock()
-	defer t.tg.signalHandlers.mu.Unlock()
+	sh := t.tg.signalLock()
+	defer sh.mu.Unlock()
 	return t.sendSignalLocked(info, true /* group */)
 }
 
@@ -399,12 +397,14 @@ func (tg *ThreadGroup) SendSignal(info *linux.SignalInfo) error {
 	return tg.leader.sendSignalLocked(info, true /* group */)
 }
 
+// Preconditions: The signal mutex must be locked.
 func (t *Task) sendSignalLocked(info *linux.SignalInfo, group bool) error {
 	return t.sendSignalTimerLocked(info, group, nil)
 }
 
+// Preconditions: The signal mutex must be locked.
 func (t *Task) sendSignalTimerLocked(info *linux.SignalInfo, group bool, timer *IntervalTimer) error {
-	if t.exitState == TaskExitDead {
+	if t.ExitState() == TaskExitDead {
 		return linuxerr.ESRCH
 	}
 	sig := linux.Signal(info.Signo)
@@ -478,6 +478,7 @@ func (t *Task) sendSignalTimerLocked(info *linux.SignalInfo, group bool, timer *
 	return nil
 }
 
+// Preconditions: The signal mutex must be locked.
 func (tg *ThreadGroup) applySignalSideEffectsLocked(sig linux.Signal) {
 	switch {
 	case linux.SignalSetOf(sig)&StopSignals != 0:
@@ -568,6 +569,7 @@ func (t *Task) forceSignal(sig linux.Signal, unconditional bool) {
 	t.forceSignalLocked(sig, unconditional)
 }
 
+// Preconditions: The signal mutex must be locked.
 func (t *Task) forceSignalLocked(sig linux.Signal, unconditional bool) {
 	blocked := linux.SignalSetOf(sig)&linux.SignalSet(t.signalMask.RacyLoad()) != 0
 	act := t.tg.signalHandlers.actions[sig]
@@ -640,13 +642,42 @@ func (t *Task) SetSavedSignalMask(mask linux.SignalSet) {
 }
 
 // SignalStack returns the task-private signal stack.
+//
+// By precondition, a full state has to be pulled.
 func (t *Task) SignalStack() linux.SignalStack {
-	t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
 	alt := t.signalStack
 	if t.onSignalStack(alt) {
 		alt.Flags |= linux.SS_ONSTACK
 	}
 	return alt
+}
+
+// SigaltStack implements the sigaltstack syscall.
+func (t *Task) SigaltStack(setaddr hostarch.Addr, oldaddr hostarch.Addr) (*SyscallControl, error) {
+	if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+		t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+		return CtrlDoExit, linuxerr.EFAULT
+	}
+
+	alt := t.SignalStack()
+	if oldaddr != 0 {
+		if _, err := alt.CopyOut(t, oldaddr); err != nil {
+			return nil, err
+		}
+	}
+	if setaddr != 0 {
+		if _, err := alt.CopyIn(t, setaddr); err != nil {
+			return nil, err
+		}
+		// The signal stack cannot be changed if the task is currently
+		// on the stack. This is enforced at the lowest level because
+		// these semantics apply to changing the signal stack via a
+		// ucontext during a signal handler.
+		if !t.SetSignalStack(alt) {
+			return nil, linuxerr.EPERM
+		}
+	}
+	return nil, nil
 }
 
 // onSignalStack returns true if the task is executing on the given signal stack.
@@ -757,7 +788,7 @@ func (t *Task) initiateGroupStop(info *linux.SignalInfo) {
 	}
 	t.tg.groupStopPendingCount = 0
 	for t2 := t.tg.tasks.Front(); t2 != nil; t2 = t2.Next() {
-		if t2.killedLocked() || t2.exitState >= TaskExitInitiated {
+		if t2.killedLocked() || t2.exitStateLocked() >= TaskExitInitiated {
 			t2.groupStopPending = false
 			continue
 		}
@@ -1014,7 +1045,10 @@ func (*runInterrupt) execute(t *Task) taskRunState {
 
 	// Are there signals pending?
 	if info := t.dequeueSignalLocked(linux.SignalSet(t.signalMask.RacyLoad())); info != nil {
-		t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch())
+		if err := t.p.PullFullState(t.MemoryManager().AddressSpace(), t.Arch()); err != nil {
+			t.PrepareGroupExit(linux.WaitStatusTerminationSignal(linux.SIGILL))
+			return (*runExit)(nil)
+		}
 
 		if linux.SignalSetOf(linux.Signal(info.Signo))&StopSignals != 0 {
 			// Indicate that we've dequeued a stop signal before unlocking the

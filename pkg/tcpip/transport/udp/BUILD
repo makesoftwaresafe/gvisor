@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "udp_packet_list",
@@ -27,9 +30,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/buffer",
+        "//pkg/log",
         "//pkg/sleep",
         "//pkg/sync",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/header/parse",
         "//pkg/tcpip/ports",
@@ -47,10 +52,11 @@ go_test(
     srcs = ["udp_test.go"],
     deps = [
         ":udp",
+        "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
@@ -59,6 +65,7 @@ go_test(
         "//pkg/tcpip/network/ipv6",
         "//pkg/tcpip/stack",
         "//pkg/tcpip/testutil",
+        "//pkg/tcpip/transport",
         "//pkg/tcpip/transport/icmp",
         "//pkg/tcpip/transport/testing/context",
         "//pkg/waiter",

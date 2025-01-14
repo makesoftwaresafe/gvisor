@@ -1,8 +1,11 @@
+load("//images:defs.bzl", "docker_image")
 load("//tools:defs.bzl", "bzl_library", "pkg_tar")
 load("//website:defs.bzl", "doc", "docs")
-load("//images:defs.bzl", "docker_image")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 docker_image(
     name = "website",
@@ -109,9 +112,10 @@ genrule(
 pkg_tar(
     name = "config",
     srcs = [
-        ":css",
         "_config.yml",
+        ":css",
         "//website/blog:index.html",
+        "//website/users:index.html",
     ] + glob([
         "assets/**",
         "_includes/**",
@@ -143,6 +147,7 @@ docs(
         "//g3doc:index",
         "//g3doc:roadmap",
         "//g3doc:style",
+        "//g3doc/architecture_guide:networking",
         "//g3doc/architecture_guide:performance",
         "//g3doc/architecture_guide:platforms",
         "//g3doc/architecture_guide:resources",
@@ -153,9 +158,15 @@ docs(
         "//g3doc/user_guide:compatibility",
         "//g3doc/user_guide:debugging",
         "//g3doc/user_guide:filesystem",
+        "//g3doc/user_guide:gpu",
         "//g3doc/user_guide:install",
         "//g3doc/user_guide:networking",
+        "//g3doc/user_guide:observability",
         "//g3doc/user_guide:platforms",
+        "//g3doc/user_guide:production",
+        "//g3doc/user_guide:runtime_monitoring",
+        "//g3doc/user_guide:systemd",
+        "//g3doc/user_guide:tpu",
         "//g3doc/user_guide/containerd:configuration",
         "//g3doc/user_guide/containerd:containerd_11",
         "//g3doc/user_guide/containerd:quick_start",
@@ -165,6 +176,9 @@ docs(
         "//g3doc/user_guide/tutorials:cni",
         "//g3doc/user_guide/tutorials:docker",
         "//g3doc/user_guide/tutorials:docker_compose",
+        "//g3doc/user_guide/tutorials:docker_in_gke_sandbox",
+        "//g3doc/user_guide/tutorials:docker_in_gvisor",
+        "//g3doc/user_guide/tutorials:falco",
         "//g3doc/user_guide/tutorials:knative",
         "//g3doc/user_guide/tutorials:kubernetes",
     ],

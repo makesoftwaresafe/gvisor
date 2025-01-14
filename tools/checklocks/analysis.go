@@ -56,7 +56,7 @@ func (pc *passContext) typeAlignment(pkg *types.Package, obj types.Object) atomi
 		}
 	case *types.Array:
 		// Export direct alignment requirements.
-		if named, ok := x.Elem().(*types.Named); ok {
+		if named, ok := x.Elem().(*types.Named); ok && !hasTypeParams(named) {
 			requiredOffset = pc.typeAlignment(pkg, named.Obj())
 		}
 	default:
@@ -75,12 +75,19 @@ func (pc *passContext) typeAlignment(pkg *types.Package, obj types.Object) atomi
 	return requiredOffset
 }
 
+// hasTypeParams returns true iff the named type has type parameters.
+func hasTypeParams(typ *types.Named) bool {
+	return typ.TypeParams() != nil && typ.TypeParams().Len() > 0
+}
+
 // checkTypeAlignment checks the alignment of the given type.
 //
 // This calls typeAlignment, which resolves all types recursively. This method
 // should be called for all types individual to ensure full coverage.
 func (pc *passContext) checkTypeAlignment(pkg *types.Package, typ *types.Named) {
-	_ = pc.typeAlignment(pkg, typ.Obj())
+	if !hasTypeParams(typ) {
+		_ = pc.typeAlignment(pkg, typ.Obj())
+	}
 }
 
 // atomicRules specify read constraints.
@@ -131,6 +138,10 @@ func (pc *passContext) checkAtomicCall(inst ssa.Instruction, obj types.Object, a
 				// This is an illegal call to a non-atomic package function.
 				pc.maybeFail(inst.Pos(), "dispatch to non-atomic function with atomic-only field")
 			}
+			return
+		}
+		if fn.Signature.Recv() != nil {
+			// always allow calls to methods of atomic wrappers such as atomic.Int32 introduced in Go 1.19
 			return
 		}
 		if ar == nonAtomic {

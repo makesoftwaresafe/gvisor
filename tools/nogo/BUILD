@@ -1,12 +1,9 @@
-load("//tools:defs.bzl", "bool_flag", "bzl_library", "go_binary", "select_goarch", "select_goos")
+load("//tools:defs.bzl", "bzl_library", "go_binary", "select_goarch", "select_goos")
 load("//tools/nogo:defs.bzl", "nogo_stdlib", "nogo_target")
 
-package(licenses = ["notice"])
-
-bool_flag(
-    name = "full",
-    build_setting_default = False,
-    visibility = ["//visibility:public"],
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
 )
 
 nogo_target(

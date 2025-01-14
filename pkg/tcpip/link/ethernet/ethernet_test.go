@@ -19,9 +19,9 @@ import (
 	"os"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
@@ -31,47 +31,94 @@ import (
 
 var _ stack.NetworkDispatcher = (*testNetworkDispatcher)(nil)
 
+type deliveredPacket struct {
+	protocol tcpip.NetworkProtocolNumber
+	packet   *stack.PacketBuffer
+}
+
 type testNetworkDispatcher struct {
-	networkPackets int
+	networkPackets []deliveredPacket
 }
 
-func (t *testNetworkDispatcher) DeliverNetworkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
-	t.networkPackets++
+func (t *testNetworkDispatcher) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pb *stack.PacketBuffer) {
+	t.networkPackets = append(t.networkPackets, deliveredPacket{protocol: proto, packet: pb})
 }
 
-func (*testNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (*testNetworkDispatcher) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	panic("not implemented")
 }
 
 func TestDeliverNetworkPacket(t *testing.T) {
+
 	const (
-		linkAddr       = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x06")
-		otherLinkAddr1 = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x07")
-		otherLinkAddr2 = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x08")
+		linkAddr      = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x06")
+		otherLinkAddr = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x07")
 	)
 
-	e := ethernet.New(channel.New(0, 0, linkAddr))
-	var networkDispatcher testNetworkDispatcher
-	e.Attach(&networkDispatcher)
+	for _, testCase := range []struct {
+		name    string
+		dstAddr tcpip.LinkAddress
+		pktType tcpip.PacketType
+	}{
+		{
+			name:    "unicast",
+			dstAddr: linkAddr,
+			pktType: tcpip.PacketHost,
+		},
+		{
+			name:    "broadcast",
+			dstAddr: header.EthernetBroadcastAddress,
+			pktType: tcpip.PacketBroadcast,
+		},
+		{
+			name:    "multicast",
+			dstAddr: tcpip.LinkAddress("\xFF\x00\x00\x00\x05\x07"),
+			pktType: tcpip.PacketMulticast,
+		},
+		{
+			name:    "other host",
+			dstAddr: tcpip.LinkAddress("\x02\x02\x03\x04\x05\x08"),
+			pktType: tcpip.PacketOtherHost,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
 
-	if networkDispatcher.networkPackets != 0 {
-		t.Fatalf("got networkDispatcher.networkPackets = %d, want = 0", networkDispatcher.networkPackets)
-	}
+			e := ethernet.New(channel.New(0, 0, linkAddr))
+			var networkDispatcher testNetworkDispatcher
+			e.Attach(&networkDispatcher)
 
-	// An ethernet frame with a destination link address that is not assigned to
-	// our ethernet link endpoint should still be delivered to the network
-	// dispatcher since the ethernet endpoint is not expected to filter frames.
-	eth := make([]byte, header.EthernetMinimumSize)
-	header.Ethernet(eth).Encode(&header.EthernetFields{
-		SrcAddr: otherLinkAddr1,
-		DstAddr: otherLinkAddr2,
-		Type:    header.IPv4ProtocolNumber,
-	})
-	p := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.NewWithData(eth)})
-	defer p.DecRef()
-	e.DeliverNetworkPacket(0, p)
-	if networkDispatcher.networkPackets != 1 {
-		t.Fatalf("got networkDispatcher.networkPackets = %d, want = 1", networkDispatcher.networkPackets)
+			if got, want := len(networkDispatcher.networkPackets), 0; got != want {
+				t.Fatalf("got networkDispatcher.networkPackets = %d, want = %d", got, want)
+			}
+
+			const networkProtocol = header.IPv4ProtocolNumber
+
+			// An ethernet frame with a destination link address that is not assigned to
+			// our ethernet link endpoint should still be delivered to the network
+			// dispatcher since the ethernet endpoint is not expected to filter frames.
+			eth := make([]byte, header.EthernetMinimumSize)
+			header.Ethernet(eth).Encode(&header.EthernetFields{
+				SrcAddr: otherLinkAddr,
+				DstAddr: testCase.dstAddr,
+				Type:    networkProtocol,
+			})
+			p := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(eth)})
+			defer p.DecRef()
+			e.DeliverNetworkPacket(0, p)
+			if got, want := len(networkDispatcher.networkPackets), 1; got != want {
+				t.Fatalf("got networkDispatcher.networkPackets = %d, want = %d", got, want)
+			}
+			delivered := networkDispatcher.networkPackets[0]
+			if diff := cmp.Diff(delivered.packet.LinkHeader().Slice(), eth); diff != "" {
+				t.Errorf("LinkHeader mismatch (-want +got):\n%s", diff)
+			}
+			if got, want := delivered.protocol, networkProtocol; got != want {
+				t.Errorf("got delivered.protocol = %d, want = %d", got, want)
+			}
+			if got, want := delivered.packet.PktType, testCase.pktType; got != want {
+				t.Errorf("got delivered.packet.PktType = %d, want = %d", got, want)
+			}
+		})
 	}
 }
 
@@ -97,20 +144,12 @@ func TestMTU(t *testing.T) {
 			expectedMTU:  0,
 		},
 		{
-			maxFrameSize: header.EthernetMinimumSize - 1,
-			expectedMTU:  0,
-		},
-		{
 			maxFrameSize: header.EthernetMinimumSize,
-			expectedMTU:  0,
-		},
-		{
-			maxFrameSize: header.EthernetMinimumSize + 1,
-			expectedMTU:  1,
+			expectedMTU:  header.EthernetMinimumSize,
 		},
 		{
 			maxFrameSize: maxFrameSize,
-			expectedMTU:  maxFrameSize - header.EthernetMinimumSize,
+			expectedMTU:  maxFrameSize,
 		},
 	}
 
@@ -140,8 +179,6 @@ func TestWritePacketToRemoteAddHeader(t *testing.T) {
 		t.Fatalf("s.CreateNIC(%d, _): %s", nicID, err)
 	}
 
-	// TODO(b/230896518): Remove tcpipbuffer once WritePacketToRemote API is
-	// changed.
 	if err := s.WritePacketToRemote(nicID, remoteLinkAddr, netProto, buffer.Buffer{}); err != nil {
 		t.Fatalf("s.WritePacketToRemote(%d, %s, _): %s", nicID, remoteLinkAddr, err)
 	}
@@ -152,7 +189,7 @@ func TestWritePacketToRemoteAddHeader(t *testing.T) {
 			t.Fatal("expected to read a packet")
 		}
 
-		eth := header.Ethernet(pkt.LinkHeader().View())
+		eth := header.Ethernet(pkt.LinkHeader().Slice())
 		pkt.DecRef()
 		if got := eth.SourceAddress(); got != localLinkAddr {
 			t.Errorf("got eth.SourceAddress() = %s, want = %s", got, localLinkAddr)
@@ -169,6 +206,6 @@ func TestWritePacketToRemoteAddHeader(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

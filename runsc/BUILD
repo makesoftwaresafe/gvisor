@@ -1,20 +1,42 @@
 load("//tools:defs.bzl", "go_binary")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_binary(
     name = "runsc",
-    srcs = [
-        "main.go",
-        "version.go",
-    ],
+    srcs = ["main.go"],
     pure = True,
     tags = ["staging"],
     visibility = [
         "//visibility:public",
     ],
-    x_defs = {"main.version": "{STABLE_VERSION}"},
-    deps = ["//runsc/cli"],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//runsc/cli",
+        "//runsc/version",
+    ],
+)
+
+go_binary(
+    name = "runsc-plugin-stack",
+    srcs = ["main_plugin_stack.go"],
+    gotags = ["network_plugins"],
+    nogo = False,
+    pure = False,
+    static = True,
+    tags = ["network_plugins"],
+    visibility = [
+        "//visibility:public",
+    ],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//pkg/sentry/socket/plugin/stack",
+        "//runsc/cli",
+        "//runsc/version",
+    ],
 )
 
 # The runsc-race target is a race-compatible BUILD target. This must be built
@@ -32,17 +54,17 @@ go_binary(
 # [1] https://github.com/bazelbuild/bazel/issues/1698
 go_binary(
     name = "runsc-race",
-    srcs = [
-        "main.go",
-        "version.go",
-    ],
+    srcs = ["main.go"],
     gotags = ["lockdep"],
     static = True,
     visibility = [
         "//visibility:public",
     ],
-    x_defs = {"main.version": "{STABLE_VERSION}"},
-    deps = ["//runsc/cli"],
+    x_defs = {"gvisor.dev/gvisor/runsc/version.version": "{STABLE_VERSION}"},
+    deps = [
+        "//runsc/cli",
+        "//runsc/version",
+    ],
 )
 
 sh_test(

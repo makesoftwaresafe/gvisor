@@ -323,7 +323,7 @@ func genTCPPacket(opts genTCPOpts) *PacketBuffer {
 	packetLen := header.IPv4MinimumSize + uint16(tcpHdrSize)
 	pkt := NewPacketBuffer(PacketBufferOptions{
 		ReserveHeaderBytes: int(packetLen),
-		Payload:            buffer.NewWithData(opts.data),
+		Payload:            buffer.MakeWithData(opts.data),
 	})
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
 	pkt.TransportProtocolNumber = header.TCPProtocolNumber

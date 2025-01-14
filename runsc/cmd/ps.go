@@ -52,7 +52,7 @@ func (ps *PS) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -61,7 +61,7 @@ func (ps *PS) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{})
 	id := f.Arg(0)
 	conf := args[0].(*config.Config)
 
-	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{})
+	c, err := container.Load(conf.RootDir, container.FullID{ContainerID: id}, container.LoadOpts{SkipCheck: true})
 	if err != nil {
 		util.Fatalf("loading sandbox: %v", err)
 	}

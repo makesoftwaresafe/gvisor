@@ -253,7 +253,7 @@ func (i *Inotify) Read(ctx context.Context, dst usermem.IOSequence, opts ReadOpt
 }
 
 // Ioctl implements FileDescriptionImpl.Ioctl.
-func (i *Inotify) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (i *Inotify) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	switch args[1].Int() {
 	case linux.FIONREAD:
 		i.evMu.Lock()
@@ -326,7 +326,7 @@ func (i *Inotify) nextWatchIDLocked() int32 {
 // returns the watch descriptor returned by inotify_add_watch(2).
 //
 // The caller must hold a reference on target.
-func (i *Inotify) AddWatch(target *Dentry, mask uint32) (int32, error) {
+func (i *Inotify) AddWatch(target *Dentry, mask uint32) int32 {
 	// Note: Locking this inotify instance protects the result returned by
 	// Lookup() below. With the lock held, we know for sure the lookup result
 	// won't become stale because it's impossible for *this* instance to
@@ -335,11 +335,6 @@ func (i *Inotify) AddWatch(target *Dentry, mask uint32) (int32, error) {
 	defer i.mu.Unlock()
 
 	ws := target.Watches()
-	if ws == nil {
-		// While Linux supports inotify watches on all filesystem types, watches on
-		// filesystems like kernfs are not generally useful, so we do not.
-		return 0, linuxerr.EPERM
-	}
 	// Does the target already have a watch from this inotify instance?
 	if existing := ws.Lookup(i.id); existing != nil {
 		newmask := mask
@@ -349,12 +344,12 @@ func (i *Inotify) AddWatch(target *Dentry, mask uint32) (int32, error) {
 			newmask |= existing.mask.Load()
 		}
 		existing.mask.Store(newmask)
-		return existing.wd, nil
+		return existing.wd
 	}
 
 	// No existing watch, create a new watch.
 	w := i.newWatchLocked(target, ws, mask)
-	return w.wd, nil
+	return w.wd
 }
 
 // RmWatch looks up an inotify watch for the given 'wd' and configures the
@@ -748,7 +743,7 @@ func InotifyEventFromStatMask(mask uint32) uint32 {
 	return ev
 }
 
-// InotifyRemoveChild sends the appriopriate notifications to the watch sets of
+// InotifyRemoveChild sends the appropriate notifications to the watch sets of
 // the child being removed and its parent. Note that unlike most pairs of
 // parent/child notifications, the child is notified first in this case.
 func InotifyRemoveChild(ctx context.Context, self, parent *Watches, name string) {
@@ -760,7 +755,7 @@ func InotifyRemoveChild(ctx context.Context, self, parent *Watches, name string)
 	}
 }
 
-// InotifyRename sends the appriopriate notifications to the watch sets of the
+// InotifyRename sends the appropriate notifications to the watch sets of the
 // file being renamed and its old/new parents.
 func InotifyRename(ctx context.Context, renamed, oldParent, newParent *Watches, oldName, newName string, isDir bool) {
 	var dirEv uint32

@@ -59,7 +59,7 @@ var blocklist = []string{
 	"SwapUint32",
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
+func run(pass *analysis.Pass) (any, error) {
 	// Check for the "// +checkalignedignore" escape hatch.
 	for _, file := range pass.Files {
 		if file.Doc == nil {
@@ -101,7 +101,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 					}
 					typeNameLen += 2 // Account for the "32" or "64" suffix.
 					typeName := blocked[len(blocked)-typeNameLen:]
-					pass.Reportf(selExpr.Pos(), fmt.Sprintf("don't call atomic.%s; use atomicbitops.%s instead", blocked, typeName))
+					pass.Reportf(selExpr.Pos(), "%s", fmt.Sprintf("don't call atomic.%s; use atomicbitops.%s instead", blocked, typeName))
 				}
 			}
 

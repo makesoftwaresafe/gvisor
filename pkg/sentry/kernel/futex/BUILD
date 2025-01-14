@@ -1,17 +1,20 @@
+load("//pkg/sync/locking:locking.bzl", "declare_mutex")
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
-go_template_instance(
+declare_mutex(
     name = "futex_mutex",
     out = "futex_mutex.go",
+    nested_lock_names = [
+        "b",
+    ],
     package = "futex",
     prefix = "futexBucket",
-    substrs = {
-        "genericMark": "futexBucket",
-    },
-    template = "//pkg/sync/locking:generic_mutex",
 )
 
 go_template_instance(

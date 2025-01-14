@@ -20,9 +20,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <climits>
+#include <string>
+#include <vector>
 
+#include "absl/algorithm/container.h"
+#include "absl/strings/numbers.h"
+#include "absl/strings/str_split.h"
 #include "test/util/capability_util.h"
+#include "test/util/proc_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -30,6 +37,20 @@ namespace gvisor {
 namespace testing {
 
 namespace {
+
+PosixErrorOr<ProcLimitsEntry> GetProcLimitEntryByType(LimitType limit_type) {
+  ASSIGN_OR_RETURN_ERRNO(std::string proc_self_limits,
+                         GetContents("/proc/self/limits"));
+  ASSIGN_OR_RETURN_ERRNO(auto entries, ParseProcLimits(proc_self_limits));
+  auto it = absl::c_find_if(entries, [limit_type](const ProcLimitsEntry& v) {
+    return v.limit_type == limit_type;
+  });
+  if (it == entries.end()) {
+    return PosixError(ENOENT, absl::StrFormat("limit type \"%s\" not found",
+                                              LimitTypeToString(limit_type)));
+  }
+  return *it;
+}
 
 TEST(RlimitTest, SetRlimitHigher) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
@@ -42,6 +63,12 @@ TEST(RlimitTest, SetRlimitHigher) {
   rl.rlim_cur--;
   rl.rlim_max--;
   ASSERT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+
+  // Now verify we can read the changed values via /proc/self/limits
+  const ProcLimitsEntry limit_entry = ASSERT_NO_ERRNO_AND_VALUE(
+      GetProcLimitEntryByType(LimitType::kNumberOfFiles));
+  EXPECT_EQ(rl.rlim_cur, limit_entry.cur_limit);
+  EXPECT_EQ(rl.rlim_max, limit_entry.max_limit);
 
   rl.rlim_max++;
   EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
@@ -126,6 +153,13 @@ TEST(RlimitTest, RlimitNProc) {
       EXPECT_THAT(pid, SyscallFailsWithErrno(EAGAIN));
     }
   }).Join();
+}
+
+TEST(RlimitTest, ParseProcPidLimits) {
+  auto proc_self_limits =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/limits"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcLimits(proc_self_limits));
+  EXPECT_EQ(entries.size(), LimitTypes.size());
 }
 
 }  // namespace

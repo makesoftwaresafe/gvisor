@@ -16,20 +16,34 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/gofrs/flock"
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sync"
 )
 
 const stateFileExtension = "state"
+
+// ErrStateFileLocked is returned by Load() when the state file is locked
+// and TryLock is enabled.
+var ErrStateFileLocked = errors.New("state file locked")
+
+// TryLock represents whether we should block waiting for the lock to be acquired or not.
+type TryLock bool
+
+const (
+	// BlockAcquire means we will block until the lock can be acquired.
+	BlockAcquire TryLock = false
+
+	// TryAcquire means we will fail fast if the lock cannot be acquired.
+	TryAcquire TryLock = true
+)
 
 // LoadOpts provides options for Load()ing a container.
 type LoadOpts struct {
@@ -38,6 +52,11 @@ type LoadOpts struct {
 
 	// SkipCheck tells Load() to skip checking if container is runnning.
 	SkipCheck bool
+
+	// TryLock tells Load() to fail if the container state file cannot be locked,
+	// as opposed to blocking until it is available.
+	// When the state file cannot be locked, it will error with ErrStateFileLocked.
+	TryLock TryLock
 
 	// RootContainer when true matches the search only with the root container of
 	// a sandbox. This is used when looking for a sandbox given that root
@@ -74,13 +93,14 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 	defer state.close()
 
 	c := &Container{}
-	if err := state.load(c); err != nil {
+	if err := state.load(c, opts); err != nil {
 		if os.IsNotExist(err) {
 			// Preserve error so that callers can distinguish 'not found' errors.
 			return nil, err
 		}
 		return nil, fmt.Errorf("reading container metadata file %q: %v", state.statePath(), err)
 	}
+	c.Sandbox.SetRootDir(rootDir)
 
 	if opts.RootContainer && c.ID != c.Sandbox.ID {
 		return nil, fmt.Errorf("ID %q doesn't belong to a sandbox", id)
@@ -92,15 +112,8 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 		//
 		// This is inherently racy.
 		switch c.Status {
-		case Created:
-			if !c.IsSandboxRunning() {
-				// Sandbox no longer exists, so this container definitely does not exist.
-				c.changeStatus(Stopped)
-			}
-		case Running:
-			if err := c.SignalContainer(unix.Signal(0), false); err != nil {
-				c.changeStatus(Stopped)
-			}
+		case Created, Running:
+			c.CheckStopped()
 		}
 	}
 
@@ -111,6 +124,26 @@ func Load(rootDir string, id FullID, opts LoadOpts) (*Container, error) {
 func List(rootDir string) ([]FullID, error) {
 	log.Debugf("List containers %q", rootDir)
 	return listMatch(rootDir, FullID{})
+}
+
+// ListSandboxes returns all sandbox ids in the given root directory.
+func ListSandboxes(rootDir string) ([]FullID, error) {
+	log.Debugf("List containers %q", rootDir)
+	ids, err := List(rootDir)
+	if err != nil {
+		return nil, err
+	}
+
+	sandboxes := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		sandboxes[id.SandboxID] = struct{}{}
+	}
+	// Reset ids to list only sandboxes.
+	ids = nil
+	for id := range sandboxes {
+		ids = append(ids, FullID{SandboxID: id, ContainerID: id})
+	}
+	return ids, nil
 }
 
 // listMatch returns all container ids that match the provided id.
@@ -132,18 +165,23 @@ func listMatch(rootDir string, id FullID) ([]FullID, error) {
 	return out, nil
 }
 
-// loadSandbox loads all containers that belong to the sandbox with the given
+// LoadSandbox loads all containers that belong to the sandbox with the given
 // ID.
-func loadSandbox(rootDir, id string) ([]*Container, error) {
+func LoadSandbox(rootDir, id string, opts LoadOpts) ([]*Container, error) {
 	cids, err := listMatch(rootDir, FullID{SandboxID: id})
 	if err != nil {
 		return nil, err
 	}
 
+	// Override load options that don't make sense in the context of this function.
+	opts.SkipCheck = true      // We're loading all containers irrespective of status.
+	opts.RootContainer = false // We're loading all containers, not just the root one.
+	opts.Exact = true          // We'll iterate over exact container IDs below.
+
 	// Load the container metadata.
 	var containers []*Container
 	for _, cid := range cids {
-		container, err := Load(rootDir, cid, LoadOpts{Exact: true, SkipCheck: true})
+		container, err := Load(rootDir, cid, opts)
 		if err != nil {
 			// Container file may not exist if it raced with creation/deletion or
 			// directory was left behind. Load provides a snapshot in time, so it's
@@ -247,36 +285,46 @@ type StateFile struct {
 	// be preserved across commands.
 	//
 
-	once  sync.Once
-	flock *flock.Flock
+	once  sync.Once    `nojson:"true"`
+	flock *flock.Flock `nojson:"true"`
 }
 
 // lock globally locks all locking operations for the container.
-func (s *StateFile) lock() error {
+func (s *StateFile) lock(tryLock TryLock) error {
 	s.once.Do(func() {
 		s.flock = flock.New(s.lockPath())
 	})
 
-	if err := s.flock.Lock(); err != nil {
-		return fmt.Errorf("acquiring lock on %q: %v", s.flock, err)
+	if tryLock {
+		gotLock, err := s.flock.TryLock()
+		if err != nil {
+			return fmt.Errorf("acquiring lock on %q: %v", s.flock, err)
+		}
+		if !gotLock {
+			return ErrStateFileLocked
+		}
+	} else {
+		if err := s.flock.Lock(); err != nil {
+			return fmt.Errorf("acquiring lock on %q: %v", s.flock, err)
+		}
 	}
 	return nil
 }
 
-// lockForNew acquires the lock and checks if the state file doesn't exist. This
+// LockForNew acquires the lock and checks if the state file doesn't exist. This
 // is done to ensure that more than one creation didn't race to create
 // containers with the same ID.
-func (s *StateFile) lockForNew() error {
-	if err := s.lock(); err != nil {
+func (s *StateFile) LockForNew() error {
+	if err := s.lock(BlockAcquire); err != nil {
 		return err
 	}
 
 	// Checks if the container already exists by looking for the metadata file.
 	if _, err := os.Stat(s.statePath()); err == nil {
-		s.unlockOrDie()
+		s.UnlockOrDie()
 		return fmt.Errorf("container already exists")
 	} else if !os.IsNotExist(err) {
-		s.unlockOrDie()
+		s.UnlockOrDie()
 		return fmt.Errorf("looking for existing container: %v", err)
 	}
 	return nil
@@ -295,7 +343,8 @@ func (s *StateFile) unlock() error {
 	return nil
 }
 
-func (s *StateFile) unlockOrDie() {
+// UnlockOrDie is the same as unlock() but panics in case of failure.
+func (s *StateFile) UnlockOrDie() {
 	if !s.flock.Locked() {
 		panic("unlock called without lock held")
 	}
@@ -304,10 +353,10 @@ func (s *StateFile) unlockOrDie() {
 	}
 }
 
-// saveLocked saves 'v' to the state file.
+// SaveLocked saves 'v' to the state file.
 //
-// Preconditions: lock() must been called before.
-func (s *StateFile) saveLocked(v interface{}) error {
+// Preconditions: lock(*) must been called before.
+func (s *StateFile) SaveLocked(v any) error {
 	if !s.flock.Locked() {
 		panic("saveLocked called without lock held")
 	}
@@ -316,19 +365,25 @@ func (s *StateFile) saveLocked(v interface{}) error {
 	if err != nil {
 		return err
 	}
-	if err := ioutil.WriteFile(s.statePath(), meta, 0640); err != nil {
+	if err := os.WriteFile(s.statePath(), meta, 0640); err != nil {
 		return fmt.Errorf("writing json file: %v", err)
 	}
 	return nil
 }
 
-func (s *StateFile) load(v interface{}) error {
-	if err := s.lock(); err != nil {
+// Stat returns the result of calling stat() on the state file.
+// Doing so does not require locking.
+func (s *StateFile) Stat() (os.FileInfo, error) {
+	return os.Stat(s.statePath())
+}
+
+func (s *StateFile) load(v any, opts LoadOpts) error {
+	if err := s.lock(opts.TryLock); err != nil {
 		return err
 	}
-	defer s.unlockOrDie()
+	defer s.UnlockOrDie()
 
-	metaBytes, err := ioutil.ReadFile(s.statePath())
+	metaBytes, err := os.ReadFile(s.statePath())
 	if err != nil {
 		return err
 	}
@@ -361,10 +416,10 @@ func (s *StateFile) lockPath() string {
 	return buildPath(s.RootDir, s.ID, "lock")
 }
 
-// destroy deletes all state created by the stateFile. It may be called with the
+// Destroy deletes all state created by the stateFile. It may be called with the
 // lock file held. In that case, the lock file must still be unlocked and
 // properly closed after destroy returns.
-func (s *StateFile) destroy() error {
+func (s *StateFile) Destroy() error {
 	if err := os.Remove(s.statePath()); err != nil && !os.IsNotExist(err) {
 		return err
 	}

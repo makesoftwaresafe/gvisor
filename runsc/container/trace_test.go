@@ -16,18 +16,19 @@ package container
 
 import (
 	"encoding/json"
-	"io/ioutil"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"golang.org/x/sys/unix"
 	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck/checkers/remote/test"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck/sinks/remote/test"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/runsc/boot"
 )
@@ -35,7 +36,7 @@ import (
 func remoteSinkConfig(endpoint string) seccheck.SinkConfig {
 	return seccheck.SinkConfig{
 		Name: "remote",
-		Config: map[string]interface{}{
+		Config: map[string]any{
 			"endpoint": endpoint,
 		},
 	}
@@ -54,7 +55,7 @@ func TestTraceStartup(t *testing.T) {
 			}
 			defer server.Close()
 
-			podInitConfig, err := ioutil.TempFile(testutil.TmpDir(), "config")
+			podInitConfig, err := os.CreateTemp(testutil.TmpDir(), "config")
 			if err != nil {
 				t.Fatalf("error creating tmp file: %v", err)
 			}
@@ -305,7 +306,6 @@ func TestProcfsDump(t *testing.T) {
 	spec.Process.Rlimits = []specs.POSIXRlimit{
 		{Type: "RLIMIT_NOFILE", Hard: fdLimit.Max, Soft: fdLimit.Cur},
 	}
-	conf.Cgroupfs = true
 	_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
 	if err != nil {
 		t.Fatalf("error setting up container: %v", err)
@@ -374,12 +374,24 @@ func TestProcfsDump(t *testing.T) {
 	if len(procfsDump[0].FDs) < 3 {
 		t.Errorf("expected at least 3 FDs for the sleep process, got %+v", procfsDump[0].FDs)
 	} else {
+		modes := [3]uint32{}
+		for i := range []*os.File{os.Stdin, os.Stdout, os.Stderr} {
+			stat := unix.Stat_t{}
+			err := unix.Fstat(i, &stat)
+			if err != nil {
+				t.Fatalf("unix.Fatat(i) failed: %s", err)
+			}
+			modes[i] = stat.Mode & unix.S_IFMT
+		}
 		for i, fd := range procfsDump[0].FDs[:3] {
 			if want := int32(i); fd.Number != want {
 				t.Errorf("expected FD number %d, got %d", want, fd.Number)
 			}
 			if wantSubStr := "host"; !strings.Contains(fd.Path, wantSubStr) {
-				t.Errorf("expected FD path to contain %q, got %q", wantSubStr, fd.Path)
+				t.Errorf("expected FD %d path to contain %q, got %q", fd.Number, wantSubStr, fd.Path)
+			}
+			if want, got := modes[i], fd.Mode&unix.S_IFMT; uint16(want) != got {
+				t.Errorf("wrong mode FD %d, want: %#o, got: %#o", fd.Number, want, got)
 			}
 		}
 	}
@@ -400,11 +412,16 @@ func TestProcfsDump(t *testing.T) {
 	}
 
 	wantCgroup := []kernel.TaskCgroupEntry{
-		kernel.TaskCgroupEntry{HierarchyID: 2, Controllers: "memory", Path: "/"},
-		kernel.TaskCgroupEntry{HierarchyID: 1, Controllers: "cpu", Path: "/"},
+		{HierarchyID: 7, Controllers: "pids", Path: "/"},
+		{HierarchyID: 6, Controllers: "memory", Path: "/"},
+		{HierarchyID: 5, Controllers: "job", Path: "/"},
+		{HierarchyID: 4, Controllers: "devices", Path: "/"},
+		{HierarchyID: 3, Controllers: "cpuset", Path: "/"},
+		{HierarchyID: 2, Controllers: "cpuacct", Path: "/"},
+		{HierarchyID: 1, Controllers: "cpu", Path: "/"},
 	}
 	if len(procfsDump[0].Cgroup) != len(wantCgroup) {
-		t.Errorf("expected 2 cgroup controllers, got %+v", procfsDump[0].Cgroup)
+		t.Errorf("expected 7 cgroup controllers, got %+v", procfsDump[0].Cgroup)
 	} else {
 		for i, cgroup := range procfsDump[0].Cgroup {
 			if cgroup != wantCgroup[i] {
@@ -433,5 +450,15 @@ func TestProcfsDump(t *testing.T) {
 	}
 	if procfsDump[0].Status.VMRSS == 0 {
 		t.Errorf("expected VMSize to be set")
+	}
+	if len(procfsDump[0].Maps) <= 0 {
+		t.Errorf("no region mapped for pid:%v", procfsDump[0].Status.PID)
+	}
+
+	maps := procfsDump[0].Maps
+	for i := 0; i < len(procfsDump[0].Maps)-1; i++ {
+		if maps[i].Address.Overlaps(maps[i+1].Address) {
+			t.Errorf("overlapped addresses for pid:%v", procfsDump[0].Status.PID)
+		}
 	}
 }

@@ -17,6 +17,9 @@ package inet
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -38,6 +41,9 @@ type Stack interface {
 	// AddInterfaceAddr adds an address to the network interface identified by
 	// idx.
 	AddInterfaceAddr(idx int32, addr InterfaceAddr) error
+
+	// SetInterface modifies or adds a new interface.
+	SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error
 
 	// RemoveInterfaceAddr removes an address from the network interface
 	// identified by idx.
@@ -74,16 +80,33 @@ type Stack interface {
 	SetTCPRecovery(recovery TCPLossRecovery) error
 
 	// Statistics reports stack statistics.
-	Statistics(stat interface{}, arg string) error
+	Statistics(stat any, arg string) error
 
 	// RouteTable returns the network stack's route table.
 	RouteTable() []Route
 
+	// RemoveRoute deletes the specified route.
+	RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
+	// NewRoute adds the given route to the network stack's route table.
+	NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error
+
 	// Pause pauses the network stack before save.
 	Pause()
 
-	// Resume restarts the network stack after restore.
+	// Resume resumes the network stack after save.
 	Resume()
+
+	// Restore restarts the network stack after restore.
+	Restore()
+
+	// ReplaceConfig replaces the new network stack configuration to the
+	// loaded or saved network stack after restore.
+	// TODO(b/379115439): This method is a workaround to update netstack config
+	// during restore. It should be removed after a new method is added to
+	// extract the complete config from the spec and update it in the loaded
+	// stack during restore.
+	ReplaceConfig(st Stack)
 
 	// Destroy the network stack.
 	Destroy()
@@ -108,6 +131,15 @@ type Stack interface {
 	// SetPortRange sets the UDP and TCP IPv4 and IPv6 ephemeral port range
 	// (inclusive).
 	SetPortRange(start uint16, end uint16) error
+
+	// EnableSaveRestore enables netstack s/r.
+	EnableSaveRestore() error
+
+	// IsSaveRestoreEnabled returns true when netstack s/r is enabled.
+	IsSaveRestoreEnabled() bool
+
+	// Stats returns the network stats.
+	Stats() tcpip.Stats
 }
 
 // Interface contains information about a network interface.
@@ -238,3 +270,25 @@ const (
 	TCP_RACK_STATIC_REO_WND
 	TCP_RACK_NO_DUPTHRESH
 )
+
+// InterfaceRequest contains information about an adding interface.
+type InterfaceRequest struct {
+	// Kind is the link type.
+	Kind string
+	// Name is the interface name.
+	Name string
+	// Addr is the hardware device address.
+	Addr []byte
+	// MTU is the maximum transmission unit.
+	MTU uint32
+	// Data is link type specific device properties.
+	Data any
+}
+
+// VethPeerReq contains information about a second interface of a new veth pair.
+type VethPeerReq struct {
+	// Req is information about the second end of the new veth pair.
+	Req InterfaceRequest
+	// Stack is the stack where the second end has to be added.
+	Stack Stack
+}

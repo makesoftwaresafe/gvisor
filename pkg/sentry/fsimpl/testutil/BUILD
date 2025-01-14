@@ -1,5 +1,7 @@
 load("//tools:defs.bzl", "go_library")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_library(
@@ -17,7 +19,6 @@ go_library(
         "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/memutil",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/fsimpl/tmpfs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
@@ -29,7 +30,10 @@ go_library(
         "//pkg/sentry/platform",
         "//pkg/sentry/platform/kvm",
         "//pkg/sentry/platform/ptrace",
+        "//pkg/sentry/seccheck",
+        "//pkg/sentry/socket/unix/transport",
         "//pkg/sentry/time",
+        "//pkg/sentry/usage",
         "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/usermem",

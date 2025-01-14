@@ -8,6 +8,7 @@
 package seqatomic
 
 import (
+	"context"
 	"sync/atomic"
 	"unsafe"
 )
@@ -31,7 +32,7 @@ func (p *AtomicPtr) savePtr() *Value {
 	return p.Load()
 }
 
-func (p *AtomicPtr) loadPtr(v *Value) {
+func (p *AtomicPtr) loadPtr(_ context.Context, v *Value) {
 	p.Store(v)
 }
 
@@ -46,4 +47,9 @@ func (p *AtomicPtr) Load() *Value {
 // Store sets the value returned by Load to x.
 func (p *AtomicPtr) Store(x *Value) {
 	atomic.StorePointer(&p.ptr, (unsafe.Pointer)(x))
+}
+
+// Swap atomically stores `x` into *p and returns the previous *p value.
+func (p *AtomicPtr) Swap(x *Value) *Value {
+	return (*Value)(atomic.SwapPointer(&p.ptr, (unsafe.Pointer)(x)))
 }

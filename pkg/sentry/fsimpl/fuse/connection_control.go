@@ -18,6 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 )
 
@@ -42,6 +43,9 @@ const (
 	// The FUSE_INIT_IN flags sent to the daemon.
 	// TODO(gvisor.dev/issue/3199): complete the flags.
 	fuseDefaultInitFlags = linux.FUSE_MAX_PAGES
+
+	// An INIT response needs to be at least this long.
+	minInitSize = 24
 )
 
 // Adjustable maximums for Connection's cogestion control parameters.
@@ -84,18 +88,21 @@ func (conn *connection) InitSend(creds *auth.Credentials, pid uint32) error {
 
 	req := conn.NewRequest(creds, pid, 0, linux.FUSE_INIT, &in)
 	// Since there is no task to block on and FUSE_INIT is the request
-	// to unblock other requests, use nil.
-	return conn.CallAsync(nil, req)
+	// to unblock other requests, use context.Background().
+	return conn.CallAsync(context.Background(), req)
 }
 
 // InitRecv receives a FUSE_INIT reply and process it.
 //
-// Preconditions: conn.asyncMu must not be held if minor verion is newer than 13.
+// Preconditions: conn.asyncMu must not be held if minor version is newer than 13.
 func (conn *connection) InitRecv(res *Response, hasSysAdminCap bool) error {
 	if err := res.Error(); err != nil {
 		return err
 	}
 
+	if res.DataLen() < minInitSize {
+		return linuxerr.EINVAL
+	}
 	initRes := fuseInitRes{initLen: res.DataLen()}
 	if err := res.UnmarshalPayload(&initRes); err != nil {
 		return err
@@ -108,7 +115,7 @@ func (conn *connection) InitRecv(res *Response, hasSysAdminCap bool) error {
 // It tries to acquire the conn.asyncMu lock if minor version is newer than 13.
 func (conn *connection) initProcessReply(out *linux.FUSEInitOut, hasSysAdminCap bool) error {
 	conn.mu.Lock()
-	// No matter error or not, always set initialzied.
+	// No matter error or not, always set initialized.
 	// to unblock the blocked requests.
 	defer func() {
 		conn.SetInitialized()
@@ -141,6 +148,7 @@ func (conn *connection) initProcessReply(out *linux.FUSEInitOut, hasSysAdminCap 
 		conn.bigWrites = out.Flags&linux.FUSE_BIG_WRITES != 0
 		conn.dontMask = out.Flags&linux.FUSE_DONT_MASK != 0
 		conn.writebackCache = out.Flags&linux.FUSE_WRITEBACK_CACHE != 0
+		conn.atomicOTrunc = out.Flags&linux.FUSE_ATOMIC_O_TRUNC != 0
 
 		// TODO(gvisor.dev/issue/3195): figure out how to use TimeGran (0 < TimeGran <= fuseMaxTimeGranNs).
 

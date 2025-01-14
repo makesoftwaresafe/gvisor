@@ -13,11 +13,15 @@
 // limitations under the License.
 
 #include <netinet/tcp.h>
+#include <sys/socket.h>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
 #include "test/syscalls/linux/socket_inet_loopback_test_params.h"
+#include "test/util/capability_util.h"
+#include "test/util/save_util.h"
 #include "test/util/socket_util.h"
 #include "test/util/test_util.h"
 
@@ -131,7 +135,7 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPPassiveCloseNoTimeWaitReuseTest) {
 // trigger FIN_WAIT2 state for the closed endpoint. Then it binds the same local
 // IP/port on a new socket and tries to connect. The connect should fail w/
 // an EADDRINUSE. Then we wait till the FIN_WAIT2 timeout is over and try the
-// connect again with a new socket and this time it should succeed.
+// bind/connect again with a new socket and this time it should succeed.
 //
 // TCP timers are not S/R today, this can cause this test to be flaky when run
 // under random S/R due to timer being reset on a restore.
@@ -139,6 +143,11 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPFinWait2Test) {
   SocketInetTestParam const& param = GetParam();
   TestAddress const& listener = param.listener;
   TestAddress const& connector = param.connector;
+
+  // Disable cooperative saves after this point. As a save between the first
+  // bind/connect and the second one can cause the linger timeout timer to
+  // be restarted causing the final bind/connect to fail.
+  DisableSave ds;
 
   // Create the listening socket.
   const FileDescriptor listen_fd = ASSERT_NO_ERRNO_AND_VALUE(
@@ -191,11 +200,6 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPFinWait2Test) {
   const FileDescriptor conn_fd2 = ASSERT_NO_ERRNO_AND_VALUE(
       Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
 
-  // Disable cooperative saves after this point. As a save between the first
-  // bind/connect and the second one can cause the linger timeout timer to
-  // be restarted causing the final bind/connect to fail.
-  DisableSave ds;
-
   ASSERT_THAT(bind(conn_fd2.get(), AsSockAddr(&conn_bound_addr), conn_addrlen),
               SyscallFailsWithErrno(EADDRINUSE));
 
@@ -203,7 +207,8 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPFinWait2Test) {
   // save/restore tests.
   absl::SleepFor(absl::Seconds(kTCPLingerTimeout + 2));
 
-  ds.reset();
+  ASSERT_THAT(bind(conn_fd2.get(), AsSockAddr(&conn_bound_addr), conn_addrlen),
+              SyscallSucceeds());
 
   ASSERT_THAT(
       RetryEINTR(connect)(conn_fd2.get(), AsSockAddr(&conn_addr), conn_addrlen),
@@ -264,7 +269,7 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPLinger2TimeoutAfterClose) {
   // across a S/R.
   {
     DisableSave ds;
-    constexpr int kTCPLingerTimeout = 5;
+    constexpr int kTCPLingerTimeout = 4;
     EXPECT_THAT(setsockopt(conn_fd.get(), IPPROTO_TCP, TCP_LINGER2,
                            &kTCPLingerTimeout, sizeof(kTCPLingerTimeout)),
                 SyscallSucceedsWithValue(0));
@@ -272,7 +277,7 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPLinger2TimeoutAfterClose) {
     // close the connecting FD to trigger FIN_WAIT2  on the connected fd.
     conn_fd.reset();
 
-    absl::SleepFor(absl::Seconds(kTCPLingerTimeout + 1));
+    absl::SleepFor(absl::Seconds(kTCPLingerTimeout + 2));
 
     // ds going out of scope will Re-enable S/R's since at this point the timer
     // must have fired and cleaned up the endpoint.
@@ -290,6 +295,65 @@ TEST_P(SocketInetLoopbackIsolatedTest, TCPLinger2TimeoutAfterClose) {
       SyscallSucceeds());
 }
 
+TEST_P(SocketInetLoopbackIsolatedTest, TCPConnectionReuseAddrConflicts) {
+  SocketInetTestParam const& param = GetParam();
+  TestAddress const& listener = param.listener;
+  TestAddress const& connector = param.connector;
+
+  const FileDescriptor listen_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Socket(listener.family(), SOCK_STREAM, 0));
+
+  sockaddr_storage listen_addr = listener.addr;
+  ASSERT_THAT(
+      bind(listen_fd.get(), AsSockAddr(&listen_addr), listener.addr_len),
+      SyscallSucceeds());
+  ASSERT_THAT(listen(listen_fd.get(), SOMAXCONN), SyscallSucceeds());
+
+  // Get the port bound by the listening socket.
+  socklen_t addrlen = listener.addr_len;
+  ASSERT_THAT(getsockname(listen_fd.get(), AsSockAddr(&listen_addr), &addrlen),
+              SyscallSucceeds());
+
+  const uint16_t port =
+      ASSERT_NO_ERRNO_AND_VALUE(AddrPort(listener.family(), listen_addr));
+
+  // Create a first connection.
+  FileDescriptor conn_fd1 = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+  ASSERT_THAT(setsockopt(conn_fd1.get(), SOL_SOCKET, SO_REUSEADDR, &kSockOptOn,
+                         sizeof(kSockOptOn)),
+              SyscallSucceeds());
+
+  sockaddr_storage conn_addr = connector.addr;
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd1.get(), AsSockAddr(&conn_addr),
+                                  connector.addr_len),
+              SyscallSucceeds());
+  sockaddr_storage conn_bound_addr;
+  addrlen = sizeof(conn_bound_addr);
+  ASSERT_THAT(
+      getsockname(conn_fd1.get(), AsSockAddr(&conn_bound_addr), &addrlen),
+      SyscallSucceeds());
+  ASSERT_EQ(addrlen, connector.addr_len);
+
+  // Create the second connection that is bind to the same local address as the
+  // first.
+  FileDescriptor conn_fd2 = ASSERT_NO_ERRNO_AND_VALUE(
+      Socket(connector.family(), SOCK_STREAM, IPPROTO_TCP));
+  ASSERT_THAT(setsockopt(conn_fd2.get(), SOL_SOCKET, SO_REUSEADDR, &kSockOptOn,
+                         sizeof(kSockOptOn)),
+              SyscallSucceeds());
+  // Bind should succeed.
+  ASSERT_THAT(bind(conn_fd2.get(), AsSockAddr(&conn_bound_addr), addrlen),
+              SyscallSucceeds());
+
+  // Connect should fail.
+  ASSERT_NO_ERRNO(SetAddrPort(connector.family(), &conn_addr, port));
+  ASSERT_THAT(RetryEINTR(connect)(conn_fd2.get(), AsSockAddr(&conn_addr),
+                                  connector.addr_len),
+              SyscallFailsWithErrno(EADDRNOTAVAIL));
+}
+
 INSTANTIATE_TEST_SUITE_P(All, SocketInetLoopbackIsolatedTest,
                          SocketInetLoopbackTestValues(),
                          DescribeSocketInetTestParam);
@@ -298,6 +362,9 @@ using SocketMultiProtocolInetLoopbackIsolatedTest =
     ::testing::TestWithParam<ProtocolTestParam>;
 
 TEST_P(SocketMultiProtocolInetLoopbackIsolatedTest, BindToDeviceReusePort) {
+  // setsockopt(SO_BINDTODEVICE) requires CAP_NET_RAW.
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveRawIPSocketCapability()));
+
   ProtocolTestParam const& param = GetParam();
   TestAddress const& test_addr = V4Loopback();
 

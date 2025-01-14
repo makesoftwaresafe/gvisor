@@ -18,8 +18,12 @@ package sys
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path"
 	"strconv"
+	"strings"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/coverage"
@@ -37,6 +41,7 @@ const (
 	defaultSysMode           = linux.FileMode(0444)
 	defaultSysDirMode        = linux.FileMode(0755)
 	defaultMaxCachedDentries = uint64(1000)
+	iommuGroupSysPath        = "/sys/kernel/iommu_groups/"
 )
 
 // FilesystemType implements vfs.FilesystemType.
@@ -51,6 +56,12 @@ type FilesystemType struct{}
 type InternalData struct {
 	// ProductName is the value to be set to devices/virtual/dmi/id/product_name.
 	ProductName string
+	// EnableTPUProxyPaths is whether to populate sysfs paths used by hardware
+	// accelerators.
+	EnableTPUProxyPaths bool
+	// TestSysfsPathPrefix is a prefix for the sysfs paths. It is useful for
+	// unit testing.
+	TestSysfsPathPrefix string
 }
 
 // filesystem implements vfs.FilesystemImpl.
@@ -103,7 +114,7 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	// cgroupfs, but the kernel creates the mountpoint. For the sentry, the
 	// launcher mounts cgroupfs.
 	if k.CgroupRegistry() != nil {
-		fsDirChildren["cgroup"] = fs.newDir(ctx, creds, defaultSysDirMode, nil)
+		fsDirChildren["cgroup"] = fs.newCgroupDir(ctx, creds, defaultSysDirMode, nil)
 	}
 
 	classSub := map[string]kernfs.Inode{
@@ -114,11 +125,55 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 			"cpu": cpuDir(ctx, fs, creds),
 		}),
 	}
+
 	productName := ""
+	busSub := make(map[string]kernfs.Inode)
+	kernelSub := kernelDir(ctx, fs, creds)
 	if opts.InternalData != nil {
-		data := opts.InternalData.(*InternalData)
-		productName = data.ProductName
+		idata := opts.InternalData.(*InternalData)
+		productName = idata.ProductName
+		if idata.EnableTPUProxyPaths {
+			deviceToIOMMUGroup, err := pciDeviceIOMMUGroups(path.Join(idata.TestSysfsPathPrefix, iommuGroupSysPath))
+			if err != nil {
+				return nil, nil, err
+			}
+			sysDevicesPath := path.Join(idata.TestSysfsPathPrefix, sysDevicesMainPath)
+			pciPaths, err := pciDevicePaths(sysDevicesPath)
+			if err != nil {
+				return nil, nil, err
+			}
+			sysDevicesSub, err := fs.mirrorSysDevicesDir(ctx, creds, sysDevicesPath, deviceToIOMMUGroup, pciPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+			for dir, sub := range sysDevicesSub {
+				devicesSub[dir] = sub
+			}
+
+			deviceDirs, err := fs.newDeviceClassDir(ctx, creds, []string{accelDevice, vfioDevice}, sysDevicesPath, pciPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+
+			for tpuDeviceType, symlinkDir := range deviceDirs {
+				classSub[tpuDeviceType] = fs.newDir(ctx, creds, defaultSysDirMode, symlinkDir)
+			}
+			pciDevicesSub, err := fs.newBusPCIDevicesDir(ctx, creds, pciPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+			busSub["pci"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"devices": fs.newDir(ctx, creds, defaultSysDirMode, pciDevicesSub),
+			})
+			iommuPath := path.Join(idata.TestSysfsPathPrefix, iommuGroupSysPath)
+			iommuGroups, err := fs.mirrorIOMMUGroups(ctx, creds, iommuPath, pciPaths)
+			if err != nil {
+				return nil, nil, err
+			}
+			kernelSub["iommu_groups"] = fs.newDir(ctx, creds, defaultSysDirMode, iommuGroups)
+		}
 	}
+
 	if len(productName) > 0 {
 		log.Debugf("Setting product_name: %q", productName)
 		classSub["dmi"] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
@@ -134,13 +189,13 @@ func (fsType FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.Virt
 	}
 	root := fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
 		"block":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
-		"bus":      fs.newDir(ctx, creds, defaultSysDirMode, nil),
+		"bus":      fs.newDir(ctx, creds, defaultSysDirMode, busSub),
 		"class":    fs.newDir(ctx, creds, defaultSysDirMode, classSub),
 		"dev":      fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"devices":  fs.newDir(ctx, creds, defaultSysDirMode, devicesSub),
 		"firmware": fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"fs":       fs.newDir(ctx, creds, defaultSysDirMode, fsDirChildren),
-		"kernel":   kernelDir(ctx, fs, creds),
+		"kernel":   fs.newDir(ctx, creds, defaultSysDirMode, kernelSub),
 		"module":   fs.newDir(ctx, creds, defaultSysDirMode, nil),
 		"power":    fs.newDir(ctx, creds, defaultSysDirMode, nil),
 	})
@@ -153,30 +208,156 @@ func cpuDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs
 	k := kernel.KernelFromContext(ctx)
 	maxCPUCores := k.ApplicationCores()
 	children := map[string]kernfs.Inode{
-		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
-		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
-		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, linux.FileMode(0444)),
+		"online":   fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
+		"possible": fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
+		"present":  fs.newCPUFile(ctx, creds, maxCPUCores, defaultSysMode),
 	}
+	// For consistency with /proc/cpuinfo, pretend all CPUs are in the same
+	// socket and each CPU is a distinct core.
+	fullMask := fullCPUMask(maxCPUCores) + "\n"
 	for i := uint(0); i < maxCPUCores; i++ {
-		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, linux.FileMode(0555), nil)
+		oneMask := oneCPUMask(i, maxCPUCores) + "\n"
+		children[fmt.Sprintf("cpu%d", i)] = fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+			"topology": fs.newDir(ctx, creds, defaultSysDirMode, map[string]kernfs.Inode{
+				"core_cpus":       fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+				"core_siblings":   fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"package_cpus":    fs.newStaticFile(ctx, creds, defaultSysMode, fullMask),
+				"thread_siblings": fs.newStaticFile(ctx, creds, defaultSysMode, oneMask),
+			}),
+		})
 	}
 	return fs.newDir(ctx, creds, defaultSysDirMode, children)
 }
 
-func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) kernfs.Inode {
+// fullCPUMask returns a "hex format ASCII string", consistent with Linux's
+// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
+// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
+// in which all `cores` CPUs are set.
+func fullCPUMask(cores uint) string {
+	var (
+		b   strings.Builder
+		sep string
+	)
+	if rem := cores % 32; rem != 0 {
+		cores -= rem
+		fmt.Fprintf(&b, "%x", (uint32(1)<<rem)-1)
+		sep = ","
+	}
+	for cores != 0 {
+		cores -= 32
+		fmt.Fprintf(&b, "%sffffffff", sep)
+		sep = ","
+	}
+	return b.String()
+}
+
+// oneCPUMask returns a "hex format ASCII string", consistent with Linux's
+// include/linux/cpumask.h:cpumap_print_to_pagebuf(list=false) =>
+// lib/bitmap.c:bitmap_print_to_pagebuf(list=false), representing a CPU bitmask
+// for `cores` CPUs in which only CPU `i` is set.
+//
+// Preconditions: i < cores.
+func oneCPUMask(i, cores uint) string {
+	var (
+		b   strings.Builder
+		sep string
+	)
+	word := func() (w uint32) {
+		if cores <= i {
+			w = uint32(1) << (i - cores)
+		}
+		return
+	}
+	if rem := cores % 32; rem != 0 {
+		cores -= rem
+		chars := (rem + 3) / 4 // 4 bits per hex character
+		fmt.Fprintf(&b, "%0*x", chars, word())
+		sep = ","
+	}
+	for cores != 0 {
+		cores -= 32
+		fmt.Fprintf(&b, "%s%08x", sep, word())
+		sep = ","
+	}
+	return b.String()
+}
+
+// Returns a map from a PCI device name to its IOMMU group if available.
+func pciDeviceIOMMUGroups(iommuGroupsPath string) (map[string]string, error) {
+	// IOMMU groups are organized as iommu_group_path/$GROUP, where $GROUP is
+	// the IOMMU group number of which the device is a member.
+	iommuGroupNums, err := hostDirEntries(iommuGroupsPath)
+	if err != nil {
+		// When IOMMU is not enabled, skip the rest of the process.
+		if err == unix.ENOENT {
+			return nil, nil
+		}
+		return nil, err
+	}
+	// The returned map from PCI device name to its IOMMU group.
+	iommuGroups := map[string]string{}
+	for _, iommuGroupNum := range iommuGroupNums {
+		groupDevicesPath := path.Join(iommuGroupsPath, iommuGroupNum, "devices")
+		pciDeviceNames, err := hostDirEntries(groupDevicesPath)
+		if err != nil {
+			return nil, err
+		}
+		// An IOMMU group may include multiple devices.
+		for _, pciDeviceName := range pciDeviceNames {
+			iommuGroups[pciDeviceName] = iommuGroupNum
+		}
+	}
+	return iommuGroups, nil
+}
+
+func kernelDir(ctx context.Context, fs *filesystem, creds *auth.Credentials) map[string]kernfs.Inode {
 	// Set up /sys/kernel/debug/kcov. Technically, debugfs should be
 	// mounted at debug/, but for our purposes, it is sufficient to keep it
 	// in sys.
-	var children map[string]kernfs.Inode
+	children := make(map[string]kernfs.Inode)
 	if coverage.KcovSupported() {
 		log.Debugf("Set up /sys/kernel/debug/kcov")
-		children = map[string]kernfs.Inode{
-			"debug": fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{
-				"kcov": fs.newKcovFile(ctx, creds),
-			}),
+		children["debug"] = fs.newDir(ctx, creds, linux.FileMode(0700), map[string]kernfs.Inode{
+			"kcov": fs.newKcovFile(ctx, creds),
+		})
+	}
+	return children
+}
+
+// Recursively build out IOMMU directories from the host.
+func (fs *filesystem) mirrorIOMMUGroups(ctx context.Context, creds *auth.Credentials, dir string, pciPaths map[string]string) (map[string]kernfs.Inode, error) {
+	subs := map[string]kernfs.Inode{}
+	dents, err := hostDirEntries(dir)
+	if err != nil {
+		// TPU before v5 doesn't need IOMMU, skip the whole process for the backward compatibility when the directory can't be found.
+		if err == unix.ENOENT {
+			log.Debugf("Skip the path at %v which cannot be found.", dir)
+			return nil, nil
+		}
+		return nil, err
+	}
+	for _, dent := range dents {
+		absPath := path.Join(dir, dent)
+		mode, err := hostFileMode(absPath)
+		if err != nil {
+			return nil, err
+		}
+		switch mode {
+		case unix.S_IFDIR:
+			contents, err := fs.mirrorIOMMUGroups(ctx, creds, absPath, pciPaths)
+			if err != nil {
+				return nil, err
+			}
+			subs[dent] = fs.newDir(ctx, creds, defaultSysMode, contents)
+		case unix.S_IFREG:
+			subs[dent] = fs.newHostFile(ctx, creds, defaultSysMode, absPath)
+		case unix.S_IFLNK:
+			if pciDeviceRegex.MatchString(dent) {
+				subs[dent] = kernfs.NewStaticSymlink(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), fmt.Sprintf("../../../../devices/%s", pciPaths[dent]))
+			}
 		}
 	}
-	return fs.newDir(ctx, creds, defaultSysDirMode, children)
+	return subs, nil
 }
 
 // Release implements vfs.FilesystemImpl.Release.
@@ -197,9 +378,12 @@ type dir struct {
 	dirRefs
 	kernfs.InodeAlwaysValid
 	kernfs.InodeAttrs
-	kernfs.InodeNotSymlink
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
+	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 	kernfs.OrderedChildren
 
 	locks vfs.FileLocks
@@ -214,6 +398,15 @@ func (fs *filesystem) newDir(ctx context.Context, creds *auth.Credentials, mode 
 	return d
 }
 
+func (fs *filesystem) newCgroupDir(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, contents map[string]kernfs.Inode) kernfs.Inode {
+	d := &cgroupDir{}
+	d.InodeAttrs.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0755)
+	d.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
+	d.InitRefs()
+	d.IncLinks(d.OrderedChildren.Populate(contents))
+	return d
+}
+
 // SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
 func (*dir) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return linuxerr.EPERM
@@ -221,6 +414,8 @@ func (*dir) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.Set
 
 // Open implements kernfs.Inode.Open.
 func (d *dir) Open(ctx context.Context, rp *vfs.ResolvingPath, kd *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
+	opts.Flags &= linux.O_ACCMODE | linux.O_CREAT | linux.O_EXCL | linux.O_TRUNC |
+		linux.O_DIRECTORY | linux.O_NOFOLLOW | linux.O_NONBLOCK | linux.O_NOCTTY
 	fd, err := kernfs.NewGenericDirectoryFD(rp.Mount(), kd, &d.OrderedChildren, &d.locks, &opts, kernfs.GenericDirectoryFDOptions{
 		SeekEnd: kernfs.SeekEndStaticEntries,
 	})
@@ -238,6 +433,18 @@ func (d *dir) DecRef(ctx context.Context) {
 // StatFS implements kernfs.Inode.StatFS.
 func (d *dir) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, error) {
 	return vfs.GenericStatFS(linux.SYSFS_MAGIC), nil
+}
+
+// cgroupDir implements kernfs.Inode.
+//
+// +stateify savable
+type cgroupDir struct {
+	dir
+}
+
+// StatFS implements kernfs.Inode.StatFS.
+func (d *cgroupDir) StatFS(ctx context.Context, fs *vfs.Filesystem) (linux.Statfs, error) {
+	return vfs.GenericStatFS(linux.TMPFS_MAGIC), nil
 }
 
 // cpuFile implements kernfs.Inode.
@@ -280,4 +487,30 @@ func (fs *filesystem) newStaticFile(ctx context.Context, creds *auth.Credentials
 	s := &staticFile{StaticData: vfs.StaticData{Data: data}}
 	s.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), s, mode)
 	return s
+}
+
+// hostFile is an inode whose contents are generated by reading from the
+// host.
+//
+// +stateify savable
+type hostFile struct {
+	kernfs.DynamicBytesFile
+	hostPath string
+}
+
+func (hf *hostFile) Generate(ctx context.Context, buf *bytes.Buffer) error {
+	fd, err := unix.Openat(-1, hf.hostPath, unix.O_RDONLY|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	file := os.NewFile(uintptr(fd), hf.hostPath)
+	defer file.Close()
+	_, err = buf.ReadFrom(file)
+	return err
+}
+
+func (fs *filesystem) newHostFile(ctx context.Context, creds *auth.Credentials, mode linux.FileMode, hostPath string) kernfs.Inode {
+	hf := &hostFile{hostPath: hostPath}
+	hf.Init(ctx, creds, linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), hf, mode)
+	return hf
 }

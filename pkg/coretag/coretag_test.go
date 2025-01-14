@@ -16,31 +16,40 @@ package coretag
 
 import (
 	"os"
+	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/hostos"
 )
 
 func TestEnable(t *testing.T) {
-	major, minor, err := hostos.KernelVersion()
+	version, err := hostos.KernelVersion()
 	if err != nil {
 		t.Fatalf("Unable to parse kernel version: %v", err)
 	}
 	// Skip running test when running on Linux kernel < 5.14 because core tagging
 	// is not available.
-	if major < 5 && minor < 14 {
-		t.Skipf("Running on Linux kernel: %d.%d < 5.14. Core tagging not available. Skipping test.", major, minor)
+	if version.LessThan(5, 14) {
+		t.Skipf("Running on Linux kernel: %s < 5.14. Core tagging not available. Skipping test.", version)
 		return
 	}
 	if err := Enable(); err != nil {
 		t.Fatalf("Enable() got error %v, wanted nil", err)
 	}
 
-	coreTags, err := GetAllCoreTags(os.Getpid())
+	pid := os.Getpid()
+	coreTags, err := GetAllCoreTags(pid)
 	if err != nil {
 		t.Fatalf("GetAllCoreTags() got error %v, wanted nil", err)
 	}
 	if len(coreTags) != 1 {
 		t.Fatalf("Got coreTags %v, wanted len(coreTags)=1", coreTags)
+	}
+	coreTagsSelf, err := GetAllCoreTags(0)
+	if err != nil {
+		t.Fatalf("GetAllCoreTags(0) got error %v, wanted nil", err)
+	}
+	if !reflect.DeepEqual(coreTags, coreTagsSelf) {
+		t.Fatalf("Got different coreTags for PID %d vs self: %v vs %v", pid, coreTags, coreTagsSelf)
 	}
 }

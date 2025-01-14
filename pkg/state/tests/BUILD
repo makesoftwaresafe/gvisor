@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "tests",
@@ -36,8 +39,5 @@ go_test(
         "struct_test.go",
     ],
     library = ":tests",
-    deps = [
-        "//pkg/state",
-        "//pkg/state/wire",
-    ],
+    deps = ["//pkg/state"],
 )

@@ -15,14 +15,16 @@
 package fuse
 
 import (
+	goContext "context"
 	"sync"
 
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/log"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -176,13 +178,27 @@ type connection struct {
 	// Negotiated and only set in INIT.
 	bigWrites bool
 
-	// dontMask if filestestem does not apply umask to creation modes.
+	// dontMask if filesystem does not apply umask to creation modes.
 	// Negotiated in INIT.
 	dontMask bool
 
 	// noOpen if FUSE server doesn't support open operation.
-	// This flag only influence performance, not correctness of the program.
+	// This flag only influences performance, not correctness of the program.
 	noOpen bool
+}
+
+func connError(err error) error {
+	// The error may contain arbitrary errno values that can't be converted.
+	switch e := err.(type) {
+	case unix.Errno:
+		if syserr.IsValid(e) {
+			return err
+		}
+	default:
+		return err
+	}
+	log.Warningf("fusefs: failed with invalid error: %v", err)
+	return unix.EINVAL
 }
 
 func (conn *connection) saveInitializedChan() bool {
@@ -194,7 +210,7 @@ func (conn *connection) saveInitializedChan() bool {
 	}
 }
 
-func (conn *connection) loadInitializedChan(closed bool) {
+func (conn *connection) loadInitializedChan(_ goContext.Context, closed bool) {
 	conn.initializedChan = make(chan struct{}, 1)
 	if closed {
 		close(conn.initializedChan)
@@ -210,11 +226,8 @@ func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOpti
 	// mount another filesystem.
 
 	// Create the writeBuf for the header to be stored in.
-	hdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
-	fuseFD.writeBuf = make([]byte, hdrLen)
 	fuseFD.completions = make(map[linux.FUSEOpID]*futureResponse)
 	fuseFD.fullQueueCh = make(chan struct{}, opts.maxActiveRequests)
-	fuseFD.writeCursor = 0
 
 	return &connection{
 		fd:                       fuseFD,
@@ -230,9 +243,9 @@ func newFUSEConnection(_ context.Context, fuseFD *DeviceFD, opts *filesystemOpti
 
 // CallAsync makes an async (aka background) request.
 // It's a simple wrapper around Call().
-func (conn *connection) CallAsync(t *kernel.Task, r *Request) error {
+func (conn *connection) CallAsync(ctx context.Context, r *Request) error {
 	r.async = true
-	_, err := conn.Call(t, r)
+	_, err := conn.Call(ctx, r)
 	return err
 }
 
@@ -254,11 +267,11 @@ func (conn *connection) CallAsync(t *kernel.Task, r *Request) error {
 //
 // The forget request does not have a reply,
 // as documented in include/uapi/linux/fuse.h:FUSE_FORGET.
-func (conn *connection) Call(t *kernel.Task, r *Request) (*Response, error) {
-	// Block requests sent before connection is initalized.
+func (conn *connection) Call(ctx context.Context, r *Request) (*Response, error) {
+	// Block requests sent before connection is initialized.
 	if !conn.Initialized() && r.hdr.Opcode != linux.FUSE_INIT {
-		if err := t.Block(conn.initializedChan); err != nil {
-			return nil, err
+		if err := ctx.Block(conn.initializedChan); err != nil {
+			return nil, connError(err)
 		}
 	}
 
@@ -278,19 +291,23 @@ func (conn *connection) Call(t *kernel.Task, r *Request) (*Response, error) {
 		return nil, linuxerr.ECONNREFUSED
 	}
 
-	fut, err := conn.callFuture(t, r)
+	fut, err := conn.callFuture(ctx, r)
 	conn.fd.mu.Unlock()
 	if err != nil {
-		return nil, err
+		return nil, connError(err)
 	}
 
-	return fut.resolve(t)
+	res, err := fut.resolve(ctx)
+	if err != nil {
+		return res, connError(err)
+	}
+	return res, nil
 }
 
 // callFuture makes a request to the server and returns a future response.
 // Call resolve() when the response needs to be fulfilled.
 // +checklocks:conn.fd.mu
-func (conn *connection) callFuture(t *kernel.Task, r *Request) (*futureResponse, error) {
+func (conn *connection) callFuture(b context.Blocker, r *Request) (*futureResponse, error) {
 	// Is the queue full?
 	//
 	// We must busy wait here until the request can be queued. We don't
@@ -306,19 +323,19 @@ func (conn *connection) callFuture(t *kernel.Task, r *Request) (*futureResponse,
 		log.Infof("Blocking request %v from being queued. Too many active requests: %v",
 			r.id, conn.fd.numActiveRequests)
 		conn.fd.mu.Unlock()
-		err := t.Block(conn.fd.fullQueueCh)
+		err := b.Block(conn.fd.fullQueueCh)
 		conn.fd.mu.Lock()
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	return conn.callFutureLocked(t, r)
+	return conn.callFutureLocked(r)
 }
 
 // callFutureLocked makes a request to the server and returns a future response.
 // +checklocks:conn.fd.mu
-func (conn *connection) callFutureLocked(t *kernel.Task, r *Request) (*futureResponse, error) {
+func (conn *connection) callFutureLocked(r *Request) (*futureResponse, error) {
 	// Check connected again holding conn.mu.
 	conn.mu.Lock()
 	if !conn.connected {

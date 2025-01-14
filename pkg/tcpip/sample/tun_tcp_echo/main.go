@@ -25,16 +25,14 @@ import (
 	"flag"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip/link/tun"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -44,7 +42,7 @@ import (
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
-var tap = flag.Bool("tap", false, "use tap istead of tun")
+var tap = flag.Bool("tap", false, "use tap instead of tun")
 var mac = flag.String("mac", "aa:00:01:01:01:01", "mac address to use in tap device")
 
 type endpointWriter struct {
@@ -87,13 +85,17 @@ func echo(wq *waiter.Queue, ep tcpip.Endpoint) {
 	}
 
 	for {
-		_, err := ep.Read(&w, tcpip.ReadOptions{})
-		if err != nil {
+		var buf bytes.Buffer
+		if _, err := ep.Read(&buf, tcpip.ReadOptions{}); err != nil {
 			if _, ok := err.(*tcpip.ErrWouldBlock); ok {
 				<-notifyCh
 				continue
 			}
 
+			return
+		}
+
+		if _, err := w.Write(buf.Bytes()); err != nil {
 			return
 		}
 	}
@@ -108,8 +110,6 @@ func main() {
 	tunName := flag.Arg(0)
 	addrName := flag.Arg(1)
 	portName := flag.Arg(2)
-
-	rand.Seed(time.Now().UnixNano())
 
 	// Parse the mac address.
 	maddr, err := net.ParseMAC(*mac)
@@ -126,10 +126,10 @@ func main() {
 	var addrWithPrefix tcpip.AddressWithPrefix
 	var proto tcpip.NetworkProtocolNumber
 	if parsedAddr.To4() != nil {
-		addrWithPrefix = tcpip.Address(parsedAddr.To4()).WithPrefix()
+		addrWithPrefix = tcpip.AddrFromSlice(parsedAddr.To4()).WithPrefix()
 		proto = ipv4.ProtocolNumber
 	} else if parsedAddr.To16() != nil {
-		addrWithPrefix = tcpip.Address(parsedAddr.To16()).WithPrefix()
+		addrWithPrefix = tcpip.AddrFromSlice(parsedAddr.To16()).WithPrefix()
 		proto = ipv6.ProtocolNumber
 	} else {
 		log.Fatalf("Unknown IP type: %v", addrName)
@@ -183,7 +183,7 @@ func main() {
 		log.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", 1, protocolAddr, err)
 	}
 
-	subnet, err := tcpip.NewSubnet(tcpip.Address(strings.Repeat("\x00", len(addrWithPrefix.Address))), tcpip.AddressMask(strings.Repeat("\x00", len(addrWithPrefix.Address))))
+	subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice([]byte(strings.Repeat("\x00", addrWithPrefix.Address.Len()))), tcpip.MaskFrom(strings.Repeat("\x00", addrWithPrefix.Address.Len())))
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func main() {
 
 	defer ep.Close()
 
-	if err := ep.Bind(tcpip.FullAddress{0, "", uint16(localPort)}); err != nil {
+	if err := ep.Bind(tcpip.FullAddress{Port: uint16(localPort)}); err != nil {
 		log.Fatal("Bind failed: ", err)
 	}
 

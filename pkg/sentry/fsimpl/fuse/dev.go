@@ -29,6 +29,9 @@ import (
 
 const fuseDevMinor = 229
 
+// This is equivalent to linux.SizeOfFUSEHeaderIn
+const fuseHeaderOutSize = 16
+
 // fuseDevice implements vfs.Device for /dev/fuse.
 //
 // +stateify savable
@@ -36,10 +39,6 @@ type fuseDevice struct{}
 
 // Open implements vfs.Device.Open.
 func (fuseDevice) Open(ctx context.Context, mnt *vfs.Mount, vfsd *vfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	if !kernel.FUSEEnabled {
-		return nil, linuxerr.ENOENT
-	}
-
 	var fd DeviceFD
 	if err := fd.vfsfd.Init(&fd, opts.Flags, mnt, vfsd, &vfs.FileDescriptionOptions{
 		UseDentryMetadata: true,
@@ -88,17 +87,10 @@ type DeviceFD struct {
 	// +checklocks:mu
 	completions map[linux.FUSEOpID]*futureResponse
 
-	// +checklocks:mu
-	writeCursor uint32
-
 	// writeBuf is the memory buffer used to copy in the FUSE out header from
 	// userspace.
 	// +checklocks:mu
-	writeBuf []byte
-
-	// writeCursorFR current FR being copied from server.
-	// +checklocks:mu
-	writeCursorFR *futureResponse
+	writeBuf [fuseHeaderOutSize]byte
 
 	// conn is the FUSE connection that this FD is being used for.
 	// +checklocks:mu
@@ -148,25 +140,18 @@ func (fd *DeviceFD) PRead(ctx context.Context, dst usermem.IOSequence, offset in
 
 // Read implements vfs.FileDescriptionImpl.Read.
 func (fd *DeviceFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
-	// Operations on /dev/fuse don't make sense until a FUSE filesystem is
-	// mounted. If there is an active connection we know there is at least one
-	// filesystem mounted.
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
 	if !fd.connected() {
 		return 0, linuxerr.EPERM
 	}
-
 	// We require that any Read done on this filesystem have a sane minimum
 	// read buffer. It must have the capacity for the fixed parts of any request
 	// header (Linux uses the request header and the FUSEWriteIn header for this
 	// calculation) + the negotiated MaxWrite room for the data.
 	minBuffSize := linux.FUSE_MIN_READ_BUFFER
-	inHdrLen := uint32((*linux.FUSEHeaderIn)(nil).SizeBytes())
-	writeHdrLen := uint32((*linux.FUSEWriteIn)(nil).SizeBytes())
-
 	fd.conn.mu.Lock()
-	negotiatedMinBuffSize := inHdrLen + writeHdrLen + fd.conn.maxWrite
+	negotiatedMinBuffSize := linux.SizeOfFUSEHeaderIn + linux.SizeOfFUSEHeaderOut + fd.conn.maxWrite
 	fd.conn.mu.Unlock()
 	if minBuffSize < negotiatedMinBuffSize {
 		minBuffSize = negotiatedMinBuffSize
@@ -176,52 +161,32 @@ func (fd *DeviceFD) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.R
 	if dst.NumBytes() < int64(minBuffSize) {
 		return 0, linuxerr.EINVAL
 	}
-	return fd.readLocked(ctx, dst, opts)
-}
-
-// readLocked implements the reading of the fuse device while locked with DeviceFD.mu.
-//
-// Preconditions: dst is large enough for any reasonable request.
-// +checklocks:fd.mu
-func (fd *DeviceFD) readLocked(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// Find the first valid request. For the normal case this loop only executes
+	// once.
 	var req *Request
-
-	// Find the first valid request.
-	// For the normal case this loop only execute once.
-	for !fd.queue.Empty() {
-		req = fd.queue.Front()
-
+	for req = fd.queue.Front(); !fd.queue.Empty(); req = fd.queue.Front() {
 		if int64(req.hdr.Len) <= dst.NumBytes() {
 			break
 		}
-
-		// The request is too large. Cannot process it. All requests must be smaller than the
-		// negotiated size as specified by Connection.MaxWrite set as part of the FUSE_INIT
-		// handshake.
+		// The request is too large so we cannot process it. All requests must be
+		// smaller than the negotiated size as specified by Connection.MaxWrite set
+		// as part of the FUSE_INIT handshake.
 		errno := -int32(unix.EIO)
 		if req.hdr.Opcode == linux.FUSE_SETXATTR {
 			errno = -int32(unix.E2BIG)
 		}
 
-		// Return the error to the calling task.
 		if err := fd.sendError(ctx, errno, req.hdr.Unique); err != nil {
 			return 0, err
 		}
-
-		// We're done with this request.
 		fd.queue.Remove(req)
 		req = nil
 	}
-
 	if req == nil {
 		return 0, linuxerr.ErrWouldBlock
 	}
 
 	// We already checked the size: dst must be able to fit the whole request.
-	// Now we write the marshalled header, the payload,
-	// and the potential additional payload
-	// to the user memory IOSequence.
-
 	n, err := dst.CopyOut(ctx, req.data)
 	if err != nil {
 		return 0, err
@@ -229,16 +194,12 @@ func (fd *DeviceFD) readLocked(ctx context.Context, dst usermem.IOSequence, opts
 	if n != len(req.data) {
 		return 0, linuxerr.EIO
 	}
-
-	// Fully done with this req, remove it from the queue.
 	fd.queue.Remove(req)
-
-	// Remove noReply ones from map of requests expecting a reply.
+	// Remove noReply ones from the map of requests expecting a reply.
 	if req.noReply {
-		fd.numActiveRequests -= 1
+		fd.numActiveRequests--
 		delete(fd.completions, req.hdr.Unique)
 	}
-
 	return int64(n), nil
 }
 
@@ -260,121 +221,54 @@ func (fd *DeviceFD) PWrite(ctx context.Context, src usermem.IOSequence, offset i
 func (fd *DeviceFD) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	return fd.writeLocked(ctx, src, opts)
-}
-
-// writeLocked implements writing to the fuse device while locked with DeviceFD.mu.
-// +checklocks:fd.mu
-func (fd *DeviceFD) writeLocked(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
-	// Operations on /dev/fuse don't make sense until a FUSE filesystem is
-	// mounted. If there is an active connection we know there is at least one
-	// filesystem mounted.
 	if !fd.connected() {
 		return 0, linuxerr.EPERM
 	}
 
-	var cn, n int64
-	hdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
+	var hdr linux.FUSEHeaderOut
+	if src.NumBytes() < int64(hdr.SizeBytes()) {
+		return 0, linuxerr.EINVAL
+	}
+	n, err := src.CopyIn(ctx, fd.writeBuf[:])
+	if err != nil {
+		return 0, err
+	}
+	hdr.UnmarshalBytes(fd.writeBuf[:])
+	if src.NumBytes() != int64(hdr.Len) {
+		return 0, linuxerr.EINVAL
+	}
 
-	for src.NumBytes() > 0 {
-		if fd.writeCursorFR != nil {
-			// Already have common header, and we're now copying the payload.
-			wantBytes := fd.writeCursorFR.hdr.Len
+	fut, ok := fd.completions[hdr.Unique]
+	if !ok {
+		// Server sent us a response for a request we never sent, or for which we
+		// already received a reply (e.g. aborted), an unlikely event.
+		return 0, linuxerr.EINVAL
+	}
+	delete(fd.completions, hdr.Unique)
 
-			// Note that the FR data doesn't have the header. Copy it over if its necessary.
-			if fd.writeCursorFR.data == nil {
-				fd.writeCursorFR.data = make([]byte, wantBytes)
-			}
-
-			bytesCopied, err := src.CopyIn(ctx, fd.writeCursorFR.data[fd.writeCursor:wantBytes])
-			if err != nil {
-				return 0, err
-			}
-			src = src.DropFirst(bytesCopied)
-
-			cn = int64(bytesCopied)
-			n += cn
-			fd.writeCursor += uint32(cn)
-			if fd.writeCursor == wantBytes {
-				// Done reading this full response. Clean up and unblock the
-				// initiator.
-				break
-			}
-
-			// Check if we have more data in src.
-			continue
-		}
-
-		// Assert that the header isn't read into the writeBuf yet.
-		if fd.writeCursor >= hdrLen {
-			return 0, linuxerr.EINVAL
-		}
-
-		// We don't have the full common response header yet.
-		wantBytes := hdrLen - fd.writeCursor
-		bytesCopied, err := src.CopyIn(ctx, fd.writeBuf[fd.writeCursor:wantBytes])
+	// Copy over the header into the future response. The rest of the payload
+	// will be copied over to the FR's data in the next iteration.
+	fut.hdr = &hdr
+	fut.data = make([]byte, fut.hdr.Len)
+	copy(fut.data, fd.writeBuf[:])
+	if fut.hdr.Len > uint32(len(fd.writeBuf)) {
+		src = src.DropFirst(len(fd.writeBuf))
+		n2, err := src.CopyIn(ctx, fut.data[len(fd.writeBuf):])
 		if err != nil {
 			return 0, err
 		}
-		src = src.DropFirst(bytesCopied)
-
-		cn = int64(bytesCopied)
-		n += cn
-		fd.writeCursor += uint32(cn)
-		if fd.writeCursor == hdrLen {
-			// Have full header in the writeBuf. Use it to fetch the actual futureResponse
-			// from the device's completions map.
-			var hdr linux.FUSEHeaderOut
-			hdr.UnmarshalBytes(fd.writeBuf)
-
-			// We have the header now and so the writeBuf has served its purpose.
-			// We could reset it manually here but instead of doing that, at the
-			// end of the write, the writeCursor will be set to 0 thereby allowing
-			// the next request to overwrite whats in the buffer,
-
-			fut, ok := fd.completions[hdr.Unique]
-			if !ok {
-				// Server sent us a response for a request we never sent,
-				// or for which we already received a reply (e.g. aborted), an unlikely event.
-				return 0, linuxerr.EINVAL
-			}
-
-			delete(fd.completions, hdr.Unique)
-
-			// Copy over the header into the future response. The rest of the payload
-			// will be copied over to the FR's data in the next iteration.
-			fut.hdr = &hdr
-			fd.writeCursorFR = fut
-
-			// Next iteration will now try read the complete request, if src has
-			// any data remaining. Otherwise we're done.
-		}
+		n += n2
 	}
-
-	if fd.writeCursorFR != nil {
-		if err := fd.sendResponse(ctx, fd.writeCursorFR); err != nil {
-			return 0, err
-		}
-
-		// Ready the device for the next request.
-		fd.writeCursorFR = nil
-		fd.writeCursor = 0
+	if err := fd.sendResponse(ctx, fut); err != nil {
+		return 0, err
 	}
-
-	return n, nil
+	return int64(n), nil
 }
 
 // Readiness implements vfs.FileDescriptionImpl.Readiness.
 func (fd *DeviceFD) Readiness(mask waiter.EventMask) waiter.EventMask {
 	fd.mu.Lock()
 	defer fd.mu.Unlock()
-	return fd.readinessLocked(mask)
-}
-
-// readinessLocked implements checking the readiness of the fuse device while
-// locked with DeviceFD.mu.
-// +checklocks:fd.mu
-func (fd *DeviceFD) readinessLocked(mask waiter.EventMask) waiter.EventMask {
 	var ready waiter.EventMask
 
 	if !fd.connected() {
@@ -452,9 +346,8 @@ func (fd *DeviceFD) sendResponse(ctx context.Context, fut *futureResponse) error
 // +checklocks:fd.mu
 func (fd *DeviceFD) sendError(ctx context.Context, errno int32, unique linux.FUSEOpID) error {
 	// Return the error to the calling task.
-	outHdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
 	respHdr := linux.FUSEHeaderOut{
-		Len:    outHdrLen,
+		Len:    linux.SizeOfFUSEHeaderOut,
 		Error:  errno,
 		Unique: unique,
 	}

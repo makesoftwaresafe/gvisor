@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "bzl_library", "go_binary")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_binary(
     name = "runner",
@@ -8,12 +11,16 @@ go_binary(
     srcs = ["main.go"],
     data = [
         "//runsc",
+        "//test/runner/fuse",
         "//test/runner/setup_container",
     ],
     visibility = ["//:sandbox"],
     deps = [
+        "//pkg/cleanup",
         "//pkg/log",
         "//pkg/sentry/seccheck",
+        "//pkg/state/pretty",
+        "//pkg/state/statefile",
         "//pkg/test/testutil",
         "//runsc/specutils",
         "//test/runner/gtest",

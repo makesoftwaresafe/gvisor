@@ -91,21 +91,6 @@ func GetNS(nst specs.LinuxNamespaceType, s *specs.Spec) (specs.LinuxNamespace, b
 	return specs.LinuxNamespace{}, false
 }
 
-// FilterNS returns a slice of namespaces from the spec with types that match
-// those in the `filter` slice.
-func FilterNS(filter []specs.LinuxNamespaceType, s *specs.Spec) []specs.LinuxNamespace {
-	if s.Linux == nil {
-		return nil
-	}
-	var out []specs.LinuxNamespace
-	for _, nst := range filter {
-		if ns, ok := GetNS(nst, s); ok {
-			out = append(out, ns)
-		}
-	}
-	return out
-}
-
 // setNS sets the namespace of the given type.  It must be called with
 // OSThreadLocked.
 func setNS(fd, nsType uintptr) error {
@@ -119,7 +104,7 @@ func setNS(fd, nsType uintptr) error {
 // that will restore the namespace to the original value.
 //
 // Preconditions: Must be called with os thread locked.
-func ApplyNS(ns specs.LinuxNamespace) (func(), error) {
+func ApplyNS(ns specs.LinuxNamespace) (func() error, error) {
 	log.Infof("Applying namespace %v at path %q", ns.Type, ns.Path)
 	newNS, err := os.Open(ns.Path)
 	if err != nil {
@@ -140,27 +125,49 @@ func ApplyNS(ns specs.LinuxNamespace) (func(), error) {
 		oldNS.Close()
 		return nil, fmt.Errorf("error setting namespace of type %v and path %q: %v", ns.Type, ns.Path, err)
 	}
-	return func() {
+	return func() error {
 		log.Infof("Restoring namespace %v", ns.Type)
 		defer oldNS.Close()
 		if err := setNS(oldNS.Fd(), flag); err != nil {
-			panic(fmt.Sprintf("error restoring namespace: of type %v: %v", ns.Type, err))
+			return fmt.Errorf("error restoring namespace: of type %v: %v", ns.Type, err)
 		}
+		return nil
 	}, nil
 }
 
 // StartInNS joins or creates the given namespaces and calls cmd.Start before
 // restoring the namespaces to the original values.
 func StartInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
-	// We are about to setup namespaces, which requires the os thread being
-	// locked so that Go doesn't change the thread out from under us.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	errChan := make(chan error)
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
+		rstFuncs, err := startInNS(cmd, nss)
+		errChan <- err
+		for _, rstFunc := range rstFuncs {
+			err := rstFunc()
+			if err == nil {
+				continue
+			}
+
+			// One or more namespaces have not been restored, but
+			// we can't destroy the current system thread, because
+			// a child process is execited with Pdeathsig.
+			log.Debugf("Block the current system thread due to: %s", err)
+			c := make(chan any)
+			<-c
+		}
+	}()
+	return <-errChan
+}
+
+func startInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) ([]func() error, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &unix.SysProcAttr{}
 	}
 
+	var deferFuncs []func() error
 	for _, ns := range nss {
 		if ns.Path == "" {
 			// No path.  Just set a flag to create a new namespace.
@@ -171,12 +178,12 @@ func StartInNS(cmd *exec.Cmd, nss []specs.LinuxNamespace) error {
 		// before exiting.
 		restoreNS, err := ApplyNS(ns)
 		if err != nil {
-			return err
+			return deferFuncs, err
 		}
-		defer restoreNS()
+		deferFuncs = append(deferFuncs, restoreNS)
 	}
 
-	return cmd.Start()
+	return deferFuncs, cmd.Start()
 }
 
 // SetUIDGIDMappings sets the given uid/gid mappings from the spec on the cmd.
@@ -207,7 +214,7 @@ func SetUIDGIDMappings(cmd *exec.Cmd, s *specs.Spec) {
 
 // HasCapabilities returns true if the user has all capabilities in 'cs'.
 func HasCapabilities(cs ...capability.Cap) bool {
-	caps, err := capability.NewPid2(os.Getpid())
+	caps, err := capability.NewPid2(0)
 	if err != nil {
 		return false
 	}
@@ -256,6 +263,10 @@ func MaybeRunAsRoot() error {
 
 		// Make sure child is killed when the parent terminates.
 		Pdeathsig: unix.SIGKILL,
+
+		// Detach from session. Otherwise, signals sent to the foreground process
+		// will also be forwarded by this process, resulting in duplicate signals.
+		Setsid: true,
 	}
 
 	cmd.Env = os.Environ()

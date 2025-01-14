@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test", "more_shards")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_test(
     name = "tcp_test",
@@ -12,7 +15,6 @@ go_test(
         "//pkg/buffer",
         "//pkg/rand",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
@@ -40,7 +42,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -75,8 +76,8 @@ go_test(
     srcs = ["forwarder_test.go"],
     deps = [
         ":e2e",
+        "//pkg/atomicbitops",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -102,7 +103,6 @@ go_test(
     srcs = ["sack_scoreboard_test.go"],
     deps = [
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//pkg/tcpip/transport/tcp",
@@ -116,7 +116,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -133,12 +132,12 @@ go_test(
     srcs = ["tcp_rack_test.go"],
     deps = [
         ":e2e",
+        "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
-        "//pkg/tcpip/stack",
+        "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/tcp/testing/context",
         "//pkg/test/testutil",
     ],
@@ -150,13 +149,12 @@ go_test(
     srcs = ["tcp_sack_test.go"],
     deps = [
         ":e2e",
+        "//pkg/buffer",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
-        "//pkg/tcpip/stack",
         "//pkg/tcpip/transport/tcp",
         "//pkg/tcpip/transport/tcp/testing/context",
         "//pkg/test/testutil",
@@ -173,7 +171,6 @@ go_test(
     deps = [
         ":e2e",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/header",
         "//pkg/tcpip/transport/tcp",

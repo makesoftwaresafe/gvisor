@@ -20,13 +20,14 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
 // fileDescription implements vfs.FileDescriptionImpl for fuse.
+//
+// +stateify savable
 type fileDescription struct {
 	vfsfd vfs.FileDescription
 	vfs.FileDescriptionDefaultImpl
@@ -36,10 +37,10 @@ type fileDescription struct {
 	// the file handle used in userspace.
 	Fh uint64
 
-	// Nonseekable is indicate cannot perform seek on a file.
+	// Nonseekable indicates we cannot perform seek on a file.
 	Nonseekable bool
 
-	// DirectIO suggest fuse to use direct io operation.
+	// DirectIO suggests that fuse use direct IO operations.
 	DirectIO bool
 
 	// OpenFlag is the flag returned by open.
@@ -77,18 +78,35 @@ func (fd *fileDescription) Release(ctx context.Context) {
 		Fh:    fd.Fh,
 		Flags: fd.statusFlags(),
 	}
-	// TODO(gvisor.dev/issue/3245): add logic when we support file lock owner.
+	// TODO(gvisor.dev/issue/3245): add logic when we support file lock owners.
+	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
 	var opcode linux.FUSEOpcode
-	if fd.inode().Mode().IsDir() {
+	if inode.filemode().IsDir() {
 		opcode = linux.FUSE_RELEASEDIR
 	} else {
 		opcode = linux.FUSE_RELEASE
 	}
-	kernelTask := kernel.TaskFromContext(ctx)
-	// Ignoring errors and FUSE server reply is analogous to Linux's behavior.
-	req := conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), fd.inode().nodeID, opcode, &in)
+	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
+	req := conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, opcode, &in)
 	// The reply will be ignored since no callback is defined in asyncCallBack().
-	conn.CallAsync(kernelTask, req)
+	conn.CallAsync(ctx, req)
+}
+
+// OnClose implements vfs.FileDescriptionImpl.OnClose.
+func (fd *fileDescription) OnClose(ctx context.Context) error {
+	inode := fd.inode()
+	conn := inode.fs.conn
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
+
+	in := linux.FUSEFlushIn{
+		Fh:        fd.Fh,
+		LockOwner: 0, // TODO(gvisor.dev/issue/3245): file lock
+	}
+	req := conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FLUSH, &in)
+	return conn.CallAsync(ctx, req)
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -127,28 +145,33 @@ func (fd *fileDescription) Stat(ctx context.Context, opts vfs.StatOptions) (linu
 func (fd *fileDescription) SetStat(ctx context.Context, opts vfs.SetStatOptions) error {
 	fs := fd.filesystem()
 	creds := auth.CredentialsFromContext(ctx)
-	return fd.inode().setAttr(ctx, fs, creds, opts, true, fd.Fh)
+	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
+	if err := vfs.CheckSetStat(ctx, creds, &opts, inode.filemode(), auth.KUID(inode.uid.Load()), auth.KGID(inode.gid.Load())); err != nil {
+		return err
+	}
+	return inode.setAttr(ctx, fs, creds, opts, fhOptions{useFh: true, fh: fd.Fh})
 }
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (fd *fileDescription) Sync(ctx context.Context) error {
-	if fd.inode().Mode().IsDir() {
-		return linuxerr.EPERM
-	}
-	conn := fd.inode().fs.conn
+	inode := fd.inode()
+	inode.attrMu.Lock()
+	defer inode.attrMu.Unlock()
+	conn := inode.fs.conn
 	// no need to proceed if FUSE server doesn't implement Open.
 	if conn.noOpen {
 		return linuxerr.EINVAL
 	}
-	kernelTask := kernel.TaskFromContext(ctx)
 
 	in := linux.FUSEFsyncIn{
 		Fh:         fd.Fh,
 		FsyncFlags: fd.statusFlags(),
 	}
-	// Ignoring errors and FUSE server reply is analogous to Linux's behavior.
-	req := conn.NewRequest(auth.CredentialsFromContext(ctx), uint32(kernelTask.ThreadID()), fd.inode().nodeID, linux.FUSE_FSYNC, &in)
+	// Ignoring errors and FUSE server replies is analogous to Linux's behavior.
+	req := conn.NewRequest(auth.CredentialsFromContext(ctx), pidFromContext(ctx), inode.nodeID, linux.FUSE_FSYNC, &in)
 	// The reply will be ignored since no callback is defined in asyncCallBack().
-	conn.CallAsync(kernelTask, req)
+	conn.CallAsync(ctx, req)
 	return nil
 }

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 proto_library(
     name = "api",
@@ -15,7 +18,7 @@ go_library(
         "runtimeoptions.go",
         "runtimeoptions_cri.go",
     ],
-    visibility = ["//pkg/shim:__pkg__"],
+    visibility = ["//pkg/shim/runsc:__pkg__"],
     deps = ["@com_github_gogo_protobuf//proto:go_default_library"],
 )
 

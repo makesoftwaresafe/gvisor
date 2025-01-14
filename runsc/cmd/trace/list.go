@@ -40,15 +40,14 @@ func (*list) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*list) Usage() string {
-	return `list - list all trace sessions
-`
+	return "list - list all trace sessions\n"
 }
 
 // SetFlags implements subcommands.Command.
 func (*list) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (l *list) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (l *list) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -73,6 +72,9 @@ func (l *list) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) 
 	fmt.Printf("SESSIONS (%d)\n", len(sessions))
 	for _, session := range sessions {
 		fmt.Printf("%q\n", session.Name)
+		for _, sink := range session.Sinks {
+			fmt.Printf("\tSink: %q, dropped: %d\n", sink.Name, sink.Status.DroppedCount)
+		}
 	}
 	return subcommands.ExitSuccess
 }

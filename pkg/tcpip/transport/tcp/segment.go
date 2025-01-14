@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"io"
 
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/seqnum"
@@ -38,6 +40,12 @@ const (
 	sendQ
 )
 
+var segmentPool = sync.Pool{
+	New: func() any {
+		return &segment{}
+	},
+}
+
 // segment represents a TCP segment. It holds the payload and parsed TCP segment
 // information, and can be added to intrusive lists.
 // segment is mostly immutable, the only field allowed to change is data.
@@ -47,7 +55,7 @@ type segment struct {
 	segmentEntry
 	segmentRefs
 
-	ep     *endpoint
+	ep     *Endpoint
 	qFlags queueFlags
 	id     stack.TransportEndpointID `state:"manual"`
 
@@ -85,71 +93,83 @@ type segment struct {
 }
 
 func newIncomingSegment(id stack.TransportEndpointID, clock tcpip.Clock, pkt *stack.PacketBuffer) (*segment, error) {
-	hdr := header.TCP(pkt.TransportHeader().View())
-	netHdr := pkt.Network()
+	hdr := header.TCP(pkt.TransportHeader().Slice())
+	var srcAddr tcpip.Address
+	var dstAddr tcpip.Address
+	switch netProto := pkt.NetworkProtocolNumber; netProto {
+	case header.IPv4ProtocolNumber:
+		hdr := header.IPv4(pkt.NetworkHeader().Slice())
+		srcAddr = hdr.SourceAddress()
+		dstAddr = hdr.DestinationAddress()
+	case header.IPv6ProtocolNumber:
+		hdr := header.IPv6(pkt.NetworkHeader().Slice())
+		srcAddr = hdr.SourceAddress()
+		dstAddr = hdr.DestinationAddress()
+	default:
+		panic(fmt.Sprintf("unknown network protocol number %d", netProto))
+	}
+
 	csum, csumValid, ok := header.TCPValid(
 		hdr,
-		func() uint16 { return pkt.Data().AsRange().Checksum() },
+		func() uint16 { return pkt.Data().Checksum() },
 		uint16(pkt.Data().Size()),
-		netHdr.SourceAddress(),
-		netHdr.DestinationAddress(),
-		pkt.RXTransportChecksumValidated)
+		srcAddr,
+		dstAddr,
+		pkt.RXChecksumValidated)
 	if !ok {
 		return nil, fmt.Errorf("header data offset does not respect size constraints: %d < offset < %d, got offset=%d", header.TCPMinimumSize, len(hdr), hdr.DataOffset())
 	}
 
-	s := &segment{
-		id:             id,
-		options:        hdr[header.TCPMinimumSize:],
-		parsedOptions:  header.ParseTCPOptions(hdr[header.TCPMinimumSize:]),
-		sequenceNumber: seqnum.Value(hdr.SequenceNumber()),
-		ackNumber:      seqnum.Value(hdr.AckNumber()),
-		flags:          hdr.Flags(),
-		window:         seqnum.Size(hdr.WindowSize()),
-		rcvdTime:       clock.NowMonotonic(),
-		dataMemSize:    pkt.MemSize(),
-		pkt:            pkt,
-		csumValid:      csumValid,
-	}
-	pkt.IncRef()
-	s.InitRefs()
+	s := newSegment()
+	s.id = id
+	s.options = hdr[header.TCPMinimumSize:]
+	s.parsedOptions = header.ParseTCPOptions(hdr[header.TCPMinimumSize:])
+	s.sequenceNumber = seqnum.Value(hdr.SequenceNumber())
+	s.ackNumber = seqnum.Value(hdr.AckNumber())
+	s.flags = hdr.Flags()
+	s.window = seqnum.Size(hdr.WindowSize())
+	s.rcvdTime = clock.NowMonotonic()
+	s.dataMemSize = pkt.MemSize()
+	s.pkt = pkt.Clone()
+	s.csumValid = csumValid
 
-	if !s.pkt.RXTransportChecksumValidated {
+	if !s.pkt.RXChecksumValidated {
 		s.csum = csum
 	}
 	return s, nil
 }
 
-func newOutgoingSegment(id stack.TransportEndpointID, clock tcpip.Clock, v []byte) *segment {
-	s := &segment{
-		id: id,
-	}
-	s.InitRefs()
+func newOutgoingSegment(id stack.TransportEndpointID, clock tcpip.Clock, buf buffer.Buffer) *segment {
+	s := newSegment()
+	s.id = id
 	s.rcvdTime = clock.NowMonotonic()
-	s.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{})
-	s.pkt.Data().AppendView(v)
+	s.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buf})
 	s.dataMemSize = s.pkt.MemSize()
 	return s
 }
 
-// clone creates a shallow clone of s not including its pkt.
 func (s *segment) clone() *segment {
-	t := &segment{
-		id:             s.id,
-		sequenceNumber: s.sequenceNumber,
-		ackNumber:      s.ackNumber,
-		flags:          s.flags,
-		window:         s.window,
-		rcvdTime:       s.rcvdTime,
-		xmitTime:       s.xmitTime,
-		xmitCount:      s.xmitCount,
-		ep:             s.ep,
-		qFlags:         s.qFlags,
-		dataMemSize:    s.dataMemSize,
-	}
-	t.InitRefs()
-	t.pkt = stack.NewPacketBuffer(stack.PacketBufferOptions{})
+	t := newSegment()
+	t.id = s.id
+	t.sequenceNumber = s.sequenceNumber
+	t.ackNumber = s.ackNumber
+	t.flags = s.flags
+	t.window = s.window
+	t.rcvdTime = s.rcvdTime
+	t.xmitTime = s.xmitTime
+	t.xmitCount = s.xmitCount
+	t.ep = s.ep
+	t.qFlags = s.qFlags
+	t.dataMemSize = s.dataMemSize
+	t.pkt = s.pkt.Clone()
 	return t
+}
+
+func newSegment() *segment {
+	s := segmentPool.Get().(*segment)
+	*s = segment{}
+	s.InitRefs()
+	return s
 }
 
 // merge merges data in oth and clears oth.
@@ -162,7 +182,7 @@ func (s *segment) merge(oth *segment) {
 // setOwner sets the owning endpoint for this segment. Its required
 // to be called to ensure memory accounting for receive/send buffer
 // queues is done properly.
-func (s *segment) setOwner(ep *endpoint, qFlags queueFlags) {
+func (s *segment) setOwner(ep *Endpoint, qFlags queueFlags) {
 	switch qFlags {
 	case recvQ:
 		ep.updateReceiveMemUsed(s.segMemSize())
@@ -177,8 +197,6 @@ func (s *segment) setOwner(ep *endpoint, qFlags queueFlags) {
 
 func (s *segment) DecRef() {
 	s.segmentRefs.DecRef(func() {
-		defer s.pkt.DecRef()
-		s.pkt = nil
 		if s.ep != nil {
 			switch s.qFlags {
 			case recvQ:
@@ -189,6 +207,9 @@ func (s *segment) DecRef() {
 				panic(fmt.Sprintf("unexpected queue flag %b set for segment", s.qFlags))
 			}
 		}
+		s.pkt.DecRef()
+		s.pkt = nil
+		segmentPool.Put(s)
 	})
 }
 

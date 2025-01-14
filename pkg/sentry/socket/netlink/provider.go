@@ -19,9 +19,11 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 )
 
@@ -42,7 +44,7 @@ type Protocol interface {
 	// If err == nil, any messages added to ms will be sent back to the
 	// other end of the socket. Setting ms.Multi will cause an NLMSG_DONE
 	// message to be sent even if ms contains no messages.
-	ProcessMessage(ctx context.Context, msg *Message, ms *MessageSet) *syserr.Error
+	ProcessMessage(ctx context.Context, s *Socket, msg *nlmsg.Message, ms *nlmsg.MessageSet) *syserr.Error
 }
 
 // Provider is a function that creates a new Protocol for a specific netlink
@@ -67,14 +69,12 @@ func RegisterProvider(protocol int, provider Provider) {
 	protocols[protocol] = provider
 }
 
-// LINT.IfChange
-
 // socketProvider implements socket.Provider.
 type socketProvider struct {
 }
 
 // Socket implements socket.Provider.Socket.
-func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*fs.File, *syserr.Error) {
+func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int) (*vfs.FileDescription, *syserr.Error) {
 	// Netlink sockets must be specified as datagram or raw, but they
 	// behave the same regardless of type.
 	if stype != linux.SOCK_DGRAM && stype != linux.SOCK_RAW {
@@ -91,26 +91,32 @@ func (*socketProvider) Socket(t *kernel.Task, stype linux.SockType, protocol int
 		return nil, err
 	}
 
-	s, err := NewSocket(t, stype, p)
+	s, err := New(t, stype, p)
 	if err != nil {
 		return nil, err
 	}
 
-	d := socket.NewDirent(t, netlinkSocketDevice)
+	vfsfd := &s.vfsfd
+	mnt := t.Kernel().SocketMount()
+	d := sockfs.NewDentry(t, mnt)
 	defer d.DecRef(t)
-	return fs.NewFile(t, d, fs.FileFlags{Read: true, Write: true, NonSeekable: true}, s), nil
+	if err := vfsfd.Init(s, linux.O_RDWR, mnt, d, &vfs.FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
+		UseDentryMetadata: true,
+	}); err != nil {
+		return nil, syserr.FromError(err)
+	}
+	return vfsfd, nil
 }
 
 // Pair implements socket.Provider.Pair by returning an error.
-func (*socketProvider) Pair(*kernel.Task, linux.SockType, int) (*fs.File, *fs.File, *syserr.Error) {
+func (*socketProvider) Pair(*kernel.Task, linux.SockType, int) (*vfs.FileDescription, *vfs.FileDescription, *syserr.Error) {
 	// Netlink sockets never supports creating socket pairs.
 	return nil, nil, syserr.ErrNotSupported
 }
 
-// LINT.ThenChange(./provider_vfs2.go)
-
 // init registers the socket provider.
 func init() {
 	socket.RegisterProvider(linux.AF_NETLINK, &socketProvider{})
-	socket.RegisterProviderVFS2(linux.AF_NETLINK, &socketProviderVFS2{})
 }

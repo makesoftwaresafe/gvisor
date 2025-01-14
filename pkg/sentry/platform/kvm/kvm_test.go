@@ -16,12 +16,14 @@ package kvm
 
 import (
 	"math/rand"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
@@ -32,11 +34,12 @@ import (
 	ktime "gvisor.dev/gvisor/pkg/sentry/time"
 )
 
-var dummyFPState = fpu.NewState()
+// dummyFPState is initialized in TestMain.
+var dummyFPState fpu.State
 
 type testHarness interface {
-	Errorf(format string, args ...interface{})
-	Fatalf(format string, args ...interface{})
+	Errorf(format string, args ...any)
+	Fatalf(format string, args ...any)
 }
 
 func kvmTest(t testHarness, setup func(*KVM), fn func(*vCPU) bool) {
@@ -507,7 +510,36 @@ func BenchmarkKernelSyscall(b *testing.B) {
 	applicationTest(b, true, testutil.AddrOfGetpid(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
 		// iteration does not include machine.Get() / machine.Put().
 		for i := 0; i < b.N; i++ {
+			bluepill(c)
 			testutil.Getpid()
+		}
+		return false
+	})
+}
+
+func BenchmarkSentrySyscall(b *testing.B) {
+	// Note that the target passed here is irrelevant, we never execute SwitchToUser.
+	applicationTest(b, true, testutil.AddrOfGetpid(), func(c *vCPU, regs *arch.Registers, pt *pagetables.PageTables) bool {
+		// iteration does not include machine.Get() / machine.Put().
+		for i := 0; i < b.N; i++ {
+			testutil.Getpid()
+		}
+		return false
+	})
+}
+
+func BenchmarkHostMMap(b *testing.B) {
+	kvmTest(b, nil, func(c *vCPU) bool {
+		// iteration does not include machine.Get() / machine.Put().
+		for i := 0; i < b.N; i++ {
+			addr, _, errno := unix.Syscall6(unix.SYS_MMAP, 0, hostarch.PageSize, unix.PROT_READ|unix.PROT_WRITE, unix.MAP_ANONYMOUS|unix.MAP_PRIVATE, 0, 0)
+			if errno != 0 {
+				b.Fatalf("mmap failed: %s", errno)
+			}
+			_, _, errno = unix.Syscall(unix.SYS_MUNMAP, addr, hostarch.PageSize, 0)
+			if errno != 0 {
+				b.Fatalf("munmap failed: %s", errno)
+			}
 		}
 		return false
 	})
@@ -553,4 +585,10 @@ func BenchmarkWorldSwitchToUserRoundtrip(b *testing.B) {
 	if a != 0 {
 		b.Logf("ErrContextInterrupt occurred %d times (in %d iterations).", a, a+i)
 	}
+}
+
+func TestMain(m *testing.M) {
+	cpuid.Initialize()
+	dummyFPState = fpu.NewState()
+	os.Exit(m.Run())
 }

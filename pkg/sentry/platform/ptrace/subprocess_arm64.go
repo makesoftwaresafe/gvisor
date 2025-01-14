@@ -28,13 +28,6 @@ import (
 )
 
 const (
-	// maximumUserAddress is the largest possible user address.
-	maximumUserAddress = 0xfffffffff000
-
-	// stubInitAddress is the initial attempt link address for the stub.
-	// Only support 48bits VA currently.
-	stubInitAddress = 0xffffffff0000
-
 	// initRegsRipAdjustment is the size of the svc instruction.
 	initRegsRipAdjustment = 4
 )
@@ -120,7 +113,7 @@ func dumpRegs(regs *arch.Registers) string {
 }
 
 // adjustInitregsRip adjust the current register RIP value to
-// be just before the system call instruction excution
+// be just before the system call instruction execution
 func (t *thread) adjustInitRegsRip() {
 	t.initRegs.Pc -= initRegsRipAdjustment
 }

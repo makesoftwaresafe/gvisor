@@ -38,6 +38,8 @@ func New(ep stack.LinkEndpoint) *Endpoint {
 // It adds an ethernet header to packets before sending them out through its
 // inner link endpoint and consumes an ethernet header before sending the
 // packet to the stack.
+//
+// +stateify savable
 type Endpoint struct {
 	nested.Endpoint
 }
@@ -52,22 +54,29 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 
 // MTU implements stack.LinkEndpoint.
 func (e *Endpoint) MTU() uint32 {
-	if mtu := e.Endpoint.MTU(); mtu > header.EthernetMinimumSize {
-		return mtu - header.EthernetMinimumSize
-	}
-	return 0
+	return e.Endpoint.MTU()
 }
 
 // DeliverNetworkPacket implements stack.NetworkDispatcher.
 func (e *Endpoint) DeliverNetworkPacket(_ tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
-	hdr, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
-	if !ok {
+	if !e.ParseHeader(pkt) {
 		return
+	}
+	eth := header.Ethernet(pkt.LinkHeader().Slice())
+	dst := eth.DestinationAddress()
+	if dst == header.EthernetBroadcastAddress {
+		pkt.PktType = tcpip.PacketBroadcast
+	} else if header.IsMulticastEthernetAddress(dst) {
+		pkt.PktType = tcpip.PacketMulticast
+	} else if dst == e.LinkAddress() {
+		pkt.PktType = tcpip.PacketHost
+	} else {
+		pkt.PktType = tcpip.PacketOtherHost
 	}
 
 	// Note, there is no need to check the destination link address here since
 	// the ethernet hardware filters frames based on their destination addresses.
-	e.Endpoint.DeliverNetworkPacket(header.Ethernet(hdr).Type() /* protocol */, pkt)
+	e.Endpoint.DeliverNetworkPacket(eth.Type() /* protocol */, pkt)
 }
 
 // Capabilities implements stack.LinkEndpoint.
@@ -101,4 +110,10 @@ func (*Endpoint) AddHeader(pkt *stack.PacketBuffer) {
 		Type:    pkt.NetworkProtocolNumber,
 	}
 	eth.Encode(&fields)
+}
+
+// ParseHeader implements stack.LinkEndpoint.
+func (*Endpoint) ParseHeader(pkt *stack.PacketBuffer) bool {
+	_, ok := pkt.LinkHeader().Consume(header.EthernetMinimumSize)
+	return ok
 }

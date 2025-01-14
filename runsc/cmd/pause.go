@@ -39,7 +39,7 @@ func (*Pause) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Pause) Usage() string {
-	return `pause <container id> - pause process in instance of container.`
+	return "pause <container id> - pause process in instance of container.\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -47,7 +47,7 @@ func (*Pause) SetFlags(*flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (*Pause) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*Pause) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError

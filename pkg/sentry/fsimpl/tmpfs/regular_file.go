@@ -25,9 +25,9 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
 	"gvisor.dev/gvisor/pkg/sentry/fsmetric"
+	"gvisor.dev/gvisor/pkg/sentry/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/hostfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
@@ -42,9 +42,6 @@ import (
 // +stateify savable
 type regularFile struct {
 	inode inode
-
-	// memFile is a platform.File used to allocate pages to this regularFile.
-	memFile *pgalloc.MemoryFile `state:"nosave"`
 
 	// memoryUsageKind is the memory accounting category under which pages backing
 	// this regularFile's contents are accounted.
@@ -83,6 +80,15 @@ type regularFile struct {
 	// Protected by dataMu.
 	seals uint32
 
+	// initiallyUnlinked is true if this file was created using NewZeroFile or
+	// NewMemfd => newUnlinkedRegularFileDescription. initiallyUnlinked should
+	// be true when the equivalent shmem file in Linux would use
+	// shmem_anon_vm_ops rather than shmem_vm_ops.
+	//
+	// initiallyUnlinked is immutable, but stored here since it fits into
+	// alignment padding.
+	initiallyUnlinked bool
+
 	// size is the size of data.
 	//
 	// Protected by both dataMu and inode.mu; reading it requires holding
@@ -94,7 +100,6 @@ type regularFile struct {
 
 func (fs *filesystem) newRegularFile(kuid auth.KUID, kgid auth.KGID, mode linux.FileMode, parentDir *directory) *inode {
 	file := &regularFile{
-		memFile:         fs.mfp.MemoryFile(),
 		memoryUsageKind: fs.usage,
 		seals:           linux.F_SEAL_SEAL,
 	}
@@ -118,6 +123,7 @@ func newUnlinkedRegularFileDescription(ctx context.Context, creds *auth.Credenti
 	}
 
 	inode := fs.newRegularFile(creds.EffectiveKUID, creds.EffectiveKGID, 0777, nil /* parentDir */)
+	inode.impl.(*regularFile).initiallyUnlinked = true
 	d := fs.newDentry(inode)
 	defer d.DecRef(ctx)
 	d.name = name
@@ -138,11 +144,6 @@ func newUnlinkedRegularFileDescription(ctx context.Context, creds *auth.Credenti
 // Preconditions: mount must be a tmpfs mount.
 func NewZeroFile(ctx context.Context, creds *auth.Credentials, mount *vfs.Mount, size uint64) (*vfs.FileDescription, error) {
 	// Compare mm/shmem.c:shmem_zero_setup().
-	fs := mount.Filesystem().Impl().(*filesystem)
-	if err := fs.updatePagesUsed(0, size); err != nil {
-		return nil, err
-	}
-
 	fd, err := newUnlinkedRegularFileDescription(ctx, creds, mount, "dev/zero")
 	if err != nil {
 		return nil, err
@@ -176,6 +177,19 @@ func (rf *regularFile) truncate(newSize uint64) (bool, error) {
 	return rf.truncateLocked(newSize)
 }
 
+// Preconditions:
+//   - rf.inode.mu must be held.
+//   - rf.dataMu must be locked for writing.
+//   - newSize > rf.size.
+func (rf *regularFile) growLocked(newSize uint64) error {
+	// Can we grow the file?
+	if rf.seals&linux.F_SEAL_GROW != 0 {
+		return linuxerr.EPERM
+	}
+	rf.size.Store(newSize)
+	return nil
+}
+
 // Preconditions: rf.inode.mu must be held.
 func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 	oldSize := rf.size.RacyLoad()
@@ -187,19 +201,9 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 	// Need to hold inode.mu and dataMu while modifying size.
 	rf.dataMu.Lock()
 	if newSize > oldSize {
-		// Can we grow the file?
-		if rf.seals&linux.F_SEAL_GROW != 0 {
-			rf.dataMu.Unlock()
-			return false, linuxerr.EPERM
-		}
-		// We only need to update the file size.
-		if err := rf.inode.fs.updatePagesUsed(rf.size.Load(), newSize); err != nil {
-			rf.dataMu.Unlock()
-			return false, err
-		}
-		rf.size.Store(newSize)
+		err := rf.growLocked(newSize)
 		rf.dataMu.Unlock()
-		return true, nil
+		return err == nil, err
 	}
 
 	// We are shrinking the file. First check if this is allowed.
@@ -208,17 +212,12 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 		return false, linuxerr.EPERM
 	}
 
-	// Update the file size.
-	if err := rf.inode.fs.updatePagesUsed(rf.size.Load(), newSize); err != nil {
-		rf.dataMu.Unlock()
-		return false, err
-	}
 	rf.size.Store(newSize)
 	rf.dataMu.Unlock()
 
 	// Invalidate past translations of truncated pages.
-	oldpgend := fs.OffsetPageEnd(int64(oldSize))
-	newpgend := fs.OffsetPageEnd(int64(newSize))
+	oldpgend := offsetPageEnd(int64(oldSize))
+	newpgend := offsetPageEnd(int64(newSize))
 	if newpgend < oldpgend {
 		rf.mapsMu.Lock()
 		rf.mappings.Invalidate(memmap.MappableRange{newpgend, oldpgend}, memmap.InvalidateOpts{
@@ -232,8 +231,9 @@ func (rf *regularFile) truncateLocked(newSize uint64) (bool, error) {
 	// We are now guaranteed that there are no translations of truncated pages,
 	// and can remove them.
 	rf.dataMu.Lock()
-	rf.data.Truncate(newSize, rf.memFile)
+	decPages := rf.data.Truncate(newSize, rf.inode.fs.mf)
 	rf.dataMu.Unlock()
+	rf.inode.fs.unaccountPages(decPages)
 	return true, nil
 }
 
@@ -290,12 +290,14 @@ func (rf *regularFile) CopyMapping(ctx context.Context, ms memmap.MappingSpace, 
 
 // Translate implements memmap.Mappable.Translate.
 func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.MappableRange, at hostarch.AccessType) ([]memmap.Translation, error) {
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
+
 	rf.dataMu.Lock()
 	defer rf.dataMu.Unlock()
 
 	// Constrain translations to f.attr.Size (rounded up) to prevent
 	// translation to pages that may be concurrently truncated.
-	pgend := fs.OffsetPageEnd(int64(rf.size.RacyLoad()))
+	pgend := offsetPageEnd(int64(rf.size.RacyLoad()))
 	var beyondEOF bool
 	if required.End > pgend {
 		if required.Start >= pgend {
@@ -307,11 +309,37 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 	if optional.End > pgend {
 		optional.End = pgend
 	}
-
-	cerr := rf.data.Fill(ctx, required, optional, rf.size.RacyLoad(), rf.memFile, rf.memoryUsageKind, func(_ context.Context, dsts safemem.BlockSeq, _ uint64) (uint64, error) {
-		// Newly-allocated pages are zeroed, so we don't need to do anything.
-		return dsts.NumBytes(), nil
-	})
+	// Constrain allocation to at most maxOptionalBytes or required.Length(),
+	// whichever is greater.
+	const maxOptionalBytes = 64 << 10 // 64 KB, arbitrarily matches Linux's default fault_around_pages
+	if required.Length() >= maxOptionalBytes {
+		optional = required
+	} else {
+		if optional.Length() > maxOptionalBytes {
+			optional.Start = required.Start
+			if optional.Length() > maxOptionalBytes {
+				optional.End = optional.Start + maxOptionalBytes
+			}
+		}
+	}
+	pagesToFill := rf.data.PagesToFill(required, optional)
+	if !rf.inode.fs.accountPages(pagesToFill) {
+		// If we can not accommodate pagesToFill pages, then retry with just
+		// the required range. Because optional may be larger than required.
+		// Only error out if even the required range can not be allocated for.
+		pagesToFill = rf.data.PagesToFill(required, required)
+		if !rf.inode.fs.accountPages(pagesToFill) {
+			return nil, &memmap.BusError{linuxerr.ENOSPC}
+		}
+		optional = required
+	}
+	pagesAlloced, cerr := rf.data.Fill(ctx, required, optional, rf.size.RacyLoad(), rf.inode.fs.mf, pgalloc.AllocOpts{
+		Kind:    rf.memoryUsageKind,
+		MemCgID: memCgID,
+	}, nil)
+	// rf.data.Fill() may fail mid-way. We still want to account any pages that
+	// were allocated, irrespective of an error.
+	rf.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
 
 	var ts []memmap.Translation
 	var translatedEnd uint64
@@ -319,7 +347,7 @@ func (rf *regularFile) Translate(ctx context.Context, required, optional memmap.
 		segMR := seg.Range().Intersect(optional)
 		ts = append(ts, memmap.Translation{
 			Source: segMR,
-			File:   rf.memFile,
+			File:   rf.inode.fs.mf,
 			Offset: seg.FileRangeOf(segMR).Start,
 			Perms:  hostarch.AnyAccess,
 		})
@@ -360,16 +388,92 @@ func (fd *regularFileFD) Release(context.Context) {
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (fd *regularFileFD) Allocate(ctx context.Context, mode, offset, length uint64) error {
 	f := fd.inode().impl.(*regularFile)
+	memCgID := pgalloc.MemoryCgroupIDFromContext(ctx)
 
+	// To be consistent with Linux, inode.mu must be locked throughout.
 	f.inode.mu.Lock()
 	defer f.inode.mu.Unlock()
-	oldSize := f.size.RacyLoad()
-	size := offset + length
-	if oldSize >= size {
+	end := offset + length
+	pgEnd, ok := hostarch.PageRoundUp(end)
+	if !ok {
+		return linuxerr.EFBIG
+	}
+	// Allocate in chunks for the following reasons:
+	// 1. Size limit may permit really large fallocate, which can take a long
+	//    time to execute on the host. This can cause watchdog to timeout and
+	//    crash the system. Watchdog needs petting.
+	// 2. Linux allocates folios iteratively while checking for interrupts. In
+	//    gVisor, we need to manually check for interrupts between chunks.
+	const chunkSize = 4 << 30 // 4 GiB
+	for curPgStart := hostarch.PageRoundDown(offset); curPgStart < pgEnd; {
+		curPgEnd := pgEnd
+		newSize := end
+		if curPgEnd-curPgStart > chunkSize {
+			curPgEnd = curPgStart + chunkSize
+			newSize = curPgEnd
+		}
+		required := memmap.MappableRange{Start: curPgStart, End: curPgEnd}
+		if err := f.allocateLocked(ctx, mode, newSize, required, memCgID); err != nil {
+			return err
+		}
+		// This loop can take a long time to process, so periodically check for
+		// interrupts. This also pets the watchdog.
+		if ctx.Interrupted() {
+			return linuxerr.EINTR
+		}
+		// Advance curPgStart.
+		curPgStart = curPgEnd
+	}
+	return nil
+}
+
+// Preconditions:
+// - rf.inode.mu is locked.
+// - required must be page-aligned.
+// - required.Start < newSize <= required.End.
+func (rf *regularFile) allocateLocked(ctx context.Context, mode, newSize uint64, required memmap.MappableRange, memCgID uint32) error {
+	rf.dataMu.Lock()
+	defer rf.dataMu.Unlock()
+
+	// We must allocate pages in the range specified by offset and length.
+	// Even if newSize <= oldSize, there might not be actual memory backing this
+	// range, so any gaps must be filled by calling f.data.Fill().
+	// "After a successful call, subsequent writes into the range
+	// specified by offset and len are guaranteed not to fail because of
+	// lack of disk space."  - fallocate(2)
+	pagesToFill := rf.data.PagesToFill(required, required)
+	if !rf.inode.fs.accountPages(pagesToFill) {
+		return linuxerr.ENOSPC
+	}
+	// Given our definitions in pgalloc, fallocate(2) semantics imply that pages
+	// in the MemoryFile must be committed, in addition to being allocated.
+	allocMode := pgalloc.AllocateAndCommit
+	if !rf.inode.fs.mf.IsDiskBacked() {
+		// Upgrade to AllocateAndWritePopulate for memory(shmem)-backed files. We
+		// take a more aggressive approach in populating pages for memory-backed
+		// MemoryFiles. shmem pages are subject to swap rather than disk writeback.
+		// They are not likely to be swapped before they are written to. Hence it
+		// is beneficial to populate (in addition to commit) shmem pages to avoid
+		// faulting page-by-page when these pages are written to in the future.
+		allocMode = pgalloc.AllocateAndWritePopulate
+	}
+	pagesAlloced, err := rf.data.Fill(ctx, required, required, newSize, rf.inode.fs.mf, pgalloc.AllocOpts{
+		Kind:    rf.memoryUsageKind,
+		MemCgID: memCgID,
+		Mode:    allocMode,
+	}, nil /* r */)
+	// f.data.Fill() may fail mid-way. We still want to account any pages that
+	// were allocated, irrespective of an error.
+	rf.inode.fs.adjustPageAcct(pagesToFill, pagesAlloced)
+	if err != nil && err != io.EOF {
+		return err
+	}
+
+	oldSize := rf.size.Load()
+	if oldSize >= newSize {
 		return nil
 	}
-	_, err := f.truncateLocked(size)
-	return err
+	return rf.growLocked(newSize)
 }
 
 // PRead implements vfs.FileDescriptionImpl.PRead.
@@ -394,7 +498,9 @@ func (fd *regularFileFD) PRead(ctx context.Context, dst usermem.IOSequence, offs
 		return 0, nil
 	}
 	f := fd.inode().impl.(*regularFile)
-	rw := getRegularFileReadWriter(f, offset)
+	// memCgID can be 0 here because regularFileReadWriter.ReadToBlocks() never
+	// allocates from pgalloc.
+	rw := getRegularFileReadWriter(f, offset, 0)
 	n, err := dst.CopyOutFrom(ctx, rw)
 	putRegularFileReadWriter(rw)
 	fd.inode().touchAtime(fd.vfsfd.Mount())
@@ -453,29 +559,11 @@ func (fd *regularFileFD) pwrite(ctx context.Context, src usermem.IOSequence, off
 	if err != nil {
 		return 0, offset, err
 	}
-
-	// Reserve enough space assuming the entire write was successful. The
-	// corresponding update to f.size is done in WriteFromBlocks() which is
-	// called via src.CopyInTo() below.
-	maybeSizeInc := false
 	src = src.TakeFirst64(srclen)
-	if uint64(end) > f.size.Load() {
-		maybeSizeInc = true
-		if err = f.inode.fs.updatePagesUsed(f.size.Load(), uint64(end)); err != nil {
-			return 0, 0, err
-		}
-	}
 
 	// Perform the write.
-	rw := getRegularFileReadWriter(f, offset)
+	rw := getRegularFileReadWriter(f, offset, pgalloc.MemoryCgroupIDFromContext(ctx))
 	n, err := src.CopyInTo(ctx, rw)
-
-	// Correct page accounting if this was a partial write.
-	if maybeSizeInc && srclen-n != 0 {
-		if err := f.inode.fs.updatePagesUsed(uint64(end), f.size.Load()); err != nil {
-			return 0, 0, err
-		}
-	}
 
 	f.inode.touchCMtimeLocked()
 	for {
@@ -523,7 +611,21 @@ func (fd *regularFileFD) Seek(ctx context.Context, offset int64, whence int32) (
 func (fd *regularFileFD) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) error {
 	file := fd.inode().impl.(*regularFile)
 	opts.SentryOwnedContent = true
+	if file.initiallyUnlinked {
+		opts.NameMut = memmap.NameMutAnonShmem
+	}
 	return vfs.GenericConfigureMMap(&fd.vfsfd, file, opts)
+}
+
+// offsetPageEnd returns the file offset rounded up to the nearest
+// page boundary. offsetPageEnd panics if rounding up causes overflow,
+// which shouldn't be possible given that offset is an int64.
+func offsetPageEnd(offset int64) uint64 {
+	end, ok := hostarch.Addr(offset).RoundUp()
+	if !ok {
+		panic("impossible overflow")
+	}
+	return uint64(end)
 }
 
 // regularFileReadWriter implements safemem.Reader and Safemem.Writer.
@@ -533,18 +635,23 @@ type regularFileReadWriter struct {
 	// Offset into the file to read/write at. Note that this may be
 	// different from the FD offset if PRead/PWrite is used.
 	off uint64
+
+	// memCgID is the memory cgroup ID used for accounting the allocated
+	// pages.
+	memCgID uint32
 }
 
 var regularFileReadWriterPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &regularFileReadWriter{}
 	},
 }
 
-func getRegularFileReadWriter(file *regularFile, offset int64) *regularFileReadWriter {
+func getRegularFileReadWriter(file *regularFile, offset int64, memCgID uint32) *regularFileReadWriter {
 	rw := regularFileReadWriterPool.Get().(*regularFileReadWriter)
 	rw.file = file
 	rw.off = uint64(offset)
+	rw.memCgID = memCgID
 	return rw
 }
 
@@ -575,7 +682,7 @@ func (rw *regularFileReadWriter) ReadToBlocks(dsts safemem.BlockSeq) (uint64, er
 		switch {
 		case seg.Ok():
 			// Get internal mappings.
-			ims, err := rw.file.memFile.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
+			ims, err := rw.file.inode.fs.mf.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Read)
 			if err != nil {
 				return done, err
 			}
@@ -639,7 +746,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		// containing EOF fails, resulting in a partial write up to the start of
 		// that page.
 		//
-		// To emulate this behaviour, artifically truncate the write to the
+		// To emulate this behaviour, artificially truncate the write to the
 		// start of the page containing the current EOF.
 		//
 		// See Linux, mm/filemap.c:generic_perform_write() and
@@ -668,15 +775,7 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		mr := memmap.MappableRange{uint64(rw.off), uint64(end)}
 		switch {
 		case seg.Ok():
-			// Get internal mappings.
-			ims, err := rw.file.memFile.MapInternal(seg.FileRangeOf(seg.Range().Intersect(mr)), hostarch.Write)
-			if err != nil {
-				retErr = err
-				goto exitLoop
-			}
-
-			// Copy to internal mappings.
-			n, err := safemem.CopySeq(ims, srcs)
+			n, err := rw.writeToMF(seg.FileRangeOf(seg.Range().Intersect(mr)), srcs)
 			done += n
 			rw.off += uint64(n)
 			srcs = srcs.DropFirst64(n)
@@ -691,15 +790,40 @@ func (rw *regularFileReadWriter) WriteFromBlocks(srcs safemem.BlockSeq) (uint64,
 		case gap.Ok():
 			// Allocate memory for the write.
 			gapMR := gap.Range().Intersect(pgMR)
-			fr, err := rw.file.memFile.Allocate(gapMR.Length(), pgalloc.AllocOpts{Kind: rw.file.memoryUsageKind})
+			pagesToFill := gapMR.Length() / hostarch.PageSize
+			pagesReserved := rw.file.inode.fs.accountPagesPartial(pagesToFill)
+			if pagesReserved == 0 {
+				if done == 0 {
+					retErr = linuxerr.ENOSPC
+					goto exitLoop
+				}
+				retErr = nil
+				goto exitLoop
+			}
+			gapMR.End = gapMR.Start + (hostarch.PageSize * pagesReserved)
+			allocMode := pgalloc.AllocateAndWritePopulate
+			if rw.file.inode.fs.mf.IsDiskBacked() {
+				// Don't populate pages for disk-backed files. Benchmarking showed that
+				// disk-backed pages are likely to be written back to disk before we
+				// can write to them. The pages fault again on write anyways. In total,
+				// prepopulating disk-backed pages deteriorates performance as it fails
+				// to eliminate future page faults and we also additionally incur
+				// useless disk writebacks.
+				allocMode = pgalloc.AllocateCallerIndirectCommit
+			}
+			fr, err := rw.file.inode.fs.mf.Allocate(gapMR.Length(), pgalloc.AllocOpts{
+				Kind:    rw.file.memoryUsageKind,
+				MemCgID: rw.memCgID,
+				Mode:    allocMode,
+			})
 			if err != nil {
 				retErr = err
+				rw.file.inode.fs.unaccountPages(pagesReserved)
 				goto exitLoop
 			}
 
 			// Write to that memory as usual.
 			seg, gap = rw.file.data.Insert(gap, gapMR, fr.Start), fsutil.FileRangeGapIterator{}
-
 		default:
 			panic("unreachable")
 		}
@@ -712,6 +836,33 @@ exitLoop:
 	}
 
 	return done, retErr
+}
+
+func (rw *regularFileReadWriter) writeToMF(fr memmap.FileRange, srcs safemem.BlockSeq) (uint64, error) {
+	if rw.file.inode.fs.mf.IsDiskBacked() {
+		// Disk-backed files are not prepopulated. The safemem.CopySeq() approach
+		// used below incurs a lot of page faults without page prepopulation, which
+		// causes a lot of context switching. Use write(2) host syscall instead,
+		// which makes one context switch and faults all the pages that are touched
+		// during the write.
+		fd, err := rw.file.inode.fs.mf.DataFD(fr)
+		if err != nil {
+			return 0, err
+		}
+		return hostfd.Pwritev2(
+			int32(fd),                     // fd
+			srcs.TakeFirst64(fr.Length()), // srcs
+			int64(fr.Start),               // offset
+			0,                             // flags
+		)
+	}
+	// Get internal mappings.
+	ims, err := rw.file.inode.fs.mf.MapInternal(fr, hostarch.Write)
+	if err != nil {
+		return 0, err
+	}
+	// Copy to internal mappings.
+	return safemem.CopySeq(ims, srcs)
 }
 
 // GetSeals returns the current set of seals on a memfd inode.
@@ -735,8 +886,8 @@ func AddSeals(fd *vfs.FileDescription, val uint32) error {
 	rf := f.inode().impl.(*regularFile)
 	rf.mapsMu.Lock()
 	defer rf.mapsMu.Unlock()
-	rf.dataMu.RLock()
-	defer rf.dataMu.RUnlock()
+	rf.dataMu.Lock()
+	defer rf.dataMu.Unlock()
 
 	if rf.seals&linux.F_SEAL_SEAL != 0 {
 		// Seal applied which prevents addition of any new seals.

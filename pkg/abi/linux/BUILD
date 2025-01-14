@@ -4,7 +4,10 @@ load("//tools:defs.bzl", "go_library", "go_test")
 # Linux kernel. It should be used instead of syscall or golang.org/x/sys/unix
 # when the host OS may not be Linux.
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "linux",
@@ -35,19 +38,26 @@ go_library(
         "inotify.go",
         "ioctl.go",
         "ioctl_tun.go",
+        "iouring.go",
         "ip.go",
         "ipc.go",
+        "keyctl.go",
         "limits.go",
         "linux.go",
         "membarrier.go",
         "mm.go",
+        "mm_amd64.go",
+        "mm_arm64.go",
         "mqueue.go",
         "msgqueue.go",
         "netdevice.go",
         "netfilter.go",
+        "netfilter_bridge.go",
+        "netfilter_ipv4.go",
         "netfilter_ipv6.go",
         "netlink.go",
         "netlink_route.go",
+        "nf_tables.go",
         "poll.go",
         "prctl.go",
         "ptrace.go",
@@ -71,6 +81,8 @@ go_library(
         "tty.go",
         "uio.go",
         "utsname.go",
+        "vfio.go",
+        "vfio_unsafe.go",
         "wait.go",
         "xattr.go",
     ],
@@ -83,6 +95,7 @@ go_library(
         "//pkg/hostarch",
         "//pkg/marshal",
         "//pkg/marshal/primitive",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 

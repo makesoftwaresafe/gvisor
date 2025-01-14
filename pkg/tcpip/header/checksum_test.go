@@ -25,139 +25,9 @@ import (
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 )
-
-func TestChecksumer(t *testing.T) {
-	testCases := []struct {
-		name string
-		data [][]byte
-		want uint16
-	}{
-		{
-			name: "empty",
-			want: 0,
-		},
-		{
-			name: "OneOddView",
-			data: [][]byte{
-				{1, 9, 0, 5, 4},
-			},
-			want: 1294,
-		},
-		{
-			name: "TwoOddViews",
-			data: [][]byte{
-				{1, 9, 0, 5, 4},
-				{4, 3, 7, 1, 2, 123},
-			},
-			want: 33819,
-		},
-		{
-			name: "OneEvenView",
-			data: [][]byte{
-				{1, 9, 0, 5},
-			},
-			want: 270,
-		},
-		{
-			name: "TwoEvenViews",
-			data: [][]byte{
-				[]byte{98, 1, 9, 0},
-				[]byte{9, 0, 5, 4},
-			},
-			want: 30981,
-		},
-		{
-			name: "ThreeViews",
-			data: [][]byte{
-				{77, 11, 33, 0, 55, 44},
-				{98, 1, 9, 0, 5, 4},
-				{4, 3, 7, 1, 2, 123, 99},
-			},
-			want: 34236,
-		},
-	}
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			var all bytes.Buffer
-			var c header.Checksumer
-			for _, b := range tc.data {
-				c.Add(b)
-				// Append to the buffer. We will check the checksum as a whole later.
-				if _, err := all.Write(b); err != nil {
-					t.Fatalf("all.Write(b) = _, %s; want _, nil", err)
-				}
-			}
-			if got, want := c.Checksum(), tc.want; got != want {
-				t.Errorf("c.Checksum() = %d, want %d", got, want)
-			}
-			if got, want := header.Checksum(all.Bytes(), 0 /* initial */), tc.want; got != want {
-				t.Errorf("Checksum(flatten tc.data) = %d, want %d", got, want)
-			}
-		})
-	}
-}
-
-func TestChecksum(t *testing.T) {
-	var bufSizes = []int{0, 1, 2, 3, 4, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256, 257, 1023, 1024}
-	type testCase struct {
-		buf      []byte
-		initial  uint16
-		csumOrig uint16
-		csumNew  uint16
-	}
-	testCases := make([]testCase, 100000)
-	// Ensure same buffer generation for test consistency.
-	rnd := rand.New(rand.NewSource(42))
-	for i := range testCases {
-		testCases[i].buf = make([]byte, bufSizes[i%len(bufSizes)])
-		testCases[i].initial = uint16(rnd.Intn(65536))
-		rnd.Read(testCases[i].buf)
-	}
-
-	for i := range testCases {
-		testCases[i].csumOrig = header.ChecksumOld(testCases[i].buf, testCases[i].initial)
-		testCases[i].csumNew = header.Checksum(testCases[i].buf, testCases[i].initial)
-		if got, want := testCases[i].csumNew, testCases[i].csumOrig; got != want {
-			t.Fatalf("new checksum for (buf = %x, initial = %d) does not match old got: %d, want: %d", testCases[i].buf, testCases[i].initial, got, want)
-		}
-	}
-}
-
-func BenchmarkChecksum(b *testing.B) {
-	var bufSizes = []int{64, 128, 256, 512, 1024, 1500, 2048, 4096, 8192, 16384, 32767, 32768, 65535, 65536}
-
-	checkSumImpls := []struct {
-		fn   func([]byte, uint16) uint16
-		name string
-	}{
-		{header.ChecksumOld, fmt.Sprintf("checksum_old")},
-		{header.Checksum, fmt.Sprintf("checksum")},
-	}
-
-	for _, csumImpl := range checkSumImpls {
-		// Ensure same buffer generation for test consistency.
-		rnd := rand.New(rand.NewSource(42))
-		for _, bufSz := range bufSizes {
-			b.Run(fmt.Sprintf("%s_%d", csumImpl.name, bufSz), func(b *testing.B) {
-				tc := struct {
-					buf     []byte
-					initial uint16
-					csum    uint16
-				}{
-					buf:     make([]byte, bufSz),
-					initial: uint16(rnd.Intn(65536)),
-				}
-				rnd.Read(tc.buf)
-				b.ResetTimer()
-				for i := 0; i < b.N; i++ {
-					tc.csum = csumImpl.fn(tc.buf, tc.initial)
-				}
-			})
-		}
-	}
-}
 
 func testICMPChecksum(t *testing.T, headerChecksum func() uint16, icmpChecksum func() uint16, want uint16, pktStr string) {
 	// icmpChecksum should not do any modifications of the header to
@@ -193,6 +63,8 @@ func testICMPChecksum(t *testing.T, headerChecksum func() uint16, icmpChecksum f
 	close(start)
 }
 
+// TODO(b/239732156): Replace magic constants with names corresponding to what
+// they represent ICMP.
 func TestICMPv4Checksum(t *testing.T) {
 	rnd := rand.New(rand.NewSource(42))
 
@@ -206,16 +78,34 @@ func TestICMPv4Checksum(t *testing.T) {
 	if _, err := rnd.Read(buf); err != nil {
 		t.Fatalf("rnd.Read failed: %v", err)
 	}
-	b := buffer.NewWithData(buf[:5])
-	b.AppendOwned(buf[5:])
+	b := buffer.MakeWithData(buf[:5])
+	b.Append(buffer.NewViewWithData(buf[5:]))
 
-	want := header.Checksum(b.Flatten(), 0)
-	want = ^header.Checksum(h, want)
+	want := checksum.Checksum(b.Flatten(), 0)
+	want = ^checksum.Checksum(h, want)
 	h.SetChecksum(want)
 
 	testICMPChecksum(t, h.Checksum, func() uint16 {
-		return header.ICMPv4Checksum(h, header.ChecksumBuffer(b, 0))
+		return header.ICMPv4Checksum(h, b.Checksum(0))
 	}, want, fmt.Sprintf("header: {% x} data {% x}", h, b.Flatten()))
+}
+
+func TestICMPv4ChecksumUpdate(t *testing.T) {
+	const icmpIdent = 0
+
+	data := make([]byte, header.ICMPv4MinimumSize)
+	h := header.ICMPv4(data)
+	h.SetType(header.ICMPv4EchoReply)
+	h.SetCode(header.ICMPv4UnusedCode)
+	h.SetIdent(icmpIdent)
+	h.SetChecksum(^checksum.Checksum(data, 0))
+
+	updated := header.ICMPv4(bytes.Clone(data))
+	// Perform an incremental checksum update where we aren't actually changing the ID.
+	updated.SetIdentWithChecksumUpdate(icmpIdent)
+	if updated.Checksum() != h.Checksum() {
+		t.Errorf("got updated.Checksum() = %x, want = %x", updated.Checksum(), h.Checksum())
+	}
 }
 
 func TestICMPv6Checksum(t *testing.T) {
@@ -231,16 +121,16 @@ func TestICMPv6Checksum(t *testing.T) {
 	if _, err := rnd.Read(buf); err != nil {
 		t.Fatalf("rnd.Read failed: %v", err)
 	}
-	b := buffer.NewWithData(buf[:7])
-	b.AppendOwned(buf[7:10])
-	b.AppendOwned(buf[10:])
+	b := buffer.MakeWithData(buf[:7])
+	b.Append(buffer.NewViewWithData(buf[7:10]))
+	b.Append(buffer.NewViewWithData(buf[10:]))
 
 	dst := header.IPv6Loopback
 	src := header.IPv6Loopback
 
 	want := header.PseudoHeaderChecksum(header.ICMPv6ProtocolNumber, src, dst, uint16(len(h)+int(b.Size())))
-	want = header.Checksum(b.Flatten(), want)
-	want = ^header.Checksum(h, want)
+	want = checksum.Checksum(b.Flatten(), want)
+	want = ^checksum.Checksum(h, want)
 	h.SetChecksum(want)
 
 	testICMPChecksum(t, h.Checksum, func() uint16 {
@@ -248,7 +138,7 @@ func TestICMPv6Checksum(t *testing.T) {
 			Header:      h,
 			Src:         src,
 			Dst:         dst,
-			PayloadCsum: header.ChecksumBuffer(b, 0),
+			PayloadCsum: b.Checksum(0),
 			PayloadLen:  int(b.Size()),
 		})
 	}, want, fmt.Sprintf("header: {% x} data {% x}", h, b.Flatten()))
@@ -259,7 +149,7 @@ func randomAddress(size int) tcpip.Address {
 	for i := 0; i < size; i++ {
 		s[i] = byte(rand.Uint32())
 	}
-	return tcpip.Address(s)
+	return tcpip.AddrFromSlice(s)
 }
 
 func TestChecksummableNetworkUpdateAddress(t *testing.T) {
@@ -401,7 +291,7 @@ func TestChecksummableTransportUpdatePort(t *testing.T) {
 }
 
 func TestChecksummableTransportUpdatePseudoHeaderAddress(t *testing.T) {
-	const addressSize = 6
+	const addressSize = 16
 
 	tests := []struct {
 		name         string

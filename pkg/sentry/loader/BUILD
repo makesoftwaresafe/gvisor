@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "loader",
@@ -21,12 +24,12 @@ go_library(
         "//pkg/context",
         "//pkg/cpuid",
         "//pkg/errors/linuxerr",
+        "//pkg/fspath",
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/rand",
         "//pkg/safemem",
         "//pkg/sentry/arch",
-        "//pkg/sentry/fsbridge",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/limits",
         "//pkg/sentry/loader/vdsodata",

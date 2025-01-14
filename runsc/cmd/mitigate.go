@@ -17,7 +17,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"runtime"
 
@@ -74,7 +73,7 @@ func (m *Mitigate) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (m *Mitigate) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (m *Mitigate) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if runtime.GOARCH == "arm64" || runtime.GOARCH == "arm" {
 		log.Warningf("As ARM is not affected by MDS, mitigate does not support ARM machines.")
 		// Set reverse flag so that we still perform post mitigate operations. mitigate reverse is a noop in this case.
@@ -157,9 +156,9 @@ func (*machineControlImpl) disable() error {
 
 // Writes data to SMT control. If file not found, logs file not exist error and returns nil
 // error, which is done because machines without the file pointed to by smtPath only have one
-// thread per core in the first place. Otherwise returns error from ioutil.WriteFile.
+// thread per core in the first place. Otherwise returns error from os.WriteFile.
 func checkFileExistsOnWrite(op, data string) error {
-	err := ioutil.WriteFile(smtPath, []byte(data), 0644)
+	err := os.WriteFile(smtPath, []byte(data), 0644)
 	if err != nil && os.IsExist(err) {
 		log.Infof("File %q does not exist for operation %s. This machine probably has no smt control.", smtPath, op)
 		return nil
@@ -168,12 +167,12 @@ func checkFileExistsOnWrite(op, data string) error {
 }
 
 func (*machineControlImpl) isEnabled() (bool, error) {
-	data, err := ioutil.ReadFile(cpuInfo)
+	data, err := os.ReadFile(cpuInfo)
 	return string(data) == "on", err
 }
 
 func (*machineControlImpl) getCPUs() (mitigate.CPUSet, error) {
-	data, err := ioutil.ReadFile(cpuInfo)
+	data, err := os.ReadFile(cpuInfo)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read %s: %w", cpuInfo, err)
 	}

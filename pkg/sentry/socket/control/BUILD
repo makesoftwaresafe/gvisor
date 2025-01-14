@@ -1,12 +1,14 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "control",
     srcs = [
         "control.go",
-        "control_vfs2.go",
     ],
     imports = [
         "gvisor.dev/gvisor/pkg/sentry/fs",
@@ -20,7 +22,6 @@ go_library(
         "//pkg/hostarch",
         "//pkg/marshal",
         "//pkg/marshal/primitive",
-        "//pkg/sentry/fs",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/socket",
