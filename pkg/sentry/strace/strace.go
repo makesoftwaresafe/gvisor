@@ -151,52 +151,19 @@ func path(t *kernel.Task, addr hostarch.Addr) string {
 }
 
 func fd(t *kernel.Task, fd int32) string {
-	if kernel.VFS2Enabled {
-		return fdVFS2(t, fd)
-	}
-
 	root := t.FSContext().RootDirectory()
-	if root != nil {
-		defer root.DecRef(t)
-	}
-
-	if fd == linux.AT_FDCWD {
-		wd := t.FSContext().WorkingDirectory()
-		var name string
-		if wd != nil {
-			defer wd.DecRef(t)
-			name, _ = wd.FullName(root)
-		} else {
-			name = "(unknown cwd)"
-		}
-		return fmt.Sprintf("AT_FDCWD %s", name)
-	}
-
-	file := t.GetFile(fd)
-	if file == nil {
-		// Cast FD to uint64 to avoid printing negative hex.
-		return fmt.Sprintf("%#x (bad FD)", uint64(fd))
-	}
-	defer file.DecRef(t)
-
-	name, _ := file.Dirent.FullName(root)
-	return fmt.Sprintf("%#x %s", fd, name)
-}
-
-func fdVFS2(t *kernel.Task, fd int32) string {
-	root := t.FSContext().RootDirectoryVFS2()
 	defer root.DecRef(t)
 
 	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
 	if fd == linux.AT_FDCWD {
-		wd := t.FSContext().WorkingDirectoryVFS2()
+		wd := t.FSContext().WorkingDirectory()
 		defer wd.DecRef(t)
 
 		name, _ := vfsObj.PathnameWithDeleted(t, root, wd)
 		return fmt.Sprintf("AT_FDCWD %s", name)
 	}
 
-	file := t.GetFileVFS2(fd)
+	file := t.GetFile(fd)
 	if file == nil {
 		// Cast FD to uint64 to avoid printing negative hex.
 		return fmt.Sprintf("%#x (bad FD)", uint64(fd))
@@ -425,7 +392,7 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 			output = append(output, dump(t, args[arg].Pointer(), args[arg+1].SizeT(), maximumBlobSize, LogAppDataAllowed /* content */))
 		case WriteIOVec:
 			output = append(output, iovecs(t, args[arg].Pointer(), int(args[arg+1].Int()), LogAppDataAllowed /* content */, uint64(maximumBlobSize)))
-		case IOVec:
+		case ReadIOVec, IOVec:
 			output = append(output, iovecs(t, args[arg].Pointer(), int(args[arg+1].Int()), false /* content */, uint64(maximumBlobSize)))
 		case SendMsgHdr:
 			output = append(output, msghdr(t, args[arg].Pointer(), LogAppDataAllowed /* content */, uint64(maximumBlobSize)))
@@ -705,7 +672,7 @@ type syscallContext struct {
 
 // SyscallEnter implements kernel.Stracer.SyscallEnter. It logs the syscall
 // entry trace.
-func (s SyscallMap) SyscallEnter(t *kernel.Task, sysno uintptr, args arch.SyscallArguments, flags uint32) interface{} {
+func (s SyscallMap) SyscallEnter(t *kernel.Task, sysno uintptr, args arch.SyscallArguments, flags uint32) any {
 	info, ok := s[sysno]
 	if !ok {
 		info = SyscallInfo{
@@ -734,7 +701,7 @@ func (s SyscallMap) SyscallEnter(t *kernel.Task, sysno uintptr, args arch.Syscal
 
 // SyscallExit implements kernel.Stracer.SyscallExit. It logs the syscall
 // exit trace.
-func (s SyscallMap) SyscallExit(context interface{}, t *kernel.Task, sysno, rval uintptr, err error) {
+func (s SyscallMap) SyscallExit(context any, t *kernel.Task, sysno, rval uintptr, err error) {
 	errno := kernel.ExtractErrno(err, int(sysno))
 	c := context.(*syscallContext)
 

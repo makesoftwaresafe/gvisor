@@ -28,19 +28,23 @@ import (
 var _ stack.QueueingDiscipline = (*discipline)(nil)
 
 const (
-	// BatchSize represents the number of packets written to the
-	// lower link endpoint during calls to WritePackets.
-	BatchSize   = 32
+	// BatchSize is the number of packets to write in each syscall. It is 47
+	// because when GVisorGSO is in use then a single 65KB TCP segment can get
+	// split into 46 segments of 1420 bytes and a single 216 byte segment.
+	BatchSize = 47
+
 	qDiscClosed = 1
 )
 
 // discipline represents a QueueingDiscipline which implements a FIFO queue for
 // all outgoing packets. discipline can have 1 or more underlying
-// queueDispatchers. All outgoing packets are consistenly hashed to a single
+// queueDispatchers. All outgoing packets are consistently hashed to a single
 // underlying queue using the PacketBuffer.Hash if set, otherwise all packets
 // are queued to the first queue to avoid reordering in case of missing hash.
+//
+// +stateify savable
 type discipline struct {
-	wg          sync.WaitGroup
+	wg          sync.WaitGroup `state:"nosave"`
 	dispatchers []queueDispatcher
 
 	closed atomicbitops.Int32
@@ -49,18 +53,20 @@ type discipline struct {
 // queueDispatcher is responsible for dispatching all outbound packets in its
 // queue. It will also smartly batch packets when possible and write them
 // through the lower LinkWriter.
+//
+// +stateify savable
 type queueDispatcher struct {
 	lower stack.LinkWriter
 
-	mu sync.Mutex
+	mu queueDispatcherMutex `state:"nosave"`
 	// +checklocks:mu
 	queue packetBufferCircularList
 
-	newPacketWaker sleep.Waker
-	closeWaker     sleep.Waker
+	newPacketWaker sleep.Waker `state:"nosave"`
+	closeWaker     sleep.Waker `state:"nosave"`
 }
 
-// New creates a new fifo queuing discipline  with the n queues with maximum
+// New creates a new fifo queuing discipline with the n queues with maximum
 // capacity of queueLen.
 //
 // +checklocksignore: we don't have to hold locks during initialization.

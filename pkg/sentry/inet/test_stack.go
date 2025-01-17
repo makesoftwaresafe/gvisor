@@ -17,10 +17,16 @@ package inet
 import (
 	"bytes"
 	"fmt"
+	"time"
 
+	"gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/sentry/socket/netlink/nlmsg"
+	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
+
+var _ Stack = (*TestStack)(nil)
 
 // TestStack is a dummy implementation of Stack for tests.
 type TestStack struct {
@@ -58,6 +64,11 @@ func (s *TestStack) Destroy() {
 func (s *TestStack) RemoveInterface(idx int32) error {
 	delete(s.InterfacesMap, idx)
 	return nil
+}
+
+// SetInterface implements Stack.
+func (s *TestStack) SetInterface(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	panic("unimplemented")
 }
 
 // InterfaceAddrs implements Stack.
@@ -139,7 +150,7 @@ func (s *TestStack) SetTCPRecovery(recovery TCPLossRecovery) error {
 }
 
 // Statistics implements Stack.
-func (s *TestStack) Statistics(stat interface{}, arg string) error {
+func (s *TestStack) Statistics(stat any, arg string) error {
 	return nil
 }
 
@@ -148,8 +159,24 @@ func (s *TestStack) RouteTable() []Route {
 	return s.RouteList
 }
 
+// RemoveRoute implements Stack.
+func (s *TestStack) RemoveRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return nil
+}
+
+// NewRoute implements Stack.
+func (s *TestStack) NewRoute(ctx context.Context, msg *nlmsg.Message) *syserr.Error {
+	return syserr.ErrNotPermitted
+}
+
 // Pause implements Stack.
 func (s *TestStack) Pause() {}
+
+// Restore implements Stack.
+func (s *TestStack) Restore() {}
+
+// ReplaceConfig implements Stack.
+func (s *TestStack) ReplaceConfig(_ Stack) {}
 
 // Resume implements Stack.
 func (s *TestStack) Resume() {}
@@ -176,11 +203,41 @@ func (s *TestStack) SetForwarding(protocol tcpip.NetworkProtocolNumber, enable b
 // PortRange implements Stack.
 func (*TestStack) PortRange() (uint16, uint16) {
 	// Use the default Linux values per net/ipv4/af_inet.c:inet_init_net().
-	return 32768, 28232
+	return 32768, 60999
 }
 
 // SetPortRange implements Stack.
 func (*TestStack) SetPortRange(start uint16, end uint16) error {
 	// No-op.
 	return nil
+}
+
+// GROTimeout implements Stack.
+func (*TestStack) GROTimeout(NICID int32) (time.Duration, error) {
+	// No-op.
+	return 0, nil
+}
+
+// SetGROTimeout implements Stack.
+func (*TestStack) SetGROTimeout(NICID int32, timeout time.Duration) error {
+	// No-op.
+	return nil
+}
+
+// EnableSaveRestore implements Stack.
+func (*TestStack) EnableSaveRestore() error {
+	// No-op.
+	return nil
+}
+
+// IsSaveRestoreEnabled implements Stack.
+func (*TestStack) IsSaveRestoreEnabled() bool {
+	// No-op.
+	return false
+}
+
+// Stats implements Stack.
+func (*TestStack) Stats() tcpip.Stats {
+	// No-op.
+	return tcpip.Stats{}
 }

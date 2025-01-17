@@ -19,7 +19,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -45,7 +44,7 @@ import (
 // containerd instance.
 func Sandbox(name string) string {
 	// Sandbox is a default JSON config for a sandbox.
-	s := map[string]interface{}{
+	s := map[string]any{
 		"metadata": map[string]string{
 			"name":      name,
 			"namespace": "default",
@@ -65,8 +64,8 @@ func Sandbox(name string) string {
 
 // SimpleSpec returns a JSON config for a simple container that runs the
 // specified command in the specified image.
-func SimpleSpec(name, image string, cmd []string, extra map[string]interface{}) string {
-	s := map[string]interface{}{
+func SimpleSpec(name, image string, cmd []string, extra map[string]any) string {
+	s := map[string]any{
 		"metadata": map[string]string{
 			"name": name,
 		},
@@ -122,8 +121,8 @@ func TestCrictlSanity(t *testing.T) {
 
 // HttpdMountPaths is a JSON config for an httpd container with additional
 // mounts.
-var HttpdMountPaths = SimpleSpec("httpd", "basic/httpd", nil, map[string]interface{}{
-	"mounts": []map[string]interface{}{
+var HttpdMountPaths = SimpleSpec("httpd", "basic/httpd", nil, map[string]any{
+	"mounts": []map[string]any{
 		{
 			"container_path": "/var/run/secrets/kubernetes.io/serviceaccount",
 			"host_path":      "/var/lib/kubelet/pods/82bae206-cdf5-11e8-b245-8cdcd43ac064/volumes/kubernetes.io~secret/default-token-2rpfx",
@@ -145,7 +144,7 @@ var HttpdMountPaths = SimpleSpec("httpd", "basic/httpd", nil, map[string]interfa
 			"readonly":       true,
 		},
 	},
-	"linux": map[string]interface{}{},
+	"linux": map[string]any{},
 })
 
 // TestMountPaths refers to b/117635704.
@@ -312,7 +311,7 @@ disabled_plugins = ["io.containerd.internal.v1.restart"]
 func setup(t *testing.T) (*criutil.Crictl, func(), error) {
 	// Create temporary containerd root and state directories, and a socket
 	// via which crictl and containerd communicate.
-	containerdRoot, err := ioutil.TempDir(testutil.TmpDir(), "containerd-root")
+	containerdRoot, err := os.MkdirTemp(testutil.TmpDir(), "containerd-root")
 	if err != nil {
 		t.Fatalf("failed to create containerd root: %v", err)
 	}
@@ -320,14 +319,14 @@ func setup(t *testing.T) (*criutil.Crictl, func(), error) {
 	defer cu.Clean()
 	t.Logf("Using containerd root: %s", containerdRoot)
 
-	containerdState, err := ioutil.TempDir(testutil.TmpDir(), "containerd-state")
+	containerdState, err := os.MkdirTemp(testutil.TmpDir(), "containerd-state")
 	if err != nil {
 		t.Fatalf("failed to create containerd state: %v", err)
 	}
 	cu.Add(func() { os.RemoveAll(containerdState) })
 	t.Logf("Using containerd state: %s", containerdState)
 
-	sockDir, err := ioutil.TempDir(testutil.TmpDir(), "containerd-sock")
+	sockDir, err := os.MkdirTemp(testutil.TmpDir(), "containerd-sock")
 	if err != nil {
 		t.Fatalf("failed to create containerd socket directory: %v", err)
 	}
@@ -446,7 +445,7 @@ func setup(t *testing.T) (*criutil.Crictl, func(), error) {
 	}
 
 	// Discard all subsequent data.
-	go io.Copy(ioutil.Discard, startupR)
+	go io.Copy(io.Discard, startupR)
 
 	// Create the crictl interface.
 	cc := criutil.NewCrictl(t, sockAddr)

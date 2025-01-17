@@ -1,13 +1,21 @@
 load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "metric",
     srcs = [
+        "condmetric.go",
         "metric.go",
         "metric_unsafe.go",
+        "profiling_metric.go",
+        "sentry_profiling.go",
+        "sentry_profiling_fake.go",
     ],
+    stateify = False,
     visibility = ["//:sandbox"],
     deps = [
         ":metric_go_proto",
@@ -15,7 +23,9 @@ go_library(
         "//pkg/eventchannel",
         "//pkg/gohacks",
         "//pkg/log",
+        "//pkg/prometheus",
         "//pkg/sync",
+        "@org_golang_google_protobuf//encoding/protojson:go_default_library",
         "@org_golang_google_protobuf//types/known/timestamppb",
     ],
 )
@@ -31,12 +41,35 @@ proto_library(
 
 go_test(
     name = "metric_test",
-    srcs = ["metric_test.go"],
+    srcs = [
+        "metric_test.go",
+        "utils_test.go",
+    ],
+    library = ":metric",
+    tags = ["not_run:arm"],
+    deps = [
+        ":metric_go_proto",
+        "//pkg/eventchannel",
+        "//pkg/prometheus",
+        "//pkg/sync",
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@com_github_prometheus_common//expfmt",
+        "@org_golang_google_protobuf//proto:go_default_library",
+        "@org_golang_google_protobuf//testing/protocmp:go_default_library",
+    ],
+)
+
+go_test(
+    name = "condmetric_test",
+    srcs = [
+        "condmetric_profiling_disabled_test.go",
+        "condmetric_profiling_enabled_test.go",
+        "utils_test.go",
+    ],
     library = ":metric",
     deps = [
         ":metric_go_proto",
         "//pkg/eventchannel",
-        "//pkg/sync",
         "@org_golang_google_protobuf//proto:go_default_library",
     ],
 )

@@ -19,6 +19,8 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include "absl/strings/str_format.h"
 #include "absl/strings/string_view.h"
@@ -29,6 +31,18 @@
 
 namespace gvisor {
 namespace testing {
+
+// Async-signal-safe version of mmap(2).
+inline void* MmapSafe(void* addr, size_t length, int prot, int flags, int fd,
+                      off_t offset) {
+  return reinterpret_cast<void*>(
+      syscall(SYS_mmap, addr, length, prot, flags, fd, offset));
+}
+
+// Async-signal-safe version of munmap(2).
+inline int MunmapSafe(void* addr, size_t length) {
+  return syscall(SYS_munmap, addr, length);
+}
 
 // RAII type for mmap'ed memory. Only usable in tests due to use of a test-only
 // macro that can't be named without invoking the presubmit's wrath.
@@ -82,7 +96,7 @@ class Mapping {
 
   void reset(void* ptr, size_t len) {
     if (len_) {
-      TEST_PCHECK(munmap(ptr_, len_) == 0);
+      TEST_PCHECK(MunmapSafe(ptr_, len_) == 0);
     }
     ptr_ = ptr;
     len_ = len;
@@ -103,7 +117,7 @@ class Mapping {
 // Wrapper around mmap(2) that returns a Mapping.
 inline PosixErrorOr<Mapping> Mmap(void* addr, size_t length, int prot,
                                   int flags, int fd, off_t offset) {
-  void* ptr = mmap(addr, length, prot, flags, fd, offset);
+  void* ptr = MmapSafe(addr, length, prot, flags, fd, offset);
   if (ptr == MAP_FAILED) {
     return PosixError(
         errno, absl::StrFormat("mmap(%p, %d, %x, %x, %d, %d)", addr, length,

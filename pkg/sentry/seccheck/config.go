@@ -21,6 +21,7 @@ import (
 
 	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
+	"gvisor.dev/gvisor/pkg/metric"
 )
 
 // DefaultSessionName is the name of the only session that can exist in the
@@ -32,6 +33,12 @@ var (
 	sessions   = make(map[string]*State)
 )
 
+var sessionCounter = metric.MustCreateNewUint64Metric("/trace/sessions_created",
+	metric.Uint64Metadata{
+		Cumulative:  true,
+		Description: "Counts the number of trace sessions created.",
+	})
+
 // SessionConfig describes a new session configuration. A session consists of a
 // set of points to be enabled and sinks where the points are sent to.
 type SessionConfig struct {
@@ -39,6 +46,13 @@ type SessionConfig struct {
 	Name string `json:"name,omitempty"`
 	// Points is the set of points to enable in this session.
 	Points []PointConfig `json:"points,omitempty"`
+	// IgnoreMissing skips point and optional/context fields not found. This can
+	// be used to apply a single configuration file with newer points/fields with
+	// older versions which do not have them yet. Note that it may hide typos in
+	// the configuration.
+	//
+	// This field does NOT apply to sinks.
+	IgnoreMissing bool `json:"ignore_missing,omitempty"`
 	// Sinks are the sinks that will process the points enabled above.
 	Sinks []SinkConfig `json:"sinks,omitempty"`
 }
@@ -59,10 +73,12 @@ type SinkConfig struct {
 	// Name is the sink to be created. The sink must exist in the system.
 	Name string `json:"name,omitempty"`
 	// Config is a opaque json object that is passed to the sink.
-	Config map[string]interface{} `json:"config,omitempty"`
+	Config map[string]any `json:"config,omitempty"`
 	// IgnoreSetupError makes errors during sink setup to be ignored. Otherwise,
 	// failures will prevent the container from starting.
 	IgnoreSetupError bool `json:"ignore_setup_error,omitempty"`
+	// Status is the runtime status for the sink.
+	Status SinkStatus `json:"status,omitempty"`
 	// FD is the endpoint returned from Setup. It may be nil.
 	FD *fd.FD `json:"-"`
 }
@@ -91,17 +107,21 @@ func Create(conf *SessionConfig, force bool) error {
 	for _, ptConfig := range conf.Points {
 		desc, err := findPointDesc(ptConfig.Name)
 		if err != nil {
+			if conf.IgnoreMissing {
+				log.Warningf("Skipping point %q: %v", ptConfig.Name, err)
+				continue
+			}
 			return err
 		}
 		req := PointReq{Pt: desc.ID}
 
-		mask, err := setFields(ptConfig.OptionalFields, desc.OptionalFields)
+		mask, err := setFields(ptConfig.OptionalFields, desc.OptionalFields, conf.IgnoreMissing)
 		if err != nil {
 			return fmt.Errorf("configuring point %q: %w", ptConfig.Name, err)
 		}
 		req.Fields.Local = mask
 
-		mask, err = setFields(ptConfig.ContextFields, desc.ContextFields)
+		mask, err = setFields(ptConfig.ContextFields, desc.ContextFields, conf.IgnoreMissing)
 		if err != nil {
 			return fmt.Errorf("configuring point %q: %w", ptConfig.Name, err)
 		}
@@ -111,18 +131,19 @@ func Create(conf *SessionConfig, force bool) error {
 	}
 
 	for _, sinkConfig := range conf.Sinks {
-		sink, err := findSinkDesc(sinkConfig.Name)
+		desc, err := findSinkDesc(sinkConfig.Name)
 		if err != nil {
 			return err
 		}
-		checker, err := sink.New(sinkConfig.Config, sinkConfig.FD)
+		sink, err := desc.New(sinkConfig.Config, sinkConfig.FD)
 		if err != nil {
 			return fmt.Errorf("creating event sink: %w", err)
 		}
-		state.AppendChecker(checker, reqs)
+		state.AppendSink(sink, reqs)
 	}
 
 	sessions[conf.Name] = state
+	sessionCounter.Increment()
 	return nil
 }
 
@@ -171,7 +192,7 @@ func deleteLocked(name string) error {
 		return fmt.Errorf("session %q not found", name)
 	}
 
-	session.clearCheckers()
+	session.clearSink()
 	delete(sessions, name)
 	return nil
 }
@@ -181,9 +202,16 @@ func List(out *[]SessionConfig) {
 	sessionsMu.Lock()
 	defer sessionsMu.Unlock()
 
-	for name := range sessions {
+	for name, state := range sessions {
 		// Only report session name. Consider adding rest of the fields as needed.
-		*out = append(*out, SessionConfig{Name: name})
+		session := SessionConfig{Name: name}
+		for _, sink := range state.getSinks() {
+			session.Sinks = append(session.Sinks, SinkConfig{
+				Name:   sink.Name(),
+				Status: sink.Status(),
+			})
+		}
+		*out = append(*out, session)
 	}
 }
 
@@ -203,11 +231,15 @@ func findField(name string, fields []FieldDesc) (FieldDesc, error) {
 	return FieldDesc{}, fmt.Errorf("field %q not found", name)
 }
 
-func setFields(names []string, fields []FieldDesc) (FieldMask, error) {
+func setFields(names []string, fields []FieldDesc, ignoreMissing bool) (FieldMask, error) {
 	fm := FieldMask{}
 	for _, name := range names {
 		desc, err := findField(name, fields)
 		if err != nil {
+			if ignoreMissing {
+				log.Warningf("Skipping field %q: %v", name, err)
+				continue
+			}
 			return FieldMask{}, err
 		}
 		fm.Add(desc.ID)
@@ -216,7 +248,7 @@ func setFields(names []string, fields []FieldDesc) (FieldMask, error) {
 }
 
 func findSinkDesc(name string) (SinkDesc, error) {
-	if desc, ok := sinks[name]; ok {
+	if desc, ok := Sinks[name]; ok {
 		return desc, nil
 	}
 	return SinkDesc{}, fmt.Errorf("sink %q not found", name)

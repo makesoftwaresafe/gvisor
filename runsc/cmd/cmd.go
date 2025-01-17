@@ -17,43 +17,62 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 	"strconv"
+	"strings"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
 
-// intFlags can be used with int flags that appear multiple times.
+// intFlags can be used with int flags that appear multiple times. It supports
+// comma-separated lists too.
 type intFlags []int
 
 // String implements flag.Value.
 func (i *intFlags) String() string {
-	return fmt.Sprintf("%v", *i)
+	sInts := make([]string, 0, len(*i))
+	for _, fd := range *i {
+		sInts = append(sInts, strconv.Itoa(fd))
+	}
+	return strings.Join(sInts, ",")
 }
 
 // Get implements flag.Value.
-func (i *intFlags) Get() interface{} {
+func (i *intFlags) Get() any {
 	return i
 }
 
-// GetArray returns array of FDs.
+// GetArray returns an array of ints representing FDs.
 func (i *intFlags) GetArray() []int {
 	return *i
 }
 
-// Set implements flag.Value.
+// GetFDs returns an array of *fd.FD.
+func (i *intFlags) GetFDs() []*fd.FD {
+	rv := make([]*fd.FD, 0, len(*i))
+	for _, val := range *i {
+		rv = append(rv, fd.New(val))
+	}
+	return rv
+}
+
+// Set implements flag.Value. Set(String()) should be idempotent.
 func (i *intFlags) Set(s string) error {
-	fd, err := strconv.Atoi(s)
-	if err != nil {
-		return fmt.Errorf("invalid flag value: %v", err)
+	for _, sFD := range strings.Split(s, ",") {
+		fd, err := strconv.Atoi(sFD)
+		if err != nil {
+			return fmt.Errorf("invalid flag value: %v", err)
+		}
+		if fd < -1 {
+			return fmt.Errorf("flag value must be >= -1: %d", fd)
+		}
+		*i = append(*i, fd)
 	}
-	if fd < -1 {
-		return fmt.Errorf("flag value must be >= -1: %d", fd)
-	}
-	*i = append(*i, fd)
 	return nil
 }
 
@@ -71,7 +90,7 @@ func setCapsAndCallSelf(args []string, caps *specs.LinuxCapabilities) error {
 	binPath := specutils.ExePath
 
 	log.Infof("Execve %q again, bye!", binPath)
-	err := unix.Exec(binPath, args, []string{})
+	err := unix.Exec(binPath, args, os.Environ())
 	return fmt.Errorf("error executing %s: %v", binPath, err)
 }
 
@@ -89,10 +108,14 @@ func callSelfAsNobody(args []string) error {
 	if _, _, err := unix.RawSyscall(unix.SYS_SETUID, uintptr(nobody), 0, 0); err != 0 {
 		return fmt.Errorf("error setting gid: %v", err)
 	}
+	// Drop all capabilities.
+	if err := applyCaps(&specs.LinuxCapabilities{}); err != nil {
+		return fmt.Errorf("error dropping capabilities: %w", err)
+	}
 
 	binPath := specutils.ExePath
 
 	log.Infof("Execve %q again, bye!", binPath)
-	err := unix.Exec(binPath, args, []string{})
+	err := unix.Exec(binPath, args, os.Environ())
 	return fmt.Errorf("error executing %s: %v", binPath, err)
 }

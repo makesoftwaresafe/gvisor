@@ -29,11 +29,14 @@ import (
 type rootInode struct {
 	rootInodeRefs
 	kernfs.InodeAlwaysValid
+	kernfs.InodeAnonymous
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 }

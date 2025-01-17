@@ -49,8 +49,8 @@ constexpr uint64_t kMagicConstant = 0x0102030405060708;
 #define SYS_epoll_pwait2 441
 #endif
 
-int epoll_pwait2(int fd, struct epoll_event* events, int maxevents,
-                 const struct timespec* timeout, const sigset_t* sigset) {
+int test_epoll_pwait2(int fd, struct epoll_event* events, int maxevents,
+                      const struct timespec* timeout, const sigset_t* sigset) {
   return syscall(SYS_epoll_pwait2, fd, events, maxevents, timeout, sigset);
 }
 
@@ -183,8 +183,8 @@ TEST(EpollTest, EpollPwait2Timeout) {
   // The syscall returns immediately when timeout is zero,
   // even if no events are available.
   SKIP_IF(!IsRunningOnGvisor() &&
-          epoll_pwait2(epollfd.get(), result, kFDsPerEpoll, &timeout, nullptr) <
-              0 &&
+          test_epoll_pwait2(epollfd.get(), result, kFDsPerEpoll, &timeout,
+                            nullptr) < 0 &&
           errno == ENOSYS);
 
   {
@@ -192,8 +192,8 @@ TEST(EpollTest, EpollPwait2Timeout) {
     EXPECT_THAT(clock_gettime(CLOCK_MONOTONIC, &begin), SyscallSucceeds());
 
     timeout.tv_nsec = kTimeoutNs;
-    ASSERT_THAT(RetryEINTR(epoll_pwait2)(epollfd.get(), result, kFDsPerEpoll,
-                                         &timeout, nullptr),
+    ASSERT_THAT(RetryEINTR(test_epoll_pwait2)(epollfd.get(), result,
+                                              kFDsPerEpoll, &timeout, nullptr),
                 SyscallSucceedsWithValue(0));
     EXPECT_THAT(clock_gettime(CLOCK_MONOTONIC, &end), SyscallSucceeds());
   }
@@ -591,6 +591,29 @@ TEST(EpollTest, PipeReaderHupAfterWriterClosed) {
   ASSERT_THAT(epoll_wait(epollfd.get(), result, kFDsPerEpoll, 0),
               SyscallSucceedsWithValue(1));
   EXPECT_EQ(result[0].events, EPOLLHUP);
+  EXPECT_EQ(result[0].data.u64, kMagicConstant);
+}
+
+TEST(EpollTest, PipeWriterErrAfterReaderClosed) {
+  auto epollfd = ASSERT_NO_ERRNO_AND_VALUE(NewEpollFD());
+  int pipefds[2];
+  ASSERT_THAT(pipe(pipefds), SyscallSucceeds());
+  FileDescriptor rfd(pipefds[0]);
+  FileDescriptor wfd(pipefds[1]);
+
+  ASSERT_NO_ERRNO(
+      RegisterEpollFD(epollfd.get(), wfd.get(), EPOLLERR, kMagicConstant));
+  struct epoll_event result[kFDsPerEpoll];
+  // Initially, wfd should not generate any events of interest.
+  ASSERT_THAT(epoll_wait(epollfd.get(), result, kFDsPerEpoll, 0),
+              SyscallSucceedsWithValue(0));
+  // Close the read end of the pipe.
+  rfd.reset();
+  // wfd should now generate EPOLLERR, which EPOLL_CTL_ADD unconditionally adds
+  // to the set of events of interest.
+  ASSERT_THAT(epoll_wait(epollfd.get(), result, kFDsPerEpoll, 0),
+              SyscallSucceedsWithValue(1));
+  EXPECT_EQ(result[0].events, EPOLLERR);
   EXPECT_EQ(result[0].data.u64, kMagicConstant);
 }
 

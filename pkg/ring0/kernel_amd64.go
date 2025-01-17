@@ -144,6 +144,7 @@ func (c *CPU) init(cpuID int) {
 
 	c.hasXSAVE = hasXSAVE
 	c.hasXSAVEOPT = hasXSAVEOPT
+	c.hasFSGSBASE = hasFSGSBASE
 }
 
 // StackTop returns the kernel's stack address.
@@ -185,7 +186,7 @@ func (c *CPU) CR0() uint64 {
 //
 //go:nosplit
 func (c *CPU) CR4() uint64 {
-	cr4 := uint64(_CR4_PAE | _CR4_PSE | _CR4_OSFXSR | _CR4_OSXMMEXCPT)
+	cr4 := uint64(_CR4_PAE | _CR4_PSE | _CR4_PGE | _CR4_OSFXSR | _CR4_OSXMMEXCPT)
 	if hasPCID {
 		cr4 |= _CR4_PCIDE
 	}
@@ -201,6 +202,9 @@ func (c *CPU) CR4() uint64 {
 	if hasFSGSBASE {
 		cr4 |= _CR4_FSGSBASE
 	}
+	if hasUMIP {
+		cr4 |= _CR4_UMIP
+	}
 	return cr4
 }
 
@@ -215,7 +219,7 @@ func (c *CPU) EFER() uint64 {
 //
 //go:nosplit
 func IsCanonical(addr uint64) bool {
-	return addr <= 0x00007fffffffffff || addr > 0xffff800000000000
+	return addr <= 0x00007fffffffffff || addr >= 0xffff800000000000
 }
 
 // SwitchToUser performs either a sysret or an iret.

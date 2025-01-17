@@ -24,6 +24,8 @@ package context
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/log"
@@ -47,6 +49,11 @@ type Blocker interface {
 	// The return value should indicate whether the wake-up occurred as a
 	// result of the requested event (versus an external interrupt).
 	BlockOn(waiter.Waitable, waiter.EventMask) bool
+
+	// Block blocks until an event is received from C, or some external
+	// interrupt. It returns nil if an event is received from C and an err if t
+	// is interrupted.
+	Block(C <-chan struct{}) error
 
 	// BlockWithTimeoutOn blocks until either the conditions of Block are
 	// satisfied, or the timeout is hit. Note that deadlines are not supported
@@ -85,6 +92,19 @@ func (nt *NoTask) Interrupt() {
 // Interrupted implements Blocker.Interrupted.
 func (nt *NoTask) Interrupted() bool {
 	return nt.cancel != nil && len(nt.cancel) > 0
+}
+
+// Block implements Blocker.Block.
+func (nt *NoTask) Block(C <-chan struct{}) error {
+	if nt.cancel == nil {
+		nt.cancel = make(chan struct{}, 1)
+	}
+	select {
+	case <-nt.cancel:
+		return errors.New("interrupted system call") // Interrupted.
+	case <-C:
+		return nil
+	}
 }
 
 // BlockOn implements Blocker.BlockOn.
@@ -162,10 +182,8 @@ type logContext struct {
 }
 
 // bgContext is the context returned by context.Background.
-var bgContext Context = &logContext{
-	Context: context.Background(),
-	Logger:  log.Log(),
-}
+var bgContext Context
+var bgOnce sync.Once
 
 // Background returns an empty context using the default logger.
 // Generally, one should use the Task as their context when available, or avoid
@@ -173,13 +191,21 @@ var bgContext Context = &logContext{
 //
 // Using a Background context for tests is fine, as long as no values are
 // needed from the context in the tested code paths.
+//
+// The global log.SetTarget() must be called before context.Background()
 func Background() Context {
+	bgOnce.Do(func() {
+		bgContext = &logContext{
+			Context: context.Background(),
+			Logger:  log.Log(),
+		}
+	})
 	return bgContext
 }
 
 // WithValue returns a copy of parent in which the value associated with key is
 // val.
-func WithValue(parent Context, key, val interface{}) Context {
+func WithValue(parent Context, key, val any) Context {
 	return &withValue{
 		Context: parent,
 		key:     key,
@@ -189,12 +215,12 @@ func WithValue(parent Context, key, val interface{}) Context {
 
 type withValue struct {
 	Context
-	key interface{}
-	val interface{}
+	key any
+	val any
 }
 
 // Value implements Context.Value.
-func (ctx *withValue) Value(key interface{}) interface{} {
+func (ctx *withValue) Value(key any) any {
 	if key == ctx.key {
 		return ctx.val
 	}

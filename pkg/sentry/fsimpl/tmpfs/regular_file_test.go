@@ -23,7 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/sentry/contexttest"
-	"gvisor.dev/gvisor/pkg/sentry/fs/lock"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/lock"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -182,7 +182,7 @@ func TestPRead(t *testing.T) {
 	defer cleanup()
 
 	// Write 100 sequences of 'gVisor is awesome'.
-	data := bytes.Repeat([]byte("gVisor is awsome"), 100)
+	data := bytes.Repeat([]byte("gVisor is awesome"), 100)
 	n, err := fd.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
 	if err != nil {
 		t.Fatalf("fd.Write failed: %v", err)
@@ -236,7 +236,7 @@ func TestTruncate(t *testing.T) {
 	defer cleanup()
 
 	// Fill the file with some data.
-	data := bytes.Repeat([]byte("gVisor is awsome"), 100)
+	data := bytes.Repeat([]byte("gVisor is awesome"), 100)
 	written, err := fd.Write(ctx, usermem.BytesIOSequence(data), vfs.WriteOptions{})
 	if err != nil {
 		t.Fatalf("fd.Write failed: %v", err)

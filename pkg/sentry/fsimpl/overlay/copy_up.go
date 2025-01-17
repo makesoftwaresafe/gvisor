@@ -31,6 +31,18 @@ func (d *dentry) isCopiedUp() bool {
 	return d.copiedUp.Load() != 0
 }
 
+func (d *dentry) canBeCopiedUp() bool {
+	ftype := d.mode.Load() & linux.S_IFMT
+	switch ftype {
+	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFBLK, linux.S_IFCHR:
+		// Can be copied-up.
+		return true
+	default:
+		// Can't be copied-up.
+		return false
+	}
+}
+
 // copyUpLocked ensures that d exists on the upper layer, i.e. d.upperVD.Ok().
 //
 // Preconditions: filesystem.renameMu must be locked.
@@ -48,21 +60,17 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	// credentials from context rather an take an explicit creds parameter.
 	ctx = auth.ContextWithCredentials(ctx, d.fs.creds)
 
-	ftype := d.mode.Load() & linux.S_IFMT
-	switch ftype {
-	case linux.S_IFREG, linux.S_IFDIR, linux.S_IFLNK, linux.S_IFBLK, linux.S_IFCHR:
-		// Can be copied-up.
-	default:
-		// Can't be copied-up.
+	if !d.canBeCopiedUp() {
 		return linuxerr.EPERM
 	}
 
 	// Ensure that our parent directory is copied-up.
-	if d.parent == nil {
+	parent := d.parent.Load()
+	if parent == nil {
 		// d is a filesystem root with no upper layer.
 		return linuxerr.EROFS
 	}
-	if err := d.parent.copyUpMaybeSyntheticMountpointLocked(ctx, forSyntheticMountpoint); err != nil {
+	if err := parent.copyUpMaybeSyntheticMountpointLocked(ctx, forSyntheticMountpoint); err != nil {
 		return err
 	}
 
@@ -92,9 +100,10 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 	}
 
 	// Perform copy-up.
+	ftype := d.mode.Load() & linux.S_IFMT
 	newpop := vfs.PathOperation{
-		Root:  d.parent.upperVD,
-		Start: d.parent.upperVD,
+		Root:  parent.upperVD,
+		Start: parent.upperVD,
 		Path:  fspath.Parse(d.name),
 	}
 	// Used during copy-up of memory-mapped regular files.
@@ -136,8 +145,6 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 			cleanupUndoCopyUp()
 			return err
 		}
-		d.mapsMu.Lock()
-		defer d.mapsMu.Unlock()
 		if d.wrappedMappable != nil {
 			// We may have memory mappings of the file on the lower layer.
 			// Switch to mapping the file on the upper layer instead.
@@ -287,11 +294,18 @@ func (d *dentry) copyUpMaybeSyntheticMountpointLocked(ctx context.Context, forSy
 		d.devMajor.Store(upperStat.DevMajor)
 		d.devMinor.Store(upperStat.DevMinor)
 		d.ino.Store(upperStat.Ino)
+
+		// Lower level dentries for non-directories are no longer accessible from
+		// the overlayfs anymore after copyup. Ask filesystems to release their
+		// resources whenever possible.
+		for _, lowerDentry := range d.lowerVDs {
+			lowerDentry.Dentry().MarkEvictable()
+		}
 	}
 
 	if mmapOpts != nil && mmapOpts.Mappable != nil {
-		// Note that if mmapOpts != nil, then d.mapsMu is locked for writing
-		// (from the S_IFREG path above).
+		d.mapsMu.Lock()
+		defer d.mapsMu.Unlock()
 
 		// Propagate mappings of d to the new Mappable. Remember which mappings
 		// we added so we can remove them on failure.

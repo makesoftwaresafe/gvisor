@@ -22,7 +22,6 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -42,7 +41,7 @@ func TestV4MappedConnectOnV6Only(t *testing.T) {
 
 	// Start connection attempt, it must fail.
 	err := c.EP.Connect(tcpip.FullAddress{Addr: context.TestV4MappedAddr, Port: context.TestPort})
-	if d := cmp.Diff(&tcpip.ErrNoRoute{}, err); d != "" {
+	if d := cmp.Diff(&tcpip.ErrHostUnreachable{}, err); d != "" {
 		t.Fatalf("c.EP.Connect(...) mismatch (-want +got):\n%s", d)
 	}
 }
@@ -198,7 +197,9 @@ func TestV4RefuseOnV6Only(t *testing.T) {
 	})
 
 	// Receive the RST reply.
-	checker.IPv4(t, c.GetPacket(),
+	v := c.GetPacket()
+	defer v.Release()
+	checker.IPv4(t, v,
 		checker.TCP(
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
@@ -234,7 +235,9 @@ func TestV6RefuseOnBoundToV4Mapped(t *testing.T) {
 	})
 
 	// Receive the RST reply.
-	checker.IPv6(t, c.GetV6Packet(),
+	p := c.GetV6Packet()
+	defer p.Release()
+	checker.IPv6(t, p,
 		checker.TCP(
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
@@ -264,10 +267,11 @@ func testV4Accept(t *testing.T, c *context.Context) {
 	})
 
 	// Receive the SYN-ACK reply.
-	b := c.GetPacket()
-	tcp := header.TCP(header.IPv4(b).Payload())
+	v := c.GetPacket()
+	defer v.Release()
+	tcp := header.TCP(header.IPv4(v.AsSlice()).Payload())
 	iss := seqnum.Value(tcp.SequenceNumber())
-	checker.IPv4(t, b,
+	checker.IPv4(t, v,
 		checker.TCP(
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
@@ -320,8 +324,9 @@ func testV4Accept(t *testing.T, c *context.Context) {
 	data := "Don't panic"
 	r.Reset(data)
 	nep.Write(&r, tcpip.WriteOptions{})
-	b = c.GetPacket()
-	tcp = header.IPv4(b).Payload()
+	v = c.GetPacket()
+	defer v.Release()
+	tcp = header.IPv4(v.AsSlice()).Payload()
 	if string(tcp.Payload()) != data {
 		t.Fatalf("Unexpected data: got %v, want %v", string(tcp.Payload()), data)
 	}
@@ -398,10 +403,11 @@ func TestV6AcceptOnV6(t *testing.T) {
 	})
 
 	// Receive the SYN-ACK reply.
-	b := c.GetV6Packet()
-	tcp := header.TCP(header.IPv6(b).Payload())
+	v := c.GetV6Packet()
+	defer v.Release()
+	tcp := header.TCP(header.IPv6(v.AsSlice()).Payload())
 	iss := seqnum.Value(tcp.SequenceNumber())
-	checker.IPv6(t, b,
+	checker.IPv6(t, v,
 		checker.TCP(
 			checker.SrcPort(context.StackPort),
 			checker.DstPort(context.TestPort),
@@ -493,8 +499,9 @@ func testV4ListenClose(t *testing.T, c *context.Context) {
 	// Each of these ACKs will cause a syn-cookie based connection to be
 	// accepted and delivered to the listening endpoint.
 	for i := 0; i < n; i++ {
-		b := c.GetPacket()
-		tcp := header.TCP(header.IPv4(b).Payload())
+		v := c.GetPacket()
+		defer v.Release()
+		tcp := header.TCP(header.IPv4(v.AsSlice()).Payload())
 		iss := seqnum.Value(tcp.SequenceNumber())
 		// Send ACK.
 		c.SendPacket(nil, &context.Headers{
@@ -555,6 +562,6 @@ func TestMain(m *testing.M) {
 	// Allow TCP async work to complete to avoid false reports of leaks.
 	// TODO(gvisor.dev/issue/5940): Use fake clock in tests.
 	time.Sleep(1 * time.Second)
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

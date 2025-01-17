@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "tools",
@@ -8,11 +11,13 @@ go_library(
     srcs = [
         "ab.go",
         "fio.go",
+        "hackbench.go",
         "hey.go",
         "iperf.go",
         "meminfo.go",
         "parser_util.go",
         "redis.go",
+        "rubydev.go",
         "sysbench.go",
         "tools.go",
     ],
@@ -28,7 +33,6 @@ go_test(
         "hey_test.go",
         "iperf_test.go",
         "meminfo_test.go",
-        "redis_test.go",
         "sysbench_test.go",
     ],
     library = ":tools",

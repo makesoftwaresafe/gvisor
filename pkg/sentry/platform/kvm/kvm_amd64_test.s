@@ -15,7 +15,19 @@
 #include "textflag.h"
 
 // stmxcsr reads the MXCSR control and status register.
-TEXT ·stmxcsr(SB),NOSPLIT,$0-8
+TEXT ·stmxcsr(SB),NOSPLIT|NOFRAME,$0-8
 	MOVQ addr+0(FP), SI
 	STMXCSR (SI)
+	RET
+
+TEXT ·vmcall(SB),NOSPLIT,$0-16
+	MOVQ $ax+0(FP), AX
+	BYTE $0x0F; BYTE $0x01; BYTE $0xC1; // vmcall
+	MOVQ AX, ret+8(FP)
+	RET
+
+TEXT ·vmmcall(SB),NOSPLIT,$0-16
+	MOVQ $ax+0(FP), AX
+	BYTE $0x0F; BYTE $0x01; BYTE $0xD9; // vmmcall
+	MOVQ AX, ret+8(FP)
 	RET

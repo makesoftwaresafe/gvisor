@@ -61,7 +61,7 @@ var linuxARM64 = SyscallMap{
 	33:  makeSyscallInfo("mknodat", FD, Path, Mode, Hex),
 	34:  makeSyscallInfo("mkdirat", FD, Path, Hex),
 	35:  makeSyscallInfo("unlinkat", FD, Path, Hex),
-	36:  makeSyscallInfo("symlinkat", Path, Hex, Path),
+	36:  makeSyscallInfo("symlinkat", Path, FD, Path),
 	37:  makeSyscallInfo("linkat", FD, Path, Hex, Path, Hex),
 	38:  makeSyscallInfo("renameat", FD, Path, Hex, Path),
 	39:  makeSyscallInfo("umount2", Path, Hex),
@@ -314,6 +314,7 @@ var linuxARM64 = SyscallMap{
 	434: makeSyscallInfo("pidfd_open", Hex, Hex),
 	435: makeSyscallInfo("clone3", Hex, Hex),
 	436: makeSyscallInfo("close_range", FD, FD, CloseRangeFlags),
+	439: makeSyscallInfo("faccessat2", FD, Path, Oct, Hex),
 	441: makeSyscallInfo("epoll_pwait2", FD, EpollEvents, Hex, Timespec, SigSet),
 }
 

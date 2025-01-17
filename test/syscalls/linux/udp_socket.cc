@@ -17,6 +17,7 @@
 #include <netinet/icmp6.h>
 #include <netinet/ip_icmp.h>
 
+#include <cerrno>
 #include <ctime>
 #include <utility>
 #include <vector>
@@ -52,6 +53,13 @@ namespace gvisor {
 namespace testing {
 
 namespace {
+
+int IcmpTimeoutMillis() {
+  // Fuchsia's CI infra is susceptible to timing jumps. Set a negative timeout
+  // so that poll will block indefinitely, which effectively delegates the
+  // timeout to infra.
+  return GvisorPlatform() == Platform::kFuchsia ? -1 : 1000;
+}
 
 // Fixture for tests parameterized by the address family to use (AF_INET and
 // AF_INET6) when creating sockets.
@@ -97,6 +105,18 @@ class UdpSocketTest : public ::testing::TestWithParam<int> {
   // Helper to initialize addrlen_ for the test case.
   socklen_t GetAddrLength();
 };
+
+// Blocks until POLLIN is signaled on fd.
+void BlockUntilPollin(int fd) {
+  constexpr int kInfiniteTimeout = -1;
+  pollfd pfd = {
+      .fd = fd,
+      .events = POLLIN,
+  };
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kInfiniteTimeout),
+              SyscallSucceedsWithValue(1));
+  ASSERT_EQ(pfd.revents, POLLIN);
+}
 
 // Gets a pointer to the port component of the given address.
 uint16_t* Port(struct sockaddr_storage* addr) {
@@ -200,20 +220,7 @@ sockaddr_storage UdpSocketTest::InetAnyAddr() {
 }
 
 sockaddr_storage UdpSocketTest::InetLoopbackAddr() {
-  struct sockaddr_storage addr;
-  memset(&addr, 0, sizeof(addr));
-  AsSockAddr(&addr)->sa_family = GetParam();
-
-  if (GetParam() == AF_INET) {
-    auto sin = reinterpret_cast<struct sockaddr_in*>(&addr);
-    sin->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    sin->sin_port = htons(0);
-    return addr;
-  }
-  auto sin6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
-  sin6->sin6_addr = in6addr_loopback;
-  sin6->sin6_port = htons(0);
-  return addr;
+  return gvisor::testing::InetLoopbackAddr(GetParam());
 }
 
 void UdpSocketTest::Disconnect(int sockfd) {
@@ -371,11 +378,14 @@ TEST_P(UdpSocketTest, ConnectWriteToInvalidPort) {
   ASSERT_THAT(getsockname(s.get(), addr, &addrlen), SyscallSucceeds());
   EXPECT_EQ(addrlen, addrlen_);
   EXPECT_NE(*Port(&addr_storage), 0);
-  ASSERT_THAT(close(s.release()), SyscallSucceeds());
-
-  // Now connect to the port that we just released. This should generate an
-  // ECONNREFUSED error.
+  // Connect to the same address. This won't send data yet but will ensure that
+  // the local port chosen for the connecting socket is different from the
+  // remote port, since it is still in use.
   ASSERT_THAT(connect(sock_.get(), addr, addrlen_), SyscallSucceeds());
+
+  // Now free the destination port and then send a packet to it. This should
+  // generate an ECONNREFUSED error.
+  ASSERT_THAT(close(s.release()), SyscallSucceeds());
   char buf[512];
   RandomizeBuffer(buf, sizeof(buf));
   // Send from sock_ to an unbound port.
@@ -383,9 +393,9 @@ TEST_P(UdpSocketTest, ConnectWriteToInvalidPort) {
               SyscallSucceedsWithValue(sizeof(buf)));
 
   // Poll to make sure we get the ICMP error back.
-  constexpr int kTimeout = 1000;
   struct pollfd pfd = {sock_.get(), POLLERR, 0};
-  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kTimeout), SyscallSucceedsWithValue(1));
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, IcmpTimeoutMillis()),
+              SyscallSucceedsWithValue(1));
 
   // Now verify that we got an ICMP error back of ECONNREFUSED.
   int err;
@@ -571,7 +581,7 @@ TEST_P(UdpSocketTest, DisconnectAfterBind) {
   // Bind to the next port above bind_.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&addr_storage, *Port(&bind_addr_storage_) - 1);
   ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
   // Connect the socket.
@@ -662,7 +672,7 @@ TEST_P(UdpSocketTest, BindToAnyConnnectToLocalhost) {
 
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&addr_storage, *Port(&bind_addr_storage_) - 1);
   socklen_t addrlen = sizeof(addr);
 
   // Connect the socket.
@@ -689,7 +699,7 @@ TEST_P(UdpSocketTest, DisconnectAfterBindToAny) {
 
   struct sockaddr_storage any_storage = InetAnyAddr();
   struct sockaddr* any = AsSockAddr(&any_storage);
-  SetPort(&any_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&any_storage, *Port(&bind_addr_storage_) - 1);
 
   ASSERT_NO_ERRNO(BindSocket(sock_.get(), any));
 
@@ -717,7 +727,7 @@ TEST_P(UdpSocketTest, Disconnect) {
 
   struct sockaddr_storage any_storage = InetAnyAddr();
   struct sockaddr* any = AsSockAddr(&any_storage);
-  SetPort(&any_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&any_storage, *Port(&bind_addr_storage_) - 1);
   ASSERT_NO_ERRNO(BindSocket(sock_.get(), any));
 
   for (int i = 0; i < 2; i++) {
@@ -763,7 +773,7 @@ TEST_P(UdpSocketTest, SendToAddressOtherThanConnected) {
 
   struct sockaddr_storage addr_storage = InetAnyAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&addr_storage, *Port(&bind_addr_storage_) - 1);
 
   ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
 
@@ -775,22 +785,23 @@ TEST_P(UdpSocketTest, SendToAddressOtherThanConnected) {
 
 TEST_P(UdpSocketTest, ConnectAndSendNoReceiver) {
   ASSERT_NO_ERRNO(BindLoopback());
-  // Close the socket to release the port so that we get an ICMP error.
-  ASSERT_THAT(close(bind_.release()), SyscallSucceeds());
-
   // Connect to loopback:bind_addr_ which should *hopefully* not be bound by an
   // UDP socket. There is no easy way to ensure that the UDP port is not bound
   // by another conncurrently running test. *This is potentially flaky*.
   ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
 
+  // Close the socket after connecting to the bound address to make sure `sock_`
+  // doesn't get auto-bound to the same port.
+  ASSERT_THAT(close(bind_.release()), SyscallSucceeds());
+
   char buf[512];
   EXPECT_THAT(send(sock_.get(), buf, sizeof(buf), 0),
               SyscallSucceedsWithValue(sizeof(buf)));
 
-  constexpr int kTimeout = 1000;
   // Poll to make sure we get the ICMP error back before issuing more writes.
   struct pollfd pfd = {sock_.get(), POLLERR, 0};
-  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kTimeout), SyscallSucceedsWithValue(1));
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, IcmpTimeoutMillis()),
+              SyscallSucceedsWithValue(1));
 
   // Next write should fail with ECONNREFUSED due to the ICMP error generated in
   // response to the previous write.
@@ -802,7 +813,8 @@ TEST_P(UdpSocketTest, ConnectAndSendNoReceiver) {
   ASSERT_THAT(send(sock_.get(), buf, sizeof(buf), 0), SyscallSucceeds());
 
   // Poll to make sure we get the ICMP error back before issuing more writes.
-  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, kTimeout), SyscallSucceedsWithValue(1));
+  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, IcmpTimeoutMillis()),
+              SyscallSucceedsWithValue(1));
 
   // Next write should fail with ECONNREFUSED due to the ICMP error generated in
   // response to the previous write.
@@ -953,14 +965,14 @@ TEST_P(UdpSocketTest, ZerolengthWriteAllowed) {
   SKIP_IF(IsRunningWithHostinet());
 
   ASSERT_NO_ERRNO(BindLoopback());
-  // Connect to loopback:bind_addr_+1.
+
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
-  // Bind sock to loopback:bind_addr_+1.
-  ASSERT_THAT(bind(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  // Connect `bind_` to `sock_`.
+  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
   char buf[3];
   // Send zero length packet from bind_ to sock_.
@@ -982,14 +994,13 @@ TEST_P(UdpSocketTest, ZerolengthWriteAllowedNonBlockRead) {
 
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
-  // Bind sock to loopback:bind_addr_port+1.
-  ASSERT_THAT(bind(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  // Connect `bind_` to `sock_`.
+  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
   // Set sock to non-blocking.
   int opts = 0;
@@ -1033,14 +1044,13 @@ TEST_P(UdpSocketTest, SendAndReceiveNotConnected) {
 TEST_P(UdpSocketTest, SendAndReceiveConnected) {
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
-  // Bind sock to loopback:bind_addr_port+1.
-  ASSERT_THAT(bind(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  // Connect `bind_` to `sock_`.
+  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
   // Send some data from sock to bind_.
   char buf[512];
@@ -1059,17 +1069,13 @@ TEST_P(UdpSocketTest, SendAndReceiveConnected) {
 TEST_P(UdpSocketTest, ReceiveFromNotConnected) {
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
-  // Bind sock to loopback:bind_addr_port+2.
-  struct sockaddr_storage addr2_storage = InetLoopbackAddr();
-  struct sockaddr* addr2 = AsSockAddr(&addr2_storage);
-  SetPort(&addr2_storage, *Port(&bind_addr_storage_) + 2);
-  ASSERT_THAT(bind(sock_.get(), addr2, addrlen_), SyscallSucceeds());
+  // Connect `bind_` to itself.
+  ASSERT_THAT(connect(bind_.get(), bind_addr_, addrlen_), SyscallSucceeds());
 
   // Send some data from sock to bind_.
   char buf[512];
@@ -1078,18 +1084,17 @@ TEST_P(UdpSocketTest, ReceiveFromNotConnected) {
 
   // Check that the data isn't received because it was sent from a different
   // address than we're connected.
-  EXPECT_THAT(recv(sock_.get(), buf, sizeof(buf), MSG_DONTWAIT),
+  EXPECT_THAT(recv(bind_.get(), buf, sizeof(buf), MSG_DONTWAIT),
               SyscallFailsWithErrno(EWOULDBLOCK));
 }
 
 TEST_P(UdpSocketTest, ReceiveBeforeConnect) {
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Bind sock to loopback:bind_addr_port+2.
-  struct sockaddr_storage addr2_storage = InetLoopbackAddr();
-  struct sockaddr* addr2 = AsSockAddr(&addr2_storage);
-  SetPort(&addr2_storage, *Port(&bind_addr_storage_) + 2);
-  ASSERT_THAT(bind(sock_.get(), addr2, addrlen_), SyscallSucceeds());
+  // Bind `sock_` to loopback.
+  struct sockaddr_storage addr_storage = InetLoopbackAddr();
+  struct sockaddr* addr = AsSockAddr(&addr_storage);
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
   // Send some data from sock to bind_.
   char buf[512];
@@ -1098,11 +1103,11 @@ TEST_P(UdpSocketTest, ReceiveBeforeConnect) {
   ASSERT_THAT(sendto(sock_.get(), buf, sizeof(buf), 0, bind_addr_, addrlen_),
               SyscallSucceedsWithValue(sizeof(buf)));
 
-  // Connect to loopback:bind_addr_port+1.
-  struct sockaddr_storage addr_storage = InetLoopbackAddr();
-  struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  // Wait for the data to arrive.
+  ASSERT_NO_FATAL_FAILURE(BlockUntilPollin(bind_.get()));
+
+  // Connect `bind_` to itself.
+  ASSERT_THAT(connect(bind_.get(), bind_addr_, addrlen_), SyscallSucceeds());
 
   // Receive the data. It works because it was sent before the connect.
   char received[sizeof(buf)];
@@ -1122,14 +1127,13 @@ TEST_P(UdpSocketTest, ReceiveBeforeConnect) {
 TEST_P(UdpSocketTest, ReceiveFrom) {
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
-  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
 
-  // Bind sock to loopback:bind_addr_port+1.
-  ASSERT_THAT(bind(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  // Connect `bind_` to `sock_`.
+  ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
   // Send some data from sock to bind_.
   char buf[512];
@@ -1165,14 +1169,15 @@ TEST_P(UdpSocketTest, Accept) {
 TEST_P(UdpSocketTest, ReadShutdownNonblockPendingData) {
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Bind `sock_` to loopback.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
+
+  // Connect `bind_` to `sock_`.
   ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
-  // Bind to loopback:bind_addr_port+1 and connect to bind_addr_.
-  ASSERT_THAT(bind(sock_.get(), addr, addrlen_), SyscallSucceeds());
+  // Connect `sock_` to `bind_addr_`.
   ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
 
   // Verify that we get EWOULDBLOCK when there is nothing to read.
@@ -1190,11 +1195,10 @@ TEST_P(UdpSocketTest, ReadShutdownNonblockPendingData) {
   ASSERT_THAT(opts = fcntl(bind_.get(), F_GETFL), SyscallSucceeds());
   ASSERT_NE(opts & O_NONBLOCK, 0);
 
-  EXPECT_THAT(shutdown(bind_.get(), SHUT_RD), SyscallSucceeds());
+  // Wait for the data to arrive.
+  ASSERT_NO_FATAL_FAILURE(BlockUntilPollin(bind_.get()));
 
-  struct pollfd pfd = {bind_.get(), POLLIN, 0};
-  ASSERT_THAT(RetryEINTR(poll)(&pfd, 1, /*timeout=*/1000),
-              SyscallSucceedsWithValue(1));
+  EXPECT_THAT(shutdown(bind_.get(), SHUT_RD), SyscallSucceeds());
 
   // We should get the data even though read has been shutdown.
   EXPECT_THAT(RecvTimeout(bind_.get(), received, 2 /*buf_size*/, 1 /*timeout*/),
@@ -1221,10 +1225,10 @@ TEST_P(UdpSocketTest, ReadShutdownSameSocketResetsShutdownState) {
   // Connect the socket, then try to shutdown again.
   ASSERT_NO_ERRNO(BindLoopback());
 
-  // Connect to loopback:bind_addr_port+1.
+  // Connect `bind_` to itself since we know the port number is valid.
   struct sockaddr_storage addr_storage = InetLoopbackAddr();
   struct sockaddr* addr = AsSockAddr(&addr_storage);
-  SetPort(&addr_storage, *Port(&bind_addr_storage_) + 1);
+  SetPort(&addr_storage, *Port(&bind_addr_storage_));
   ASSERT_THAT(connect(bind_.get(), addr, addrlen_), SyscallSucceeds());
 
   EXPECT_THAT(recv(bind_.get(), received, sizeof(received), MSG_DONTWAIT),
@@ -1571,10 +1575,6 @@ TEST_P(UdpSocketTest, FIONREADZeroLengthWriteShutdown) {
 }
 
 TEST_P(UdpSocketTest, SoNoCheckOffByDefault) {
-  // TODO(gvisor.dev/issue/1202): SO_NO_CHECK socket option not supported by
-  // hostinet.
-  SKIP_IF(IsRunningWithHostinet());
-
   int v = -1;
   socklen_t optlen = sizeof(v);
   ASSERT_THAT(getsockopt(bind_.get(), SOL_SOCKET, SO_NO_CHECK, &v, &optlen),
@@ -1584,10 +1584,6 @@ TEST_P(UdpSocketTest, SoNoCheckOffByDefault) {
 }
 
 TEST_P(UdpSocketTest, SoNoCheck) {
-  // TODO(gvisor.dev/issue/1202): SO_NO_CHECK socket option not supported by
-  // hostinet.
-  SKIP_IF(IsRunningWithHostinet());
-
   int v = kSockOptOn;
   socklen_t optlen = sizeof(v);
   ASSERT_THAT(setsockopt(bind_.get(), SOL_SOCKET, SO_NO_CHECK, &v, optlen),
@@ -2109,6 +2105,9 @@ class UdpSocketControlMessagesTest
 };
 
 TEST_P(UdpSocketControlMessagesTest, SetAndReceiveTOSOrTClass) {
+  // TODO(b/267210840): Test is flaky on hostinet.
+  SKIP_IF(IsRunningWithHostinet());
+
   // Enable receiving TOS and maybe TClass on the receiver.
   ASSERT_THAT(setsockopt(server_.get(), SOL_IP, IP_RECVTOS, &kSockOptOn,
                          sizeof(kSockOptOn)),
@@ -2434,6 +2433,55 @@ TEST_P(UdpSocketTest, SendPacketLargerThanSendBufOnNonBlockingSocket) {
             SyscallFailsWithErrno(EAGAIN)));
 }
 
+TEST_P(UdpSocketTest, ReadShutdownOnBoundSocket) {
+  ASSERT_NO_ERRNO(BindLoopback());
+
+  // Bind `sock_` to loopback.
+  struct sockaddr_storage addr_storage = InetLoopbackAddr();
+  struct sockaddr* addr = AsSockAddr(&addr_storage);
+  ASSERT_NO_ERRNO(BindSocket(sock_.get(), addr));
+
+  int shut_opts[] = {SHUT_RD, SHUT_WR, SHUT_RDWR};
+  for (int shut_opt : shut_opts) {
+    EXPECT_THAT(shutdown(sock_.get(), shut_opt),
+                SyscallFailsWithErrno(ENOTCONN));
+  }
+}
+
+TEST_P(UdpSocketTest, ReconnectDoesNotClearReadShutdown) {
+  // TODO(gvisor.dev/issue/1202): Reconnecting the UDP socket after shutdown
+  // fails on hostinet.
+  SKIP_IF(IsRunningWithHostinet());
+  ASSERT_NO_ERRNO(BindLoopback());
+  ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
+  ASSERT_THAT(shutdown(sock_.get(), SHUT_RD), SyscallSucceeds());
+
+  char received[512];
+  EXPECT_THAT(recv(sock_.get(), received, sizeof(received), 0),
+              SyscallSucceedsWithValue(0));
+
+  EXPECT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
+  EXPECT_THAT(recv(sock_.get(), received, sizeof(received), 0),
+              SyscallSucceedsWithValue(0));
+}
+
+TEST_P(UdpSocketTest, ReconnectDoesNotClearWriteShutdown) {
+  // TODO(gvisor.dev/issue/1202): Reconnecting the UDP socket after shutdown
+  // fails on hostinet.
+  SKIP_IF(IsRunningWithHostinet());
+  ASSERT_NO_ERRNO(BindLoopback());
+  ASSERT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
+
+  const char buf = 'A';
+  ASSERT_THAT(send(sock_.get(), &buf, 1, 0), SyscallSucceeds());
+
+  ASSERT_THAT(shutdown(sock_.get(), SHUT_WR), SyscallSucceeds());
+  EXPECT_THAT(send(sock_.get(), &buf, 1, 0), SyscallFailsWithErrno(EPIPE));
+
+  EXPECT_THAT(connect(sock_.get(), bind_addr_, addrlen_), SyscallSucceeds());
+  EXPECT_THAT(send(sock_.get(), &buf, 1, 0), SyscallFailsWithErrno(EPIPE));
+}
+
 INSTANTIATE_TEST_SUITE_P(AllInetTests, UdpSocketControlMessagesTest,
                          ::testing::Values(AddressFamily::kIpv4,
                                            AddressFamily::kIpv6,
@@ -2462,7 +2510,7 @@ TEST(UdpInet6SocketTest, ConnectInet4Sockaddr) {
   ASSERT_NE(addr = inet_ntop(sockname.ss_family, &sockname, addr_buf,
                              sizeof(addr_buf)),
             nullptr);
-  ASSERT_TRUE(IN6_IS_ADDR_V4MAPPED(sin6->sin6_addr.s6_addr)) << addr;
+  ASSERT_TRUE(IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) << addr;
 }
 
 }  // namespace

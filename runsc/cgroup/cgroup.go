@@ -23,7 +23,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,9 +38,14 @@ import (
 )
 
 const (
-	cgroupRoot     = "/sys/fs/cgroup"
 	cgroupv1FsName = "cgroup"
 	cgroupv2FsName = "cgroup2"
+
+	// procRoot is the procfs root this module uses.
+	procRoot = "/proc"
+
+	// cgroupRoot is the cgroupfs root this module uses.
+	cgroupRoot = "/sys/fs/cgroup"
 )
 
 var controllers = map[string]controller{
@@ -112,7 +116,7 @@ func setValue(path, name, data string) error {
 	return writeFile(fullpath, []byte(data), 0700)
 }
 
-// writeFile is similar to ioutil.WriteFile() but doesn't create the file if it
+// writeFile is similar to os.WriteFile() but doesn't create the file if it
 // doesn't exist.
 func writeFile(path string, data []byte, perm os.FileMode) error {
 	f, err := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, perm)
@@ -127,7 +131,7 @@ func writeFile(path string, data []byte, perm os.FileMode) error {
 
 func getValue(path, name string) (string, error) {
 	fullpath := filepath.Join(path, name)
-	out, err := ioutil.ReadFile(fullpath)
+	out, err := os.ReadFile(fullpath)
 	if err != nil {
 		return "", err
 	}
@@ -145,7 +149,7 @@ func getInt(path, name string) (int, error) {
 // fillFromAncestor sets the value of a cgroup file from the first ancestor
 // that has content. It does nothing if the file in 'path' has already been set.
 func fillFromAncestor(path string) (string, error) {
-	out, err := ioutil.ReadFile(path)
+	out, err := os.ReadFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -206,7 +210,7 @@ func countCpuset(cpuset string) (int, error) {
 
 // loadPaths loads cgroup paths for given 'pid', may be set to 'self'.
 func loadPaths(pid string) (map[string]string, error) {
-	procCgroup, err := os.Open(filepath.Join("/proc", pid, "cgroup"))
+	procCgroup, err := os.Open(filepath.Join(procRoot, pid, "cgroup"))
 	if err != nil {
 		return nil, err
 	}
@@ -214,7 +218,7 @@ func loadPaths(pid string) (map[string]string, error) {
 
 	// Load mountinfo for the current process, because it's where cgroups is
 	// being accessed from.
-	mountinfo, err := os.Open(filepath.Join("/proc/self/mountinfo"))
+	mountinfo, err := os.Open(filepath.Join(procRoot, "self/mountinfo"))
 	if err != nil {
 		return nil, err
 	}
@@ -337,18 +341,6 @@ type cgroupV1 struct {
 	Own     map[string]bool   `json:"own"`
 }
 
-// NewFromSpec creates a new Cgroup instance if the spec includes a cgroup path.
-// Returns nil otherwise. Cgroup paths are loaded based on the current process.
-// If useSystemd is true, the Cgroup will be created and managed with
-// systemd. This requires systemd (>=v244) to be running on the host and the
-// cgroup path to be in the form `slice:prefix:name`.
-func NewFromSpec(spec *specs.Spec, useSystemd bool) (Cgroup, error) {
-	if spec.Linux == nil || spec.Linux.CgroupsPath == "" {
-		return nil, nil
-	}
-	return NewFromPath(spec.Linux.CgroupsPath, useSystemd)
-}
-
 // NewFromPath creates a new Cgroup instance from the specified relative path.
 // Cgroup paths are loaded based on the current process.
 // If useSystemd is true, the Cgroup will be created and managed with
@@ -364,6 +356,36 @@ func NewFromPath(cgroupsPath string, useSystemd bool) (Cgroup, error) {
 // cgroup path to be in the form `slice:prefix:name`.
 func NewFromPid(pid int, useSystemd bool) (Cgroup, error) {
 	return new(strconv.Itoa(pid), "", useSystemd)
+}
+
+// LikelySystemdPath returns true if the path looks like a systemd path. This is
+// by no means an exhaustive check, it's just a useful proxy for logging a
+// warning.
+func LikelySystemdPath(path string) bool {
+	parts := strings.SplitN(path, ":", 4)
+	return len(parts) == 3
+}
+
+// TransformSystemdPath transforms systemd path to be in the form
+// `slice:prefix:name`. It returns an error if path could not be parsed as a
+// valid systemd path.
+func TransformSystemdPath(path, cid string, rootless bool) (string, error) {
+	if len(path) == 0 {
+		path = fmt.Sprintf(":runsc:%s", cid)
+	}
+	parts := strings.SplitN(path, ":", 4)
+	if len(parts) != 3 {
+		return "", fmt.Errorf("invalid systemd path: %q", path)
+	}
+	slice, prefix, name := parts[0], parts[1], parts[2]
+	if len(slice) == 0 {
+		if rootless {
+			slice = "user.slice"
+		} else {
+			slice = "system.slice"
+		}
+	}
+	return fmt.Sprintf("%s:%s:%s", slice, prefix, name), nil
 }
 
 func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
@@ -408,67 +430,67 @@ func new(pid, cgroupsPath string, useSystemd bool) (Cgroup, error) {
 
 // CgroupJSON is a wrapper for Cgroup that can be encoded to JSON.
 type CgroupJSON struct {
-	Cgroup     Cgroup `json:"cgroup"`
-	UseSystemd bool   `json:"useSystemd"`
+	Cgroup Cgroup
 }
 
 type cgroupJSONv1 struct {
-	Cgroup *cgroupV1 `json:"cgroup"`
+	Cgroup *cgroupV1 `json:"cgroupv1"`
 }
 
 type cgroupJSONv2 struct {
-	Cgroup *cgroupV2 `json:"cgroup"`
+	Cgroup *cgroupV2 `json:"cgroupv2"`
 }
 
 type cgroupJSONSystemd struct {
-	Cgroup *cgroupSystemd `json:"cgroup"`
+	Cgroup *cgroupSystemd `json:"cgroupsystemd"`
+}
+
+type cgroupJSONUnknown struct {
+	Cgroup any `json:"cgroupunknown"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.UnmarshalJSON
 func (c *CgroupJSON) UnmarshalJSON(data []byte) error {
-	if c.UseSystemd {
-		systemd := cgroupJSONSystemd{}
-		if err := json.Unmarshal(data, &systemd); err != nil {
-			return err
-		}
-		if systemd.Cgroup != nil {
-			c.Cgroup = systemd.Cgroup
-		}
-		return nil
-	}
-
-	if IsOnlyV2() {
-		v2 := cgroupJSONv2{}
-		err := json.Unmarshal(data, &v2)
-		if v2.Cgroup != nil {
-			c.Cgroup = v2.Cgroup
-		}
+	m := map[string]json.RawMessage{}
+	if err := json.Unmarshal(data, &m); err != nil {
 		return err
 	}
-	v1 := cgroupJSONv1{}
-	err := json.Unmarshal(data, &v1)
-	if v1.Cgroup != nil {
-		c.Cgroup = v1.Cgroup
+
+	var cg Cgroup
+	if rm, ok := m["cgroupv1"]; ok {
+		cg = &cgroupV1{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
+	} else if rm, ok := m["cgroupv2"]; ok {
+		cg = &cgroupV2{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
+	} else if rm, ok := m["cgroupsystemd"]; ok {
+		cg = &cgroupSystemd{}
+		if err := json.Unmarshal(rm, cg); err != nil {
+			return err
+		}
 	}
-	return err
+	c.Cgroup = cg
+	return nil
 }
 
 // MarshalJSON implements json.Marshaler.MarshalJSON
 func (c *CgroupJSON) MarshalJSON() ([]byte, error) {
 	if c.Cgroup == nil {
-		v1 := cgroupJSONv1{}
-		return json.Marshal(&v1)
+		return json.Marshal(cgroupJSONUnknown{})
 	}
-	if IsOnlyV2() {
-		if c.UseSystemd {
-			systemd := cgroupJSONSystemd{Cgroup: c.Cgroup.(*cgroupSystemd)}
-			return json.Marshal(&systemd)
-		}
-		v2 := cgroupJSONv2{Cgroup: c.Cgroup.(*cgroupV2)}
-		return json.Marshal(&v2)
+	switch c.Cgroup.(type) {
+	case *cgroupV1:
+		return json.Marshal(cgroupJSONv1{Cgroup: c.Cgroup.(*cgroupV1)})
+	case *cgroupV2:
+		return json.Marshal(cgroupJSONv2{Cgroup: c.Cgroup.(*cgroupV2)})
+	case *cgroupSystemd:
+		return json.Marshal(cgroupJSONSystemd{Cgroup: c.Cgroup.(*cgroupSystemd)})
 	}
-	v1 := cgroupJSONv1{Cgroup: c.Cgroup.(*cgroupV1)}
-	return json.Marshal(&v1)
+	return nil, nil
 }
 
 // Install creates and configures cgroups according to 'res'. If cgroup path
@@ -638,7 +660,7 @@ func (c *cgroupV1) CPUQuota() (float64, error) {
 	return float64(quota) / float64(period), nil
 }
 
-// CPUUsage returns the total CPU usage of the cgroup.
+// CPUUsage returns the total CPU usage of the cgroup in nanoseconds.
 func (c *cgroupV1) CPUUsage() (uint64, error) {
 	path := c.MakePath("cpuacct")
 	usage, err := getValue(path, "cpuacct.usage")

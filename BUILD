@@ -1,16 +1,27 @@
+load("@rules_license//rules:license.bzl", "license")
 load("//tools:defs.bzl", "build_test", "gazelle", "go_path")
 load("//tools/nogo:defs.bzl", "nogo_config")
 load("//tools/yamltest:defs.bzl", "yaml_test")
 load("//website:defs.bzl", "doc")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
+
+license(
+    name = "license",
+    package_name = "gvisor",
+)
 
 exports_files(["LICENSE"])
 
 nogo_config(
     name = "nogo_config",
     srcs = ["nogo.yaml"],
-    visibility = ["//:sandbox"],
+    visibility = [
+        "//visibility:public",
+    ],
 )
 
 doc(
@@ -111,7 +122,7 @@ build_test(
 # The files in this tree are symlinks to the true sources.
 go_path(
     name = "gopath",
-    mode = "link",
+    mode = "archive",
     deps = [
         # Main binaries.
         #
@@ -128,6 +139,7 @@ go_path(
 
         # Packages that are not dependencies of the above.
         "//pkg/sentry/kernel/memevent",
+        "//pkg/sentry/socket/plugin/stack",
         "//pkg/tcpip/adapters/gonet",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/link/channel",
@@ -143,6 +155,28 @@ go_path(
         "//pkg/tcpip/sample/tun_tcp_echo",
         "//pkg/tcpip/transport/tcpconntrack",
     ],
+)
+
+# CC toolchain targets for cross-compilation.
+# Required to be explicitly specified in bazel >= 5.
+toolchain(
+    name = "cc_toolchain_k8",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    toolchain = "@crosstool//:cc-compiler-k8",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+toolchain(
+    name = "cc_toolchain_aarch64",
+    target_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:aarch64",
+    ],
+    toolchain = "@crosstool//:cc-compiler-aarch64",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
 
 # gazelle is a set of build tools.

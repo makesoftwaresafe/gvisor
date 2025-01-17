@@ -25,27 +25,59 @@ import (
 )
 
 // EnterInitialCgroups moves t into an initial set of cgroups.
+// If initCgroups is not nil, the new task will be placed in the specified cgroups.
+// Otherwise, if parent is not nil, the new task will be placed in the parent's cgroups.
+// If neither is specified, the new task will be in the root cgroups.
 //
 // This is analogous to Linux's kernel/cgroup/cgroup.c:cgroup_css_set_fork().
 //
 // Precondition: t isn't in any cgroups yet, t.cgroups is empty.
-func (t *Task) EnterInitialCgroups(parent *Task) {
+func (t *Task) EnterInitialCgroups(parent *Task, initCgroups map[Cgroup]struct{}) {
 	var inherit map[Cgroup]struct{}
-	if parent != nil {
+	if initCgroups != nil {
+		inherit = initCgroups
+	} else if parent != nil {
 		parent.mu.Lock()
 		defer parent.mu.Unlock()
 		inherit = parent.cgroups
 	}
 	joinSet := t.k.cgroupRegistry.computeInitialGroups(inherit)
 
-	t.mu.NestedLock()
-	defer t.mu.NestedUnlock()
+	t.mu.NestedLock(taskLockChild)
+	defer t.mu.NestedUnlock(taskLockChild)
 	// Transfer ownership of joinSet refs to the task's cgset.
 	t.cgroups = joinSet
 	for c := range t.cgroups {
 		// Since t isn't in any cgroup yet, we can skip the check against
 		// existing cgroups.
 		c.Enter(t)
+		t.SetMemCgIDFromCgroup(c)
+	}
+}
+
+// SetMemCgID sets the given memory cgroup id to the task.
+func (t *Task) SetMemCgID(memCgID uint32) {
+	t.memCgID.Store(memCgID)
+}
+
+// SetMemCgIDFromCgroup sets the id of the given memory cgroup to the task.
+func (t *Task) SetMemCgIDFromCgroup(cg Cgroup) {
+	for _, ctl := range cg.Controllers() {
+		if ctl.Type() == CgroupControllerMemory {
+			t.SetMemCgID(cg.ID())
+			return
+		}
+	}
+}
+
+// ResetMemCgIDFromCgroup sets the memory cgroup id to zero, if the task has
+// a memory cgroup.
+func (t *Task) ResetMemCgIDFromCgroup(cg Cgroup) {
+	for _, ctl := range cg.Controllers() {
+		if ctl.Type() == CgroupControllerMemory {
+			t.SetMemCgID(0)
+			return
+		}
 	}
 }
 
@@ -77,6 +109,7 @@ func (t *Task) enterCgroupLocked(c Cgroup) {
 	c.IncRef()
 	t.cgroups[c] = struct{}{}
 	c.Enter(t)
+	t.SetMemCgIDFromCgroup(c)
 }
 
 // +checklocks:t.mu
@@ -89,13 +122,17 @@ func (t *Task) enterCgroupIfNotYetLocked(c Cgroup) {
 
 // LeaveCgroups removes t out from all its cgroups.
 func (t *Task) LeaveCgroups() {
+	t.tg.pidns.owner.mu.Lock() // Prevent migration.
 	t.mu.Lock()
 	cgs := t.cgroups
 	t.cgroups = nil
 	for c := range cgs {
 		c.Leave(t)
 	}
+	t.SetMemCgID(0)
 	t.mu.Unlock()
+	t.tg.pidns.owner.mu.Unlock()
+
 	for c := range cgs {
 		c.decRef()
 	}
@@ -119,7 +156,7 @@ func (t *Task) CgroupPrepareMigrate(dst Cgroup) (*CgroupMigrationContext, error)
 	defer t.mu.Unlock()
 	src, found := t.findCgroupWithMatchingHierarchyLocked(dst)
 	if !found {
-		log.Warningf("Cannot migrate to cgroup %v since task %v not currently in target hierarchy %v", dst, t, dst.HierarchyID())
+		log.Warningf("Cannot migrate to cgroup %v since task not currently in target hierarchy %v", dst, dst.HierarchyID())
 		return nil, linuxerr.EINVAL
 	}
 	if err := dst.PrepareMigrate(t, &src); err != nil {
@@ -180,7 +217,7 @@ func (t *Task) MigrateCgroup(dst Cgroup) error {
 // TaskCgroupEntry represents a line in /proc/<pid>/cgroup, and is used to
 // format a cgroup for display.
 type TaskCgroupEntry struct {
-	HierarchyID uint32 `json:"hierarchy_id,omitempty"`
+	HierarchyID uint32 `json:"hierarchy_id"`
 	Controllers string `json:"controllers,omitempty"`
 	Path        string `json:"path,omitempty"`
 }
@@ -199,7 +236,7 @@ func (t *Task) GetCgroupEntries() []TaskCgroupEntry {
 		// We're guaranteed to have a valid name, a non-empty controller list,
 		// or both.
 
-		// Explicit hierachy name, if any.
+		// Explicit hierarchy name, if any.
 		if name := c.Name(); name != "" {
 			ctlNames = append(ctlNames, fmt.Sprintf("name=%s", name))
 		}
@@ -229,17 +266,23 @@ func (t *Task) GenerateProcTaskCgroup(buf *bytes.Buffer) {
 }
 
 // +checklocks:t.mu
-func (t *Task) chargeLocked(target *Task, ctl CgroupControllerType, res CgroupResourceType, value int64) error {
+func (t *Task) chargeLocked(target *Task, ctl CgroupControllerType, res CgroupResourceType, value int64) (bool, Cgroup, error) {
+	// Due to the uniqueness of controllers on hierarchies, at most one cgroup
+	// in t.cgroups will match.
 	for c := range t.cgroups {
-		if err := c.Charge(target, c.Dentry, ctl, res, value); err != nil {
-			return err
+		err := c.Charge(target, c.Dentry, ctl, res, value)
+		if err == nil {
+			c.IncRef()
 		}
+		return err == nil, c, err
 	}
-	return nil
+	return false, Cgroup{}, nil
 }
 
-// ChargeFor charges t's cgroup on behalf of some other task.
-func (t *Task) ChargeFor(other *Task, ctl CgroupControllerType, res CgroupResourceType, value int64) error {
+// ChargeFor charges t's cgroup on behalf of some other task. Returns
+// the cgroup that's charged if any. Returned cgroup has an extra ref
+// that's transferred to the caller.
+func (t *Task) ChargeFor(other *Task, ctl CgroupControllerType, res CgroupResourceType, value int64) (bool, Cgroup, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.chargeLocked(other, ctl, res, value)

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "proto_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "strace",
@@ -36,6 +39,7 @@ go_library(
         "//pkg/sentry/kernel",
         "//pkg/sentry/socket",
         "//pkg/sentry/socket/netlink",
+        "//pkg/sentry/socket/unix",
         "//pkg/sentry/syscalls/linux",
     ],
 )

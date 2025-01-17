@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"time"
@@ -56,17 +55,17 @@ func (fds *fdSender) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (fds *fdSender) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (fds *fdSender) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if fds.socketPath == "" {
 		log.Fatalf("socket flag must be set")
 	}
 
-	dir, err := ioutil.TempDir("", "")
+	dir, err := os.MkdirTemp("", "")
 	if err != nil {
 		log.Fatalf("TempDir failed: %v", err)
 	}
 
-	fileToSend, err := ioutil.TempFile(dir, "")
+	fileToSend, err := os.CreateTemp(dir, "")
 	if err != nil {
 		log.Fatalf("TempFile failed: %v", err)
 	}
@@ -123,7 +122,7 @@ func (fdr *fdReceiver) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (fdr *fdReceiver) Execute(ctx context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (fdr *fdReceiver) Execute(ctx context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if fdr.socketPath == "" {
 		log.Fatalf("Flags cannot be empty, given: socket: %q", fdr.socketPath)
 	}
@@ -173,7 +172,7 @@ func (fdr *fdReceiver) Execute(ctx context.Context, f *flag.FlagSet, args ...int
 		log.Fatalf("Error from seek(0, 0): %v", err)
 	}
 
-	got, err := ioutil.ReadAll(file)
+	got, err := io.ReadAll(file)
 	if err != nil {
 		log.Fatalf("ReadAll failed: %v", err)
 	}

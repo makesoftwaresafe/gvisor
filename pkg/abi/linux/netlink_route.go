@@ -96,6 +96,9 @@ type InterfaceInfoMessage struct {
 	Change uint32
 }
 
+// InterfaceInfoMessageSize is the size of InterfaceInfoMessage.
+const InterfaceInfoMessageSize = 16
+
 // Interface flags, from uapi/linux/if.h.
 const (
 	IFF_UP          = 1 << 0
@@ -165,6 +168,21 @@ const (
 	IFLA_GSO_MAX_SIZE    = 41
 )
 
+// Interface link info attributes, from uapi/linux/if_link.h.
+const (
+	IFLA_INFO_UNSPEC     = 0
+	IFLA_INFO_KIND       = 1
+	IFLA_INFO_DATA       = 2
+	IFLA_INFO_XSTATS     = 3
+	IFLA_INFO_SLAVE_KIND = 4
+	IFLA_INFO_SLAVE_DATA = 5
+)
+
+// Virtuall ethernet attributes, from uapi/linux/veth.h.
+const (
+	VETH_INFO_PEER = 1
+)
+
 // InterfaceAddrMessage is struct ifaddrmsg, from uapi/linux/if_addr.h.
 //
 // +marshal
@@ -175,6 +193,9 @@ type InterfaceAddrMessage struct {
 	Scope     uint8
 	Index     uint32
 }
+
+// InterfaceAddrMessageSize is the size of InterfaceAddrMessage.
+const InterfaceAddrMessageSize = 8
 
 // Interface attributes, from uapi/linux/if_addr.h.
 const (
@@ -345,6 +366,8 @@ const (
 
 // RtAttr is the header of optional addition route information, as a netlink
 // attribute. From include/uapi/linux/rtnetlink.h.
+//
+// +marshal
 type RtAttr struct {
 	Len  uint16
 	Type uint16

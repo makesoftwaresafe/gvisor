@@ -23,7 +23,6 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
 	"gvisor.dev/gvisor/pkg/tcpip/faketime"
@@ -98,7 +97,7 @@ func (m *fakeMulticastEventDispatcher) OnUnexpectedInputInterface(context stack.
 var (
 	v4Addrs = map[addrType]tcpip.Address{
 		anyAddr:                header.IPv4Any,
-		emptyAddr:              "",
+		emptyAddr:              {},
 		linkLocalMulticastAddr: testutil.MustParse4("224.0.0.1"),
 		linkLocalUnicastAddr:   testutil.MustParse4("169.254.0.10"),
 		multicastAddr:          testutil.MustParse4("225.0.0.0"),
@@ -108,7 +107,7 @@ var (
 
 	v6Addrs = map[addrType]tcpip.Address{
 		anyAddr:                header.IPv6Any,
-		emptyAddr:              "",
+		emptyAddr:              {},
 		linkLocalMulticastAddr: testutil.MustParse6("ff02::a"),
 		linkLocalUnicastAddr:   testutil.MustParse6("fe80::a"),
 		multicastAddr:          testutil.MustParse6("ff0e::a"),
@@ -166,9 +165,11 @@ func getEndpointAddr(protocol tcpip.NetworkProtocolNumber, addrType endpointAddr
 }
 
 func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address, ttl uint8) {
+	payload := stack.PayloadSince(pkt.NetworkHeader())
+	defer payload.Release()
 	switch protocol {
 	case ipv4.ProtocolNumber:
-		checker.IPv4(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv4(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.TTL(ttl),
@@ -177,7 +178,7 @@ func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *s
 			),
 		)
 	case ipv6.ProtocolNumber:
-		checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv6(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.TTL(ttl),
@@ -191,9 +192,11 @@ func checkEchoRequest(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *s
 }
 
 func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer, srcAddr, dstAddr tcpip.Address) {
+	payload := stack.PayloadSince(pkt.NetworkHeader())
+	defer payload.Release()
 	switch protocol {
 	case ipv4.ProtocolNumber:
-		checker.IPv4(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv4(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.ICMPv4(
@@ -201,7 +204,7 @@ func checkEchoReply(t *testing.T, protocol tcpip.NetworkProtocolNumber, pkt *sta
 			),
 		)
 	case ipv6.ProtocolNumber:
-		checker.IPv6(t, stack.PayloadSince(pkt.NetworkHeader()),
+		checker.IPv6(t, payload,
 			checker.SrcAddr(srcAddr),
 			checker.DstAddr(dstAddr),
 			checker.ICMPv6(
@@ -417,7 +420,7 @@ func TestAddMulticastRoute(t *testing.T) {
 				s := stack.New(stack.Options{
 					NetworkProtocols: []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				endpoints := make(map[tcpip.NICID]*channel.Endpoint)
 				for nicID, addrType := range endpointConfigs {
@@ -547,7 +550,7 @@ func TestEnableMulticastForwardingE(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				for _, wantResult := range test.wantResult {
 					alreadyEnabled, err := s.EnableMulticastForwardingForProtocol(protocol, test.eventDispatcher)
@@ -583,7 +586,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 			name:    "no matching route",
 			srcAddr: remoteUnicastAddr,
 			dstAddr: otherMulticastAddr,
-			wantErr: &tcpip.ErrNoRoute{},
+			wantErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name:    "multicast source",
@@ -638,7 +641,7 @@ func TestMulticastRouteLastUsedTime(t *testing.T) {
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 					Clock:              clock,
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				if _, err := s.EnableMulticastForwardingForProtocol(protocol, &fakeMulticastEventDispatcher{}); err != nil {
 					t.Fatalf("s.EnableMulticastForwardingForProtocol(%d, _): (_, %s)", protocol, err)
@@ -741,7 +744,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 			name:    "no matching route",
 			srcAddr: remoteUnicastAddr,
 			dstAddr: otherMulticastAddr,
-			wantErr: &tcpip.ErrNoRoute{},
+			wantErr: &tcpip.ErrHostUnreachable{},
 		},
 		{
 			name:    "multicast source",
@@ -794,7 +797,7 @@ func TestRemoveMulticastRoute(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				if _, err := s.EnableMulticastForwardingForProtocol(protocol, &fakeMulticastEventDispatcher{}); err != nil {
 					t.Fatalf("s.EnableMulticastForwardingForProtocol(%d, _): (_, %s)", protocol, err)
@@ -1036,7 +1039,7 @@ func TestMulticastForwarding(t *testing.T) {
 					NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 					TransportProtocols: []stack.TransportProtocolFactory{udp.NewProtocol},
 				})
-				defer s.Close()
+				defer s.Destroy()
 
 				eventDispatcher, ok := eventDispatchers[protocol]
 				if !ok {
@@ -1210,6 +1213,6 @@ func TestMulticastForwarding(t *testing.T) {
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

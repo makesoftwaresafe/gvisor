@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_binary", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 alias(
     name = "mockgen",
@@ -84,6 +87,7 @@ go_test(
     deps = [
         "//pkg/fd",
         "//pkg/p9",
+        "//pkg/rand",
         "//pkg/sync",
         "@com_github_golang_mock//gomock:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",

@@ -20,12 +20,14 @@ package sharedmem
 import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/eventfd"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/pipe"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sharedmem/queue"
 )
 
+// +stateify savable
 type serverRx struct {
 	// packetPipe represents the receive end of the pipe that carries the packet
 	// descriptors sent by the client.
@@ -125,23 +127,23 @@ func (s *serverRx) DisableNotification() {
 const completionNotificationSize = 8
 
 // receive receives a single packet from the packetPipe.
-func (s *serverRx) receive() []byte {
+func (s *serverRx) receive() *buffer.View {
 	desc := s.packetPipe.Pull()
 	if desc == nil {
 		return nil
 	}
 
 	pktInfo := queue.DecodeTxPacketHeader(desc)
-	contents := make([]byte, 0, pktInfo.Size)
+	contents := buffer.NewView(int(pktInfo.Size))
 	toCopy := pktInfo.Size
 	for i := 0; i < pktInfo.BufferCount; i++ {
 		txBuf := queue.DecodeTxBufferHeader(desc, i)
 		if txBuf.Size <= toCopy {
-			contents = append(contents, s.data[txBuf.Offset:][:txBuf.Size]...)
+			contents.Write(s.data[txBuf.Offset:][:txBuf.Size])
 			toCopy -= txBuf.Size
 			continue
 		}
-		contents = append(contents, s.data[txBuf.Offset:][:toCopy]...)
+		contents.Write(s.data[txBuf.Offset:][:toCopy])
 		break
 	}
 

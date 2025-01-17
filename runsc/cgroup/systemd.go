@@ -181,6 +181,8 @@ func (c *cgroupSystemd) Join() (func(), error) {
 			c.dbusConn.ResetFailedUnitContext(ctx, unitName)
 			return nil, fmt.Errorf("unknown job completion status %q", s)
 		}
+	} else if unitAlreadyExists(err) {
+		return clean.Release(), nil
 	} else {
 		return nil, fmt.Errorf("systemd error: %v", err)
 	}
@@ -188,6 +190,18 @@ func (c *cgroupSystemd) Join() (func(), error) {
 		return nil, err
 	}
 	return clean.Release(), nil
+}
+
+// unitAlreadyExists returns true if the error is that a systemd unit already
+// exists.
+func unitAlreadyExists(err error) bool {
+	if err != nil {
+		var derr dbus.Error
+		if errors.As(err, &derr) {
+			return strings.Contains(derr.Name, "org.freedesktop.systemd1.UnitExists")
+		}
+	}
+	return false
 }
 
 // systemd represents slice hierarchy using `-`, so we need to follow suit when
@@ -278,16 +292,30 @@ func addIOProps(props []systemdDbus.Property, name string, devs []specs.LinuxThr
 	return props
 }
 
-func (c *cgroupSystemd) addProp(name string, value interface{}) {
+func (c *cgroupSystemd) addProp(name string, value any) {
 	if value == nil {
 		return
 	}
 	c.properties = append(c.properties, newProp(name, value))
 }
 
-func newProp(name string, units interface{}) systemdDbus.Property {
+func newProp(name string, units any) systemdDbus.Property {
 	return systemdDbus.Property{
 		Name:  name,
 		Value: dbus.MakeVariant(units),
+	}
+}
+
+// CreateMockSystemdCgroup returns a mock Cgroup configured for systemd. This
+// is useful for testing.
+func CreateMockSystemdCgroup() Cgroup {
+	return &cgroupSystemd{
+		Name:        "test",
+		ScopePrefix: "runsc",
+		Parent:      "system.slice",
+		cgroupV2: cgroupV2{
+			Mountpoint: "/sys/fs/cgroup",
+			Path:       "/a/random/path",
+		},
 	}
 }

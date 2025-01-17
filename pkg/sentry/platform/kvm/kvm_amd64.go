@@ -20,6 +20,7 @@ package kvm
 import (
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/arch/fpu"
 )
 
 // userRegs represents KVM user registers.
@@ -217,8 +218,14 @@ func (c *cpuidEntries) Set(in cpuid.In, out cpuid.Out) {
 	}
 }
 
+var hasFSGSBASE bool
+
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
+	hasFSGSBASE = cpuid.HostFeatureSet().UseFSGSBASE()
+	fpu.InitHostState()
+
+	bitsForScaling = getBitsForScaling()
 	if err := updateSystemValues(int(fd)); err != nil {
 		return err
 	}
@@ -231,7 +238,9 @@ func updateGlobalOnce(fd int) error {
 	// explicitly set OSXSAVE, since this does not come in the feature
 	// entries, but can be provided when the relevant CR4 bit is set.
 	s := &cpuidSupported
-	cpuid.X86FeatureOSXSAVE.Set(s)
+	if cpuid.HostFeatureSet().UseXsave() {
+		cpuid.X86FeatureOSXSAVE.Set(s)
+	}
 	// Explicitly disable nested virtualization. Since we don't provide
 	// any virtualization APIs, there is no need to enable this feature.
 	cpuid.X86FeatureVMX.Unset(s)

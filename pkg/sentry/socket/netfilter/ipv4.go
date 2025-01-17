@@ -18,7 +18,6 @@ import (
 	"fmt"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -28,10 +27,10 @@ import (
 // emptyIPv4Filter is for comparison with a rule's filters to determine whether
 // it is also empty. It is immutable.
 var emptyIPv4Filter = stack.IPHeaderFilter{
-	Dst:     "\x00\x00\x00\x00",
-	DstMask: "\x00\x00\x00\x00",
-	Src:     "\x00\x00\x00\x00",
-	SrcMask: "\x00\x00\x00\x00",
+	Dst:     tcpip.AddrFrom4([4]byte{0x00, 0x00, 0x00, 0x00}),
+	DstMask: tcpip.AddrFrom4([4]byte{0x00, 0x00, 0x00, 0x00}),
+	Src:     tcpip.AddrFrom4([4]byte{0x00, 0x00, 0x00, 0x00}),
+	SrcMask: tcpip.AddrFrom4([4]byte{0x00, 0x00, 0x00, 0x00}),
 }
 
 // convertNetstackToBinary4 converts the iptables as stored in netstack to the
@@ -75,10 +74,10 @@ func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTG
 				TargetOffset: linux.SizeOfIPTEntry,
 			},
 		}
-		copy(entry.Entry.IP.Dst[:], rule.Filter.Dst)
-		copy(entry.Entry.IP.DstMask[:], rule.Filter.DstMask)
-		copy(entry.Entry.IP.Src[:], rule.Filter.Src)
-		copy(entry.Entry.IP.SrcMask[:], rule.Filter.SrcMask)
+		copy(entry.Entry.IP.Dst[:], rule.Filter.Dst.AsSlice())
+		copy(entry.Entry.IP.DstMask[:], rule.Filter.DstMask.AsSlice())
+		copy(entry.Entry.IP.Src[:], rule.Filter.Src.AsSlice())
+		copy(entry.Entry.IP.SrcMask[:], rule.Filter.SrcMask.AsSlice())
 		copy(entry.Entry.IP.OutputInterface[:], rule.Filter.OutputInterface)
 		copy(entry.Entry.IP.OutputInterfaceMask[:], rule.Filter.OutputInterfaceMask)
 		copy(entry.Entry.IP.InputInterface[:], rule.Filter.InputInterface)
@@ -126,7 +125,7 @@ func getEntries4(table stack.Table, tablename linux.TableName) (linux.KernelIPTG
 	return entries, info
 }
 
-func modifyEntries4(task *kernel.Task, stk *stack.Stack, optVal []byte, replace *linux.IPTReplace, table *stack.Table) (map[uint32]int, *syserr.Error) {
+func modifyEntries4(mapper IDMapper, stk *stack.Stack, optVal []byte, replace *linux.IPTReplace, table *stack.Table) (map[uint32]int, *syserr.Error) {
 	nflog("set entries: setting entries in table %q", replace.Name.String())
 
 	// Convert input into a list of rules and their offsets.
@@ -162,7 +161,7 @@ func modifyEntries4(task *kernel.Task, stk *stack.Stack, optVal []byte, replace 
 			nflog("entry doesn't have enough room for its matchers (only %d bytes remain)", len(optVal))
 			return nil, syserr.ErrInvalidArgument
 		}
-		matchers, err := parseMatchers(task, filter, optVal[:matchersSize])
+		matchers, err := parseMatchers(mapper, filter, optVal[:matchersSize])
 		if err != nil {
 			nflog("failed to parse matchers: %v", err)
 			return nil, syserr.ErrInvalidArgument
@@ -218,11 +217,11 @@ func filterFromIPTIP(iptip linux.IPTIP) (stack.IPHeaderFilter, error) {
 		Protocol: tcpip.TransportProtocolNumber(iptip.Protocol),
 		// A Protocol value of 0 indicates all protocols match.
 		CheckProtocol:         iptip.Protocol != 0,
-		Dst:                   tcpip.Address(iptip.Dst[:]),
-		DstMask:               tcpip.Address(iptip.DstMask[:]),
+		Dst:                   tcpip.AddrFrom4(iptip.Dst),
+		DstMask:               tcpip.AddrFrom4(iptip.DstMask),
 		DstInvert:             iptip.InverseFlags&linux.IPT_INV_DSTIP != 0,
-		Src:                   tcpip.Address(iptip.Src[:]),
-		SrcMask:               tcpip.Address(iptip.SrcMask[:]),
+		Src:                   tcpip.AddrFrom4(iptip.Src),
+		SrcMask:               tcpip.AddrFrom4(iptip.SrcMask),
 		SrcInvert:             iptip.InverseFlags&linux.IPT_INV_SRCIP != 0,
 		InputInterface:        string(trimNullBytes(iptip.InputInterface[:])),
 		InputInterfaceMask:    string(trimNullBytes(iptip.InputInterfaceMask[:])),

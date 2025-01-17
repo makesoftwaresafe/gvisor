@@ -50,6 +50,22 @@ func (b *Bitmap) IsEmpty() bool {
 	return b.numOnes == 0
 }
 
+// Size returns the total number of bits in the bitmap.
+func (b *Bitmap) Size() int {
+	return len(b.bitBlock) * 64
+}
+
+// Grow grows the bitmap by at least toGrow bits.
+func (b *Bitmap) Grow(toGrow uint32) error {
+	newbitBlockSize := uint32(len(b.bitBlock)) + ((toGrow + 63) / 64)
+	if newbitBlockSize > MaxBitEntryLimit/8 {
+		return fmt.Errorf("requested bitmap size %d too large", newbitBlockSize*64)
+	}
+	bits := make([]uint64, (toGrow+63)/64)
+	b.bitBlock = append(b.bitBlock, bits...)
+	return nil
+}
+
 // Minimum return the smallest value in the Bitmap.
 func (b *Bitmap) Minimum() uint32 {
 	for i := 0; i < len(b.bitBlock); i++ {
@@ -234,6 +250,44 @@ func (b *Bitmap) FlipRange(begin, end uint32) {
 	}
 }
 
+// Reset zeroes the entire bitmap.
+func (b *Bitmap) Reset() {
+	b.numOnes = 0
+	clear(b.bitBlock)
+}
+
+// ForEach calls `f` for each set bit in the range [start, end).
+//
+// If f returns false, ForEach stops the iteration.
+func (b *Bitmap) ForEach(start, end uint32, f func(idx uint32) bool) {
+	blockEnd := (end + 63) / 64
+	if blockEnd > uint32(len(b.bitBlock)) {
+		blockEnd = uint32(len(b.bitBlock))
+	}
+	// base is the start number of a bitBlock
+	base := start / 64 * 64
+	blockMask := ^((uint64(1) << (start % 64)) - 1)
+	for i := start / 64; i < blockEnd; i++ {
+		if i == end/64 {
+			blockMask &= (uint64(1) << (end % 64)) - 1
+		}
+		bitBlock := b.bitBlock[i] & blockMask
+		blockMask = ^uint64(0)
+		// Iterate through all the numbers held by this bit block.
+		for bitBlock != 0 {
+			// Extract the lowest set 1 bit.
+			j := bitBlock & -bitBlock
+			// Interpret the bit as the in32 number it represents and add it to result.
+			idx := base + uint32(bits.OnesCount64(j-1))
+			if !f(idx) {
+				return
+			}
+			bitBlock ^= j
+		}
+		base += 64
+	}
+}
+
 // ToSlice transform the Bitmap into slice. For example, a bitmap of [0, 1, 0, 1]
 // will return the slice [1, 3].
 func (b *Bitmap) ToSlice() []uint32 {
@@ -255,7 +309,7 @@ func (b *Bitmap) ToSlice() []uint32 {
 	return bitmapSlice
 }
 
-// GetNumOnes return the the number of ones in the Bitmap.
+// GetNumOnes return the number of ones in the Bitmap.
 func (b *Bitmap) GetNumOnes() uint32 {
 	return b.numOnes
 }

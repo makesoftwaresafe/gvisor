@@ -26,14 +26,25 @@ const (
 	// HugePageSize is the system huge page size.
 	HugePageSize = 1 << HugePageShift
 
+	// CacheLineSize is the size of the cache line.
+	CacheLineSize = 1 << CacheLineShift
+
 	// PageShift is the binary log of the system page size.
 	PageShift = 12
 
 	// HugePageShift is the binary log of the system huge page size.
 	HugePageShift = 21
+
+	// CacheLineShift is the binary log of the cache line size.
+	CacheLineShift = 6
 )
 
 var (
 	// ByteOrder is the native byte order (little endian).
 	ByteOrder = binary.LittleEndian
 )
+
+// UntaggedUserAddr is no-op on x86.
+func UntaggedUserAddr(addr Addr) Addr {
+	return addr
+}

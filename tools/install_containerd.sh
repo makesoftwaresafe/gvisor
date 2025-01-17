@@ -16,18 +16,31 @@
 
 set -xeo pipefail
 
+# This script should be run with 'sudo -H'. $HOME must be set correctly because
+# we invoke other scripts below that build Go binaries. In some operating
+# systems, sudo(8) does not change $HOME by default. In such cases, root user
+# ends up creating files in ~/.cache/go-build for the non-root user. This can
+# cause future invocations of go build to fail due to permission issues.
+if [[ "$EUID" -ne 0 ]]; then
+  echo "Run this script with sudo -H"
+  exit 1
+fi
+
 declare -r CONTAINERD_VERSION=${1:-1.3.0}
-declare -r CONTAINERD_MAJOR="$(echo ${CONTAINERD_VERSION} | awk -F '.' '{ print $1; }')"
-declare -r CONTAINERD_MINOR="$(echo ${CONTAINERD_VERSION} | awk -F '.' '{ print $2; }')"
+CONTAINERD_MAJOR="$(echo "${CONTAINERD_VERSION}" | awk -F '.' '{ print $1; }')"
+declare -r CONTAINERD_MAJOR
+CONTAINERD_MINOR="$(echo "${CONTAINERD_VERSION}" | awk -F '.' '{ print $2; }')"
+declare -r CONTAINERD_MINOR
 declare -r CRITOOLS_VERSION=${CRITOOLS_VERSION:-1.18.0}
 
 if [[ "${CONTAINERD_MAJOR}" -eq 1 ]] && [[ "${CONTAINERD_MINOR}" -le 4 ]]; then
-  # We're running Go 1.16, but using pre-module containerd and cri-tools.
+  # We're running Go 1.18, but using pre-module containerd and cri-tools.
   export GO111MODULE=off
 fi
 
 # containerd < 1.4 doesn't work with cgroupv2 setup, so we check for that here
-if [[ "$(stat -f -c %T /sys/fs/cgroup 2>/dev/null)" == "cgroup2fs" && "${CONTAINERD_MAJOR}" -eq 1 && "${CONTAINERD_MINOR}" -lt 4 ]]; then
+SYSFS_ROOT=/sys/fs/cgroup
+if [[ "$(stat -f -c %T "$SYSFS_ROOT" 2>/dev/null)" == "cgroup2fs" && "${CONTAINERD_MAJOR}" -eq 1 && "${CONTAINERD_MINOR}" -lt 4 ]]; then
   echo "containerd < 1.4 does not work with cgroup2"
   exit 1
 fi
@@ -38,7 +51,7 @@ install_helper() {
   declare -r TAG="${2}"
 
   # Clone the repository.
-  mkdir -p "${GOPATH}"/src/$(dirname "${PACKAGE}") && \
+  mkdir -p "${GOPATH}"/src/"$(dirname "${PACKAGE}")" && \
      git clone https://"${PACKAGE}" "${GOPATH}"/src/"${PACKAGE}"
 
   # Checkout and build the repository.
@@ -52,9 +65,12 @@ install_helper() {
 #
 # Ubuntu 16.04 has only btrfs-tools, while 18.04 has a transitional package,
 # and later versions no longer have the transitional package.
+#
+# If we can't detect the VERSION_ID, we assume it's a newer version and use
+# libbtrfs-dev.
 source /etc/os-release
 declare BTRFS_DEV
-if [[ "${VERSION_ID%.*}" -le "18" ]]; then
+if [[ ! -z "${VERSION_ID}" && "${VERSION_ID%.*}" -le "18" ]]; then
   BTRFS_DEV="btrfs-tools"
 else
   BTRFS_DEV="libbtrfs-dev"
@@ -64,26 +80,26 @@ readonly BTRFS_DEV
 # Install dependencies for the crictl tests.
 export DEBIAN_FRONTEND=noninteractive
 while true; do
-  if (apt-get update && apt-get install -y \
-      "${BTRFS_DEV}" \
-      libseccomp-dev); then
-    break
-  fi
+  apt-get update && apt-get install -y \
+    "${BTRFS_DEV}" libseccomp-dev
   result=$?
-  if [[ $result -ne 100 ]]; then
+  if [[ $result -eq 0 ]]; then
+    break
+  elif [[ $result -ne 100 ]]; then
     exit $result
   fi
 done
 
 # Install containerd & cri-tools.
-declare -rx GOPATH=$(mktemp -d --tmpdir gopathXXXXX)
+GOPATH=$(mktemp -d --tmpdir gopathXXXXX)
+declare -rx GOPATH
 install_helper github.com/containerd/containerd "v${CONTAINERD_VERSION}"
 install_helper github.com/kubernetes-sigs/cri-tools "v${CRITOOLS_VERSION}"
 
 # Configure containerd-shim.
 declare -r shim_config_path=/etc/containerd/runsc/config.toml
-mkdir -p $(dirname ${shim_config_path})
-cat > ${shim_config_path} <<-EOF
+mkdir -p "$(dirname "${shim_config_path}")"
+tee ${shim_config_path} <<-EOF
 log_path = "/tmp/shim-logs/"
 log_level = "debug"
 
@@ -96,7 +112,7 @@ EOF
 
 # Configure CNI.
 (cd "${GOPATH}" && src/github.com/containerd/containerd/script/setup/install-cni)
-cat <<EOF | sudo tee /etc/cni/net.d/10-bridge.conf
+tee /etc/cni/net.d/10-bridge.conf <<EOF
 {
   "cniVersion": "0.3.1",
   "name": "bridge",
@@ -113,7 +129,7 @@ cat <<EOF | sudo tee /etc/cni/net.d/10-bridge.conf
   }
 }
 EOF
-cat <<EOF | sudo tee /etc/cni/net.d/99-loopback.conf
+tee /etc/cni/net.d/99-loopback.conf <<EOF
 {
   "cniVersion": "0.3.1",
   "type": "loopback"
@@ -121,7 +137,7 @@ cat <<EOF | sudo tee /etc/cni/net.d/99-loopback.conf
 EOF
 
 # Configure crictl.
-cat <<EOF | sudo tee /etc/crictl.yaml
+tee /etc/crictl.yaml <<EOF
 runtime-endpoint: unix:///run/containerd/containerd.sock
 EOF
 

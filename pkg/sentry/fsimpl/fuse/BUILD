@@ -1,6 +1,8 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_template_instance(
@@ -20,9 +22,23 @@ go_template_instance(
     out = "inode_refs.go",
     package = "fuse",
     prefix = "inode",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "inode",
+    },
+)
+
+go_template_instance(
+    name = "seqatomic_time",
+    out = "seqatomic_time_unsafe.go",
+    imports = {
+        "ktime": "gvisor.dev/gvisor/pkg/sentry/ktime",
+    },
+    package = "fuse",
+    suffix = "Time",
+    template = "//pkg/sync/seqatomic:generic_seqatomic",
+    types = {
+        "Value": "ktime.Time",
     },
 )
 
@@ -36,12 +52,15 @@ go_library(
         "directory.go",
         "file.go",
         "fusefs.go",
+        "inode.go",
         "inode_refs.go",
         "read_write.go",
         "register.go",
         "regular_file.go",
         "request_list.go",
         "request_response.go",
+        "save_restore.go",
+        "seqatomic_time_unsafe.go",
     ],
     marshal = True,
     visibility = ["//pkg/sentry:internal"],
@@ -55,14 +74,17 @@ go_library(
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
-        "//pkg/sentry/fsimpl/devtmpfs",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/kernel/pipe",
+        "//pkg/sentry/ktime",
+        "//pkg/sentry/memmap",
         "//pkg/sentry/vfs",
         "//pkg/sync",
+        "//pkg/syserr",
         "//pkg/usermem",
         "//pkg/waiter",
         "@org_golang_x_sys//unix:go_default_library",

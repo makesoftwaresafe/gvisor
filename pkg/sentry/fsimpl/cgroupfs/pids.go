@@ -55,7 +55,7 @@ const pidLimitUnlimited = pidMaxLimit + 1
 type pidsController struct {
 	controllerCommon
 
-	// isRoot indiciates if this is the root cgroup in its hierarchy. Immutable
+	// isRoot indicates if this is the root cgroup in its hierarchy. Immutable
 	// since cgroupfs doesn't allow cross directory renames.
 	isRoot bool
 
@@ -112,18 +112,18 @@ func (c *pidsController) Clone() controller {
 
 // AddControlFiles implements controller.AddControlFiles.
 func (c *pidsController) AddControlFiles(ctx context.Context, creds *auth.Credentials, _ *cgroupInode, contents map[string]kernfs.Inode) {
-	contents["pids.current"] = c.fs.newControllerFile(ctx, creds, &pidsCurrentData{c: c})
+	contents["pids.current"] = c.fs.newControllerFile(ctx, creds, &pidsCurrentData{c: c}, true)
 	if !c.isRoot {
 		// "This is not available in the root cgroup for obvious reasons" --
 		// Linux, Documentation/cgroup-v1/pids.txt.
-		contents["pids.max"] = c.fs.newControllerWritableFile(ctx, creds, &pidsMaxData{c: c})
+		contents["pids.max"] = c.fs.newControllerWritableFile(ctx, creds, &pidsMaxData{c: c}, true)
 	}
 }
 
 // Enter implements controller.Enter.
 //
 // Enter attempts to commit a charge from the pending pool. If at least one
-// charge is pending for t, one pending charge is converted to a commited
+// charge is pending for t, one pending charge is converted to a committed
 // charge, and the net change in total charges is zero. If no charge is pending,
 // a new charge is added directly to the committed pool.
 func (c *pidsController) Enter(t *kernel.Task) {
@@ -161,14 +161,23 @@ func (c *pidsController) Leave(t *kernel.Task) {
 
 // PrepareMigrate implements controller.PrepareMigrate.
 func (c *pidsController) PrepareMigrate(t *kernel.Task, src controller) error {
+	srcC := src.(*pidsController)
+	srcC.mu.Lock()
+	defer srcC.mu.Unlock()
+
+	if _, ok := srcC.pendingPool[t]; ok {
+		// Migrating task isn't fully initialized, return transient failure.
+		return linuxerr.EAGAIN
+	}
+
 	return nil
 }
 
 // CommitMigrate implements controller.CommitMigrate.
 //
-// Migrations can cause a cgroup to exceed its limit. Migration can only be
-// called for tasks with committed charges, as it is not possible to migrate a
-// task prior to Enter.
+// Migrations can cause a cgroup to exceed its limit. CommitMigrate can only be
+// called for tasks with committed charges, PrepareMigrate will deny migrations
+// prior to Enter.
 func (c *pidsController) CommitMigrate(t *kernel.Task, src controller) {
 	// Note: The charge is allowed to exceed max on migration. The charge may
 	// not exceed max when incurred due to a fork/clone, which will call
@@ -204,15 +213,15 @@ func (c *pidsController) Charge(t *kernel.Task, d *kernfs.Dentry, res kernel.Cgr
 	// Negative charge.
 	if value < 0 {
 		if c.pendingTotal+value < 0 {
-			panic(fmt.Sprintf("cgroupfs: pids controller pending pool would be negative if charge was allowed: current pool: %d, proposed charge: %d", c.pendingTotal, value))
+			panic(fmt.Sprintf("cgroupfs: pids controller pending pool would be negative if charge was allowed: current pool: %d, proposed charge: %d, path: %q, task: %p", c.pendingTotal, value, d.FSLocalPath(), t))
 		}
 
 		pending, ok := c.pendingPool[t]
 		if !ok {
-			panic(fmt.Sprintf("cgroupfs: pids controller attempted to remove pending charge for task %+v, but task didn't have pending charges", t))
+			panic(fmt.Sprintf("cgroupfs: pids controller attempted to remove pending charge for Task %p, but task didn't have pending charges, path: %q", t, d.FSLocalPath()))
 		}
 		if pending+value < 0 {
-			panic(fmt.Sprintf("cgroupfs: pids controller attempted to remove pending charge for task %+v, but task didn't have enough pending charges; current charges: %d, proposed charge: %d", t, pending, value))
+			panic(fmt.Sprintf("cgroupfs: pids controller attempted to remove pending charge for Task %p, but task didn't have enough pending charges; current charges: %d, proposed charge: %d, path: %q", t, pending, value, d.FSLocalPath()))
 
 		}
 
@@ -268,8 +277,12 @@ func (d *pidsMaxData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 
 // Write implements vfs.WritableDynamicBytesSource.Write.
 func (d *pidsMaxData) Write(ctx context.Context, _ *vfs.FileDescription, src usermem.IOSequence, offset int64) (int64, error) {
-	t := kernel.TaskFromContext(ctx)
-	buf := t.CopyScratchBuffer(hostarch.PageSize)
+	return d.WriteBackground(ctx, src)
+}
+
+// WriteBackground implements writableControllerFileImpl.WriteBackground.
+func (d *pidsMaxData) WriteBackground(ctx context.Context, src usermem.IOSequence) (int64, error) {
+	buf := copyScratchBufferFromContext(ctx, hostarch.PageSize)
 	ncpy, err := src.CopyIn(ctx, buf)
 	if err != nil {
 		return 0, err

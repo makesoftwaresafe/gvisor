@@ -20,18 +20,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math"
+	"math/big"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/bits-and-blooms/bitset"
 	"github.com/cenkalti/backoff"
 	"github.com/coreos/go-systemd/v22/dbus"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -41,9 +39,12 @@ import (
 )
 
 const (
-	subtreeControl  = "cgroup.subtree_control"
-	controllersFile = "cgroup.controllers"
-	cgroup2Key      = "cgroup2"
+	subtreeControl    = "cgroup.subtree_control"
+	controllersFile   = "cgroup.controllers"
+	cgroup2Key        = "cgroup2"
+	memoryLimitCgroup = "memory.max"
+	cpuLimitCgroup    = "cpu.max"
+	maxLimitStr       = "max"
 
 	// https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html
 	defaultPeriod = 100000
@@ -77,7 +78,7 @@ type cgroupV2 struct {
 }
 
 func newCgroupV2(mountpoint, group string, useSystemd bool) (Cgroup, error) {
-	data, err := ioutil.ReadFile(filepath.Join(mountpoint, "cgroup.controllers"))
+	data, err := os.ReadFile(filepath.Join(mountpoint, "cgroup.controllers"))
 	if err != nil {
 		return nil, err
 	}
@@ -231,14 +232,29 @@ func (c *cgroupV2) Join() (func(), error) {
 	return cu.Release(), nil
 }
 
-// CPUQuota returns the CFS CPU quota.
-func (c *cgroupV2) CPUQuota() (float64, error) {
-	cpuMax, err := getValue(c.MakePath(""), "cpu.max")
+func getCPUQuota(path string) (float64, error) {
+	cpuMax, err := getValue(path, cpuLimitCgroup)
 	if err != nil {
 		return -1, err
 	}
-
 	return parseCPUQuota(cpuMax)
+}
+
+// CPUQuota returns the CFS CPU quota.
+func (c *cgroupV2) CPUQuota() (float64, error) {
+	cpuQuota, err := getCPUQuota(c.MakePath(""))
+	if err != nil {
+		return -1, err
+	}
+	// In cgroupv2+systemd, limits are set in the parent slice rather
+	// than the leaf node. Check the parent to see if this is the case.
+	if cpuQuota == -1 {
+		cpuQuota, err = getCPUQuota(filepath.Dir(c.MakePath("")))
+		if err != nil && errors.Is(err, os.ErrNotExist) {
+			err = nil
+		}
+	}
+	return cpuQuota, nil
 }
 
 func parseCPUQuota(cpuMax string) (float64, error) {
@@ -248,7 +264,7 @@ func parseCPUQuota(cpuMax string) (float64, error) {
 	}
 
 	// no cpu limit if quota is max
-	if data[0] == "max" {
+	if data[0] == maxLimitStr {
 		return -1, nil
 	}
 
@@ -269,7 +285,7 @@ func parseCPUQuota(cpuMax string) (float64, error) {
 
 }
 
-// CPUUsage returns the total CPU usage of the cgroup.
+// CPUUsage returns the total CPU usage of the cgroup in nanoseconds.
 func (c *cgroupV2) CPUUsage() (uint64, error) {
 	cpuStat, err := getValue(c.MakePath(""), "cpu.stat")
 	if err != nil {
@@ -283,7 +299,7 @@ func (c *cgroupV2) CPUUsage() (uint64, error) {
 			return 0, err
 		}
 		if key == "usage_usec" {
-			return value, nil
+			return value * 1000, nil
 		}
 	}
 
@@ -299,21 +315,39 @@ func (c *cgroupV2) NumCPU() (int, error) {
 	return countCpuset(strings.TrimSpace(cpuset))
 }
 
+func getMemoryLimit(path string) (string, error) {
+	limStr, err := getValue(path, memoryLimitCgroup)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(limStr), nil
+}
+
 // MemoryLimit returns the memory limit.
 func (c *cgroupV2) MemoryLimit() (uint64, error) {
-	limStr, err := getValue(c.MakePath(""), "memory.max")
+	limStr, err := getMemoryLimit(c.MakePath(""))
 	if err != nil {
 		return 0, err
 	}
-	limStr = strings.TrimSpace(limStr)
-	if limStr == "max" {
-		return math.MaxUint64, nil
+	// In cgroupv2+systemd, limits are set in the parent slice rather
+	// than the leaf node. Check the parent to see if this is the case.
+	if limStr == maxLimitStr {
+		parentLimStr, err := getMemoryLimit(filepath.Dir(c.MakePath("")))
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return 0, err
+		}
+		if parentLimStr != "" {
+			limStr = parentLimStr
+		}
+		if limStr == maxLimitStr {
+			return math.MaxUint64, nil
+		}
 	}
 	return strconv.ParseUint(limStr, 10, 64)
 }
 
 // MakePath builds a path to the given controller.
-func (c *cgroupV2) MakePath(controllerName string) string {
+func (c *cgroupV2) MakePath(string) string {
 	return filepath.Join(c.Mountpoint, c.Path)
 }
 
@@ -389,7 +423,7 @@ func (*cpu2) set(spec *specs.LinuxResources, path string) error {
 	}
 
 	if spec.CPU.Period != nil || spec.CPU.Quota != nil {
-		v := "max"
+		v := maxLimitStr
 		if spec.CPU.Quota != nil && *spec.CPU.Quota > 0 {
 			v = strconv.FormatInt(*spec.CPU.Quota, 10)
 		}
@@ -761,7 +795,7 @@ func numToStr(value int64) (ret string) {
 	case value == 0:
 		ret = ""
 	case value == -1:
-		ret = "max"
+		ret = maxLimitStr
 	default:
 		ret = strconv.FormatInt(value, 10)
 	}
@@ -834,7 +868,8 @@ func parseUint(s string, base, bitSize int) (uint64, error) {
 // AllowedCPUs/AllowedMemoryNodes unit property value).
 // Copied from runc.
 func RangeToBits(str string) ([]byte, error) {
-	bits := &bitset.BitSet{}
+	bits := &big.Int{}
+
 	for _, r := range strings.Split(str, ",") {
 		// allow extra spaces around
 		r = strings.TrimSpace(r)
@@ -855,31 +890,22 @@ func RangeToBits(str string) ([]byte, error) {
 			if start > end {
 				return nil, errors.New("invalid range: " + r)
 			}
-			for i := uint(start); i <= uint(end); i++ {
-				bits.Set(i)
+			for i := start; i <= end; i++ {
+				bits.SetBit(bits, int(i), 1)
 			}
 		} else {
 			val, err := strconv.ParseUint(ranges[0], 10, 32)
 			if err != nil {
 				return nil, err
 			}
-			bits.Set(uint(val))
+			bits.SetBit(bits, int(val), 1)
 		}
 	}
 
-	val := bits.Bytes()
-	if len(val) == 0 {
+	ret := bits.Bytes()
+	if len(ret) == 0 {
 		// do not allow empty values
 		return nil, errors.New("empty value")
-	}
-	ret := make([]byte, len(val)*8)
-	for i := range val {
-		// bitset uses BigEndian internally
-		binary.BigEndian.PutUint64(ret[i*8:], val[len(val)-1-i])
-	}
-	// remove upper all-zero bytes
-	for ret[0] == 0 {
-		ret = ret[1:]
 	}
 	return ret, nil
 }

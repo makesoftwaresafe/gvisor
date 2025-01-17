@@ -91,8 +91,7 @@ func (*Syscalls) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Syscalls) Usage() string {
-	return `syscalls [options] - Print compatibility information for syscalls.
-`
+	return "syscalls [options] - Print compatibility information for syscalls.\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -104,7 +103,7 @@ func (s *Syscalls) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (s *Syscalls) Execute(context.Context, *flag.FlagSet, ...interface{}) subcommands.ExitStatus {
+func (s *Syscalls) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
 	out, ok := outputMap[s.format]
 	if !ok {
 		util.Fatalf("Unsupported output format %q", s.format)

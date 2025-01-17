@@ -1,6 +1,6 @@
 // Copyright 2021 The gVisor Authors.
 //
-// Licensed under the Apache License, Version 3.0 (the "License");
+// Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
@@ -24,13 +24,14 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 // All possible operations from redis. Note: "ping" will
 // run both PING_INLINE and PING_BUILD.
 var operations []string = []string{
 	"PING_INLINE",
-	"PING_BULK",
+	"PING_MBULK",
 	"SET",
 	"GET",
 	"INCR",
@@ -48,9 +49,18 @@ var operations []string = []string{
 	"MSET",
 }
 
-// BenchmarkRedis runs redis-benchmark against a redis instance and reports
+// BenchmarkAllRedisOperations runs redis-benchmark against a redis instance and reports
 // data in queries per second. Each is reported by named operation (e.g. LPUSH).
+func BenchmarkAllRedisOperations(b *testing.B) {
+	doBenchmarkRedis(b, operations)
+}
+
+// BenchmarkRedisDashboard runs a subset of redis benchmarks for the performance dashboard.
 func BenchmarkRedis(b *testing.B) {
+	doBenchmarkRedis(b, []string{"SET", "LPUSH", "LRANGE_100"})
+}
+
+func doBenchmarkRedis(b *testing.B, ops []string) {
 	clientMachine, err := harness.GetMachine()
 	if err != nil {
 		b.Fatalf("failed to get machine: %v", err)
@@ -76,25 +86,31 @@ func BenchmarkRedis(b *testing.B) {
 	}); err != nil {
 		b.Fatalf("failed to start redis server with: %v", err)
 	}
+	defer metricsviz.FromContainerLogs(ctx, b, server)
 
 	if out, err := server.WaitForOutput(ctx, "Ready to accept connections", 3*time.Second); err != nil {
 		b.Fatalf("failed to start redis server: %v %s", err, out)
 	}
 
-	ip, err := serverMachine.IPAddress()
+	pinger := clientMachine.GetNativeContainer(ctx, b)
+	defer pinger.CleanUp(ctx)
+
+	out, err := pinger.Run(ctx, dockerutil.RunOpts{
+		Image: "benchmarks/redis",
+		Links: []string{
+			server.MakeLink("redis"),
+		},
+	}, strings.Split("redis-cli -h redis -r 5 -i 1 ping", " ")...)
+
 	if err != nil {
-		b.Fatalf("failed to get IP from server: %v", err)
+		b.Fatalf("redis-benchmark failed with: %v", err)
 	}
 
-	serverPort, err := server.FindPort(ctx, port)
-	if err != nil {
-		b.Fatalf("failed to get IP from server: %v", err)
+	if !strings.Contains(strings.ToLower(out), "pong") {
+		b.Fatalf("redis-benchmark failed to start redis server: %s", out)
 	}
 
-	if err = harness.WaitUntilServing(ctx, clientMachine, ip, serverPort); err != nil {
-		b.Fatalf("failed to start redis with: %v", err)
-	}
-	for _, operation := range operations {
+	for _, operation := range ops {
 		param := tools.Parameter{
 			Name:  "operation",
 			Value: operation,
@@ -120,7 +136,8 @@ func BenchmarkRedis(b *testing.B) {
 
 				out, err = client.Run(ctx, dockerutil.RunOpts{
 					Image: "benchmarks/redis",
-				}, redis.MakeCmd(ip, serverPort, b.N /*requests*/)...)
+					Links: []string{server.MakeLink("redis")},
+				}, redis.MakeCmd("redis", port, b.N /*requests*/)...)
 			}
 
 			if err != nil {

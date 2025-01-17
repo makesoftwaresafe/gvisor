@@ -22,7 +22,6 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"text/template"
 
 	"github.com/google/subcommands"
 	"golang.org/x/sys/unix"
@@ -62,7 +61,7 @@ func closeOutput(w io.Writer) {
 }
 
 // failure exits with the given failure message.
-func failure(fmtStr string, v ...interface{}) subcommands.ExitStatus {
+func failure(fmtStr string, v ...any) subcommands.ExitStatus {
 	fmt.Fprintf(os.Stderr, fmtStr+"\n", v...)
 	return subcommands.ExitFailure
 }
@@ -179,7 +178,7 @@ func (c *Check) SetFlags(fs *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Check) Execute(ctx context.Context, fs *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *Check) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if c.Package == "" {
 		c.Package = "main" // Default, no imports.
 	}
@@ -199,6 +198,7 @@ type Bundle struct {
 	checkCommon
 	Root   string
 	Prefix string
+	Filter string
 }
 
 // Name implements subcommands.Command.Name.
@@ -230,22 +230,24 @@ func (b *Bundle) SetFlags(fs *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (b *Bundle) Execute(ctx context.Context, fs *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (b *Bundle) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	// Perform the analysis.
 	if err := b.execute(func() (check.FindingSet, facts.Serializer, error) {
 		// Discover the correct common root.
-		srcRootPrefix, err := check.FindRoot(fs.Args(), b.Root)
+		srcRootPrefixes, err := check.FindRoots(fs.Args(), b.Root)
 		if err != nil {
 			return nil, nil, err
 		}
 		// Split into packages.
 		sources := make(map[string][]string)
-		for pkg, srcs := range check.SplitPackages(fs.Args(), srcRootPrefix) {
-			path := pkg
-			if b.Prefix != "" {
-				path = b.Prefix + "/" + path // Subpackage.
+		for _, srcRootPrefix := range srcRootPrefixes {
+			for pkg, srcs := range check.SplitPackages(fs.Args(), srcRootPrefix) {
+				path := pkg
+				if b.Prefix != "" {
+					path = b.Prefix + "/" + path // Subpackage.
+				}
+				sources[path] = append(sources[path], srcs...)
 			}
-			sources[path] = append(sources[path], srcs...)
 		}
 		return check.Bundle(sources)
 	}); err != nil {
@@ -286,7 +288,7 @@ func (s *Stdlib) SetFlags(fs *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (s *Stdlib) Execute(ctx context.Context, fs *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (s *Stdlib) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if fs.NArg() != 0 {
 		return subcommands.ExitUsageError // Need no arguments.
 	}
@@ -398,7 +400,7 @@ func loadConfigs(filenames []string) (*config.Config, error) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (f *Filter) Execute(ctx context.Context, fs *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (f *Filter) Execute(ctx context.Context, fs *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	// Open and merge all configuations.
 	config, err := loadConfigs(f.Configs)
 	if err != nil {
@@ -412,7 +414,7 @@ func (f *Filter) Execute(ctx context.Context, fs *flag.FlagSet, args ...interfac
 	}
 	defer closeOutput(output)
 
-	// Load and filer available findings.
+	// Load and filter available findings.
 	var filteredFindings check.FindingSet
 	for _, filename := range fs.Args() {
 		// Note that this applies a caching strategy to the filtered
@@ -458,75 +460,12 @@ func (f *Filter) Execute(ctx context.Context, fs *flag.FlagSet, args ...interfac
 	return subcommands.ExitSuccess
 }
 
-// Render implements subcommands.Command for the "render" command.
-type Render struct {
-	Template string
-	Output   string
-}
-
-// Name implements subcommands.Command.Name.
-func (*Render) Name() string {
-	return "render"
-}
-
-// Synopsis implements subcommands.Command.Synopsis.
-func (*Render) Synopsis() string {
-	return "Renders facts about a package using a template."
-}
-
-// Usage implements subcommands.Command.Usage.
-func (*Render) Usage() string {
-	return `render <srcs...>
-
-	Loads all data and renders all known facts. Note that render is not
-	currently compatible with binary analyzers, and these facts will not
-	be included (unless they come from dependencies).
-
-`
-}
-
-// SetFlags implements subcommands.Command.SetFlags.
-func (r *Render) SetFlags(fs *flag.FlagSet) {
-	fs.StringVar(&r.Template, "template", "", "text template file for rendering (required)")
-	fs.StringVar(&r.Output, "output", "", "output file for rendering (or empty for stdout)")
-}
-
-// Execute implements subcommands.Command.Execute.
-func (r *Render) Execute(ctx context.Context, fs *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
-	// Open the output file.
-	output, err := openOutput(r.Output, os.Stdout)
-	if err != nil {
-		return failure("opening output: %v", err)
-	}
-	defer closeOutput(output)
-
-	// Open the template file.
-	t, err := template.ParseFiles(r.Template)
-	if err != nil {
-		return failure("loading template: %v", err)
-	}
-
-	// Process the facts.
-	facts, err := check.Facts("main", fs.Args())
-	if err != nil {
-		return failure("%v", err)
-	}
-
-	// Render as a template.
-	if err := t.Execute(output, facts); err != nil {
-		return failure("during render: %v", err)
-	}
-
-	return subcommands.ExitSuccess
-}
-
 // Main is the main entrypoint.
 func Main() {
 	subcommands.Register(&Check{}, "")
 	subcommands.Register(&Bundle{}, "")
 	subcommands.Register(&Stdlib{}, "")
 	subcommands.Register(&Filter{}, "")
-	subcommands.Register(&Render{}, "")
 	subcommands.Register(subcommands.HelpCommand(), "")
 	subcommands.Register(subcommands.FlagsCommand(), "")
 	flag.CommandLine.Parse(os.Args[1:])

@@ -93,9 +93,9 @@ type testContext struct {
 
 func (ctx *testContext) cleanup() {
 	ctx.localServerListener.Close()
-	ctx.localStack.Close()
+	ctx.localStack.Destroy()
 	ctx.remoteServerListener.Close()
-	ctx.remoteStack.Close()
+	ctx.remoteStack.Destroy()
 	ctx.wg.Wait()
 }
 
@@ -113,14 +113,13 @@ var (
 
 func newTestContext(t *testing.T) *testContext {
 	t.Helper()
-	localNIC, remoteNIC := pipe.New("" /* linkAddr1 */, "" /* linkAddr2 */, header.IPv4MinimumMTU)
+	localNIC, remoteNIC := pipe.New("" /* linkAddr1 */, "" /* linkAddr2 */, 1500)
 
 	localStack := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
 		HandleLocal:        true,
 	})
-
 	remoteStack := stack.New(stack.Options{
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
@@ -307,7 +306,7 @@ func TestOutboundNATRedirect(t *testing.T) {
 		Protocol:      tcp.ProtocolNumber,
 		CheckProtocol: true,
 		Src:           localIPv4Addr1,
-		SrcMask:       tcpip.Address("\xff\xff\xff\xff"),
+		SrcMask:       tcpip.AddrFromSlice([]byte("\xff\xff\xff\xff")),
 	}
 	tbl.Rules[ruleIdx].Target = &stack.RedirectTarget{
 		Port:            localServerPort,
@@ -328,7 +327,7 @@ func TestOutboundNATRedirect(t *testing.T) {
 			return nil, fmt.Errorf("unable to parse port from string %s, err: %s", port, err)
 		}
 		remoteAddress := tcpip.FullAddress{
-			Addr: tcpip.Address(remoteServerIP.To4()),
+			Addr: tcpip.AddrFrom4Slice(remoteServerIP.To4()),
 			Port: uint16(remoteServerPort),
 		}
 
@@ -344,7 +343,7 @@ func TestOutboundNATRedirect(t *testing.T) {
 		},
 	}
 
-	serverURL := fmt.Sprintf("http://[%s]:%d/", net.IP(remoteIPv4Addr1), remoteServerPort)
+	serverURL := fmt.Sprintf("http://[%s]:%d/", net.IP(remoteIPv4Addr1.AsSlice()), remoteServerPort)
 	response, err := httpClient.Get(serverURL)
 	if err != nil {
 		t.Fatalf("httpClient.Get(\"/\") failed: %s", err)

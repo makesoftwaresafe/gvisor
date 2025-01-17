@@ -37,6 +37,7 @@
 #include <atomic>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <ostream>
@@ -48,7 +49,11 @@
 
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
+#include "absl/algorithm/container.h"
+#include "absl/container/btree_map.h"
+#include "absl/container/flat_hash_set.h"
 #include "absl/container/node_hash_set.h"
+#include "absl/flags/flag.h"
 #include "absl/strings/ascii.h"
 #include "absl/strings/match.h"
 #include "absl/strings/numbers.h"
@@ -97,6 +102,9 @@ using ::testing::UnorderedElementsAreArray;
 // Exported by glibc.
 extern char** environ;
 
+ABSL_FLAG(bool, proc_pid_reuse_child, false,
+          "If true, run the Proc_PidReuse child workload.");
+
 namespace gvisor {
 namespace testing {
 namespace {
@@ -112,34 +120,35 @@ namespace {
 #endif /* SUID_DUMP_ROOT */
 
 #if defined(__x86_64__) || defined(__i386__)
-// This list of "required" fields is taken from reading the file
-// arch/x86/kernel/cpu/proc.c and seeing which fields will be unconditionally
-// printed by the kernel.
+// This list of "required" fields consists of the set of fields that are printed
+// unconditionally by the kernel (see arch/x86/kernel/cpu/proc.c) and a set of
+// fields that are printed conditionally, but are present on common
+// configurations (e.g. when CONFIG_SMP is set).
 static const char* required_fields[] = {
-    "processor",
-    "vendor_id",
-    "cpu family",
-    "model\t\t:",
-    "model name",
-    "stepping",
-    "cpu MHz",
-    "fpu\t\t:",
-    "fpu_exception",
-    "cpuid level",
-    "wp",
-    "bogomips",
-    "clflush size",
-    "cache_alignment",
-    "address sizes",
-    "power management",
+    "processor",     "vendor_id",        "cpu family",
+    "model\t\t:",    "model name",       "stepping",
+    "cpu MHz",       "cache size",       "physical id",
+    "siblings",      "core id",          "cpu cores",
+    "apicid\t\t:",   "initial apicid",   "fpu\t\t:",
+    "fpu_exception", "cpuid level",      "wp",
+    "bogomips",      "clflush size",     "cache_alignment",
+    "address sizes", "power management",
 };
-#elif __aarch64__
+#elif defined(__aarch64__)
 // This list of "required" fields is taken from reading the file
 // arch/arm64/kernel/cpuinfo.c and seeing which fields will be unconditionally
 // printed by the kernel.
 static const char* required_fields[] = {
     "processor",        "BogoMIPS",    "Features", "CPU implementer",
     "CPU architecture", "CPU variant", "CPU part", "CPU revision",
+};
+#elif defined(__riscv)
+// This list of "required" fields is taken from reading the file
+// arch/riscv/kernel/cpu.c and seeing which fields will be unconditionally
+// printed by the kernel.
+static const char* required_fields[] = {
+    "processor",
+    "hart",
 };
 #else
 #error "Unknown architecture"
@@ -563,13 +572,20 @@ TEST(ProcPidMem, Unmapped) {
               SyscallSucceedsWithValue(sizeof(output)));
   ASSERT_EQ(expected, output);
 
-  // Unmap region again
-  ASSERT_THAT(munmap(mapping.ptr(), mapping.len()), SyscallSucceeds());
+  const auto rest = [&] {
+    // This is a new process, so we need to re-open /proc/self/mem.
+    int memfd = open("/proc/self/mem", O_RDONLY);
+    TEST_PCHECK_MSG(memfd >= 0, "open failed");
+    // Unmap region again
+    TEST_PCHECK_MSG(MunmapSafe(mapping.ptr(), mapping.len()) == 0,
+                    "munmap failed");
+    // Now we want EIO error
+    TEST_CHECK(pread(memfd, &output, sizeof(output),
+                     reinterpret_cast<off_t>(mapping.ptr())) == -1);
+    TEST_PCHECK_MSG(errno == EIO, "pread failed with unexpected errno");
+  };
 
-  // Now we want EIO error
-  ASSERT_THAT(pread(memfd.get(), &output, sizeof(output),
-                    reinterpret_cast<off_t>(mapping.ptr())),
-              SyscallFailsWithErrno(EIO));
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
 }
 
 // Perform read repeatedly to verify offset change.
@@ -623,29 +639,32 @@ TEST(ProcPidMem, RepeatedSeek) {
 
 // Perform read past an allocated memory region.
 TEST(ProcPidMem, PartialRead) {
-  // Strategy: map large region, then do unmap and remap smaller region
-  auto memfd = ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/self/mem", O_RDONLY));
-
+  // Reserve 2 pages.
   Mapping mapping = ASSERT_NO_ERRNO_AND_VALUE(
       MmapAnon(2 * kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE));
-  ASSERT_THAT(munmap(mapping.ptr(), mapping.len()), SyscallSucceeds());
-  Mapping smaller_mapping = ASSERT_NO_ERRNO_AND_VALUE(
-      Mmap(mapping.ptr(), kPageSize, PROT_READ | PROT_WRITE,
-           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
 
-  // Fill it with things
-  memset(smaller_mapping.ptr(), 'x', smaller_mapping.len());
+  // Fill the first page with data.
+  memset(mapping.ptr(), 'x', kPageSize);
 
-  // Now we want no error
   char expected[] = {'x'};
   std::unique_ptr<char[]> output(new char[kPageSize]);
-  off_t read_offset =
-      reinterpret_cast<off_t>(smaller_mapping.ptr()) + kPageSize - 1;
-  ASSERT_THAT(
-      pread(memfd.get(), output.get(), sizeof(output.get()), read_offset),
-      SyscallSucceedsWithValue(sizeof(expected)));
-  // Since output is larger, than expected we have to do manual compare
-  ASSERT_EQ(expected[0], (output).get()[0]);
+  off_t read_offset = reinterpret_cast<off_t>(mapping.ptr()) + kPageSize - 1;
+  const auto rest = [&] {
+    int memfd = open("/proc/self/mem", O_RDONLY);
+    TEST_PCHECK_MSG(memfd >= 0, "open failed");
+    // Unmap the second page.
+    TEST_PCHECK_MSG(
+        MunmapSafe(reinterpret_cast<void*>(mapping.addr() + kPageSize),
+                   kPageSize) == 0,
+        "munmap failed");
+    // Expect to read up to the end of the first page without getting EIO.
+    TEST_PCHECK_MSG(
+        pread(memfd, output.get(), kPageSize, read_offset) == sizeof(expected),
+        "pread failed");
+    TEST_CHECK(expected[0] == output.get()[0]);
+  };
+
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
 }
 
 // Perform read on /proc/[pid]/mem after exit.
@@ -1108,22 +1127,122 @@ TEST(ProcSelfMaps, Mprotect) {
                                                    3 * kPageSize, PROT_READ)));
 }
 
+// Expected pathname for MAP_SHARED | MAP_ANONYMOUS mappings. See proc(5),
+// "/proc/[pid]/map_files/".
+constexpr char kSharedAnonPath[] = "/dev/zero (deleted)";
+
 TEST(ProcSelfMaps, SharedAnon) {
   const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
       MmapAnon(kPageSize, PROT_READ, MAP_SHARED | MAP_ANONYMOUS));
 
   const auto proc_self_maps =
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
-  for (const auto& line : absl::StrSplit(proc_self_maps, '\n')) {
-    const auto entry = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMapsLine(line));
-    if (entry.start <= m.addr() && m.addr() < entry.end) {
-      // cf. proc(5), "/proc/[pid]/map_files/"
-      EXPECT_EQ(entry.filename, "/dev/zero (deleted)");
-      return;
-    }
-  }
-  FAIL() << "no maps entry containing mapping at " << m.ptr();
+  const auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  const auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, kSharedAnonPath);
 }
+
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+
+TEST(ProcSelfMaps, AnonNamePrivateAnon) {
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  ASSERT_THAT(rv, SyscallSucceeds());
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon:test]");
+
+  ASSERT_THAT(prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), ""),
+              SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon:]");
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "");
+}
+
+TEST(ProcSelfMaps, AnonNameSharedAnon) {
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ, MAP_SHARED | MAP_ANONYMOUS));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  // Using PR_SET_VMA_ANON_NAME on shared anonymous mappings isn't permitted
+  // until d09e8ca6cb93 ("mm: anonymous shared memory naming"), Linux 6.2+.
+  SKIP_IF(rv < 0 && errno == EBADF);
+  ASSERT_THAT(rv, SyscallSucceeds());
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon_shmem:test]");
+
+  ASSERT_THAT(prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), ""),
+              SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, "[anon_shmem:]");
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallSucceeds());
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, kSharedAnonPath);
+}
+
+// Test parameterized by mmap flags.
+class ProcSelfMapsMmapFileTest : public ::testing::TestWithParam<int> {};
+
+TEST_P(ProcSelfMapsMmapFileTest, AnonNameFile) {
+  const auto f = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const auto fd = ASSERT_NO_ERRNO_AND_VALUE(Open(f.path(), O_RDONLY));
+  const Mapping m = ASSERT_NO_ERRNO_AND_VALUE(
+      Mmap(nullptr, kPageSize, PROT_READ, GetParam(), fd.get(), 0));
+
+  int rv = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), "test");
+  SKIP_IF(rv < 0 && errno == EINVAL);
+  ASSERT_THAT(rv, SyscallFailsWithErrno(EBADF));
+  auto proc_self_maps =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  auto entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  auto entry =
+      ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, f.path());
+
+  ASSERT_THAT(
+      prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, m.addr(), m.len(), nullptr),
+      SyscallFailsWithErrno(EBADF));
+  proc_self_maps = ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/self/maps"));
+  entries = ASSERT_NO_ERRNO_AND_VALUE(ParseProcMaps(proc_self_maps));
+  entry = ASSERT_NO_ERRNO_AND_VALUE(FindUniqueMapsEntry(entries, m.addr()));
+  EXPECT_EQ(entry.filename, f.path());
+}
+
+INSTANTIATE_TEST_SUITE_P(SelfAndNumericPid, ProcSelfMapsMmapFileTest,
+                         ::testing::Values(MAP_SHARED, MAP_PRIVATE));
 
 TEST(ProcSelfFd, OpenFd) {
   int pipe_fds[2];
@@ -1156,7 +1275,7 @@ static void CheckFdDirGetdentsDuplicates(const std::string& path) {
   EXPECT_GE(newfd, 1024);
   auto fd_closer = Cleanup([newfd]() { close(newfd); });
   auto fd_files = ASSERT_NO_ERRNO_AND_VALUE(ListDir(path.c_str(), false));
-  absl::node_hash_set<std::string> fd_files_dedup(fd_files.begin(),
+  absl::flat_hash_set<std::string> fd_files_dedup(fd_files.begin(),
                                                   fd_files.end());
   EXPECT_EQ(fd_files.size(), fd_files_dedup.size());
 }
@@ -1223,6 +1342,11 @@ TEST(ProcSelfCwd, Absolute) {
   EXPECT_EQ(exe[0], '/');
 }
 
+TEST(ProcSelfRoot, IsRoot) {
+  auto exe = ASSERT_NO_ERRNO_AND_VALUE(ReadLink("/proc/self/root"));
+  EXPECT_EQ(exe, "/");
+}
+
 // Sanity check that /proc/cmdline is present.
 TEST(ProcCmdline, IsPresent) {
   std::string proc_cmdline =
@@ -1238,7 +1362,7 @@ TEST(ProcCpuinfo, RequiredFieldsArePresent) {
 
   // Check that the usual fields are there. We don't really care about the
   // contents.
-  for (const std::string& field : required_fields) {
+  for (const char* field : required_fields) {
     EXPECT_THAT(proc_cpuinfo, HasSubstr(field));
   }
 }
@@ -1335,6 +1459,28 @@ TEST(ProcMeminfo, ContainsBasicFields) {
       ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/meminfo"));
   EXPECT_THAT(proc_meminfo, AllOf(ContainsRegex(R"(MemTotal:\s+[0-9]+ kB)"),
                                   ContainsRegex(R"(MemFree:\s+[0-9]+ kB)")));
+}
+
+TEST(ProcSentryMeminfo, ContainsFieldsAndEndsWithNewline) {
+  SKIP_IF(!IsRunningOnGvisor());
+
+  std::string proc_sentry_meminfo =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sentry-meminfo"));
+
+  // Assert that all expected fields are present.
+  EXPECT_THAT(proc_sentry_meminfo,
+              AllOf(ContainsRegex(R"(Alloc:\s+[0-9]+ kB)"),
+                    ContainsRegex(R"(TotalAlloc:\s+[0-9]+ kB)"),
+                    ContainsRegex(R"(Sys:\s+[0-9]+ kB)"),
+                    ContainsRegex(R"(Mallocs:\s+[0-9]+)"),
+                    ContainsRegex(R"(Frees:\s+[0-9]+)"),
+                    ContainsRegex(R"(Live Objects:\s+[0-9]+)"),
+                    ContainsRegex(R"(HeapAlloc:\s+[0-9]+ kB)"),
+                    ContainsRegex(R"(HeapSys:\s+[0-9]+ kB)"),
+                    ContainsRegex(R"(HeapObjects:\s+[0-9]+)")));
+
+  // Assert that /proc/sentry-meminfo ends with a new line.
+  EXPECT_EQ(proc_sentry_meminfo.back(), '\n');
 }
 
 TEST(ProcStat, ContainsBasicFields) {
@@ -1446,12 +1592,32 @@ TEST(ProcLoadavg, Fields) {
 
 class ProcPidStatTest : public ::testing::TestWithParam<std::string> {};
 
+// Parses /proc/<pid>/stat output to a vector of string. We need a more
+// complicated approach than absl::StrSplit because COMM can contain spaces.
+PosixErrorOr<std::vector<std::string>> ParseProcPidStat(
+    absl::string_view proc_pid_stat) {
+  auto comm_start = proc_pid_stat.find('(');
+  auto comm_end = proc_pid_stat.rfind(')');
+  if (comm_start == proc_pid_stat.npos || comm_end == proc_pid_stat.npos) {
+    return PosixError(EINVAL, absl::StrCat("Invalid /proc/<pid>/stat"));
+  }
+  std::vector<std::string> fields =
+      absl::StrSplit(proc_pid_stat.substr(0, comm_start - 1), ' ');
+  fields.push_back(std::string{proc_pid_stat.substr(comm_start, comm_end + 1)});
+  absl::c_transform(absl::StrSplit(proc_pid_stat.substr(comm_end + 2), ' '),
+                    std::back_inserter(fields),
+                    [](auto sv) { return std::string{sv}; });
+  return fields;
+}
+
 TEST_P(ProcPidStatTest, HasBasicFields) {
   std::string proc_pid_stat = ASSERT_NO_ERRNO_AND_VALUE(
       GetContents(absl::StrCat("/proc/", GetParam(), "/stat")));
 
   ASSERT_FALSE(proc_pid_stat.empty());
-  std::vector<std::string> fields = absl::StrSplit(proc_pid_stat, ' ');
+  std::vector<std::string> fields =
+      ASSERT_NO_ERRNO_AND_VALUE(ParseProcPidStat(proc_pid_stat));
+
   ASSERT_GE(fields.size(), 24);
   EXPECT_EQ(absl::StrCat(getpid()), fields[0]);
   // fields[1] is the thread name.
@@ -1509,7 +1675,8 @@ PosixErrorOr<uint64_t> CurrentRSS() {
     return PosixError(EINVAL, "empty /proc/self/stat");
   }
 
-  std::vector<std::string> fields = absl::StrSplit(proc_self_stat, ' ');
+  ASSIGN_OR_RETURN_ERRNO(std::vector<std::string> fields,
+                         ParseProcPidStat(proc_self_stat));
   if (fields.size() < 24) {
     return PosixError(
         EINVAL,
@@ -1599,9 +1766,9 @@ PosixErrorOr<std::string> ThreadName() {
 
 // Parses the contents of a /proc/[pid]/status file into a collection of
 // key-value pairs.
-PosixErrorOr<std::map<std::string, std::string>> ParseProcStatus(
+PosixErrorOr<absl::btree_map<std::string, std::string>> ParseProcStatus(
     absl::string_view status_str) {
-  std::map<std::string, std::string> fields;
+  absl::btree_map<std::string, std::string> fields;
   for (absl::string_view const line :
        absl::StrSplit(status_str, '\n', absl::SkipWhitespace())) {
     const std::pair<absl::string_view, absl::string_view> kv =
@@ -1996,6 +2163,14 @@ TEST(ProcPidCwd, Subprocess) {
   EXPECT_EQ(got, want);
 }
 
+// /proc/PID/root points to the correct directory.
+TEST(ProcPidRoot, Subprocess) {
+  char got[PATH_MAX + 1] = {};
+  ASSERT_THAT(ReadlinkWhileRunning("root", got, sizeof(got)),
+              SyscallSucceedsWithValue(Gt(0)));
+  EXPECT_STREQ(got, "/");
+}
+
 // Test whether /proc/PID/ files can be read for a running process.
 TEST(ProcPidFile, SubprocessRunning) {
   char buf[1];
@@ -2320,6 +2495,38 @@ TEST(ProcTask, VerifyTaskDir) {
       DirContains(absl::StrCat("/proc/self/task/", getpid()), {}, {"task"}));
 }
 
+TEST(ProcTask, VerifyTaskChildren) {
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(gettid()), "children");
+  EXPECT_THAT(access(path.c_str(), F_OK), SyscallSucceeds());
+
+  int pid1 = -1, status1 = -1;
+  auto cleanup1 =
+      ForkAndExec("/bin/sleep", {"sleep", "100"}, {}, nullptr, &pid1, &status1);
+  ASSERT_GT(pid1, 0);
+  ASSERT_EQ(status1, 0);
+
+  auto proc_children_file = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+  EXPECT_EQ(absl::StrCat(pid1, " "), proc_children_file);
+
+  int pid2 = -1, status2 = -1;
+  auto cleanup2 =
+      ForkAndExec("/bin/sleep", {"sleep", "100"}, {}, nullptr, &pid2, &status2);
+  ASSERT_GT(pid2, 0);
+  ASSERT_EQ(status2, 0);
+
+  proc_children_file = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+
+  // /children contains space-separated sorted list of thread Ids of children.
+  std::string expectedContent;
+  if (pid1 < pid2) {
+    expectedContent = absl::StrCat(pid1, " ", pid2, " ");
+  } else {
+    expectedContent = absl::StrCat(pid2, " ", pid1, " ");
+  }
+  EXPECT_EQ(expectedContent, proc_children_file);
+}
+
 TEST(ProcTask, TaskDirCannotBeDeleted) {
   // Drop capabilities that allow us to override file and directory permissions.
   AutoCapability cap(CAP_DAC_OVERRIDE, false);
@@ -2394,6 +2601,65 @@ TEST(ProcTask, CommContainsThreadNameAndTrailingNewline) {
       GetContents(JoinPath("/proc", absl::StrCat(getpid()), "task",
                            absl::StrCat(syscall(SYS_gettid)), "comm")));
   EXPECT_EQ(absl::StrCat(kThreadName, "\n"), thread_name);
+}
+
+TEST(ProcTask, CommCanSetSelfThreadName) {
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(syscall(SYS_gettid)), "comm");
+  constexpr char kThreadName[] = "TestThread12345";
+  ASSERT_NO_ERRNO(SetContents(path, kThreadName));
+
+  auto got_thread_name = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+  EXPECT_EQ(absl::StrCat(kThreadName, "\n"), got_thread_name);
+}
+
+TEST(ProcTask, CommCanSetPeerThreadName) {
+  constexpr char kThreadName[] = "TestThread12345";
+
+  // Path correspond to *this* thread's tid. We will changed it from the new
+  // thread created below.
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(syscall(SYS_gettid)), "comm");
+
+  // Start a thread that will set this parent threads name.
+  ScopedThread peer_thread(
+      [&]() { ASSERT_NO_ERRNO(SetContents(path, kThreadName)); });
+
+  peer_thread.Join();
+
+  // Our thread name should have been updated.
+  auto got_thread_name = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+  EXPECT_EQ(absl::StrCat(kThreadName, "\n"), got_thread_name);
+}
+
+TEST(ProcTask, CommCannotSetAnotherProcessThreadName) {
+  // Path correspond to *this* thread's pid and tid.
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(syscall(SYS_gettid)), "comm");
+
+  auto rest = [&] {
+    // New process is allowed to open the file, even for writing, since the
+    // owning user is the same.
+    int fd;
+    TEST_CHECK_SUCCESS(fd = open(path.c_str(), O_WRONLY));
+
+    // Write gets EINVAL since the thread group is different. See Linux
+    // fs/proc/base.c:comm_write.
+    TEST_CHECK_ERRNO(write(fd, "x", 1), EINVAL);
+  };
+
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+TEST(ProcTask, CommLenLimited) {
+  auto path = JoinPath("/proc", absl::StrCat(getpid()), "task",
+                       absl::StrCat(syscall(SYS_gettid)), "comm");
+  // comm is limited by 15 symbols (TASK_COMM_LEN).
+  constexpr char kThreadName[] = "0123456789abcde";
+  ASSERT_NO_ERRNO(SetContents(path, absl::StrCat(kThreadName, "XYZ")));
+
+  auto got_thread_name = ASSERT_NO_ERRNO_AND_VALUE(GetContents(path));
+  EXPECT_EQ(absl::StrCat(kThreadName, "\n"), got_thread_name);
 }
 
 TEST(ProcTaskNs, NsDirExistsAndHasCorrectMetadata) {
@@ -2556,7 +2822,7 @@ void CheckDuplicatesRecursively(std::string path) {
       return;
     }
     auto dir_closer = Cleanup([&dir]() { closedir(dir); });
-    absl::node_hash_set<std::string> children;
+    absl::flat_hash_set<std::string> children;
     while (true) {
       // Readdir(3): If the end of the directory stream is reached, NULL is
       // returned and errno is not changed.  If an error occurs, NULL is
@@ -2743,6 +3009,55 @@ TEST(Proc, RegressionTestB236035339) {
               SyscallFailsWithErrno(ENOTDIR));
 }
 
+// NOTE(b/338393279): Tests that after execve() from a non-leader thread
+// changes which thread owns the thread group ID, the new thread group leader
+// can access its /proc/self.
+TEST(Proc, PidReuse) {
+  const ExecveArray owned_child_argv = {"/proc/self/exe",
+                                        "--proc_pid_reuse_child"};
+  char* const* const child_argv = owned_child_argv.get();
+
+  const auto rest = [child_argv] {
+    struct stat statbuf;
+    TEST_PCHECK(stat("/proc/self/cwd", &statbuf) == 0);
+
+    ScopedThread([child_argv] {
+      execve(child_argv[0], child_argv, /* envp = */ nullptr);
+      TEST_PCHECK_MSG(false, "Survived execve to test child");
+    });
+  };
+  EXPECT_THAT(InForkedProcess(rest), IsPosixErrorOkAndHolds(0));
+}
+
+[[noreturn]] void RunProcPidReuseChild() {
+  struct stat statbuf;
+  TEST_PCHECK(stat("/proc/self/cwd", &statbuf) == 0);
+  _exit(0);
+}
+
+TEST(ProcFilesystems, ReadCapLastCap) {
+  std::string lastCapStr =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/cap_last_cap"));
+
+  uint64_t lastCap;
+  ASSERT_TRUE(absl::SimpleAtoi(lastCapStr, &lastCap));
+  EXPECT_TRUE(lastCap > 32 && lastCap < 64);
+}
+
+TEST(ProcFilesystems, OverflowID) {
+  std::string overflowGidStr =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/overflowgid"));
+  std::string overflowUidStr =
+      ASSERT_NO_ERRNO_AND_VALUE(GetContents("/proc/sys/kernel/overflowuid"));
+  uint64_t overflowGid, overflowUid;
+  ASSERT_TRUE(absl::SimpleAtoi(overflowGidStr, &overflowGid));
+  ASSERT_TRUE(absl::SimpleAtoi(overflowUidStr, &overflowUid));
+
+  const uint64_t defaultOverflowID = 65534;
+  EXPECT_EQ(overflowGid, defaultOverflowID);
+  EXPECT_EQ(overflowUid, defaultOverflowID);
+}
+
 }  // namespace
 }  // namespace testing
 }  // namespace gvisor
@@ -2753,5 +3068,10 @@ int main(int argc, char** argv) {
   }
 
   gvisor::testing::TestInit(&argc, &argv);
+
+  if (absl::GetFlag(FLAGS_proc_pid_reuse_child)) {
+    gvisor::testing::RunProcPidReuseChild();
+  }
+
   return gvisor::testing::RunAllTests();
 }

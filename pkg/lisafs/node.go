@@ -92,7 +92,7 @@ type Node struct {
 	// upto numStaticChildren children using hardcoded pointers. If more children
 	// are inserted then move to a map. Use dynamicChildren iff it is non-nil.
 
-	// The folowing fields are protected by childrenMu.
+	// The following fields are protected by childrenMu.
 	childrenMu     sync.Mutex
 	staticChildren [numStaticChildren]struct {
 		name string
@@ -101,9 +101,9 @@ type Node struct {
 	dynamicChildren map[string]*Node
 }
 
-// DecRef implements refsvfs2.RefCounter.DecRef. Note that the context
+// DecRef implements refs.RefCounter.DecRef. Note that the context
 // parameter should never be used. It exists solely to comply with the
-// refsvfs2.RefCounter interface.
+// refs.RefCounter interface.
 //
 // Precondition: server's rename mutex must be at least read locked.
 func (n *Node) DecRef(context.Context) {

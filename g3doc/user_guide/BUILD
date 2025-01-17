@@ -1,6 +1,7 @@
 load("//website:defs.bzl", "doc")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//website:__pkg__"],
     licenses = ["notice"],
 )
@@ -11,6 +12,81 @@ doc(
     category = "Compatibility",
     permalink = "/docs/user_guide/compatibility/",
     weight = "0",
+)
+
+doc(
+    name = "install",
+    src = "install.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/install/",
+    weight = "10",
+)
+
+doc(
+    name = "production",
+    src = "production.md",
+    category = "User Guide",
+    data = [
+        "sandboxing-tradeoffs.png",
+    ],
+    permalink = "/docs/user_guide/production/",
+    weight = "20",
+)
+
+doc(
+    name = "platforms",
+    src = "platforms.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/platforms/",
+    weight = "30",
+)
+
+doc(
+    name = "filesystem",
+    src = "filesystem.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/filesystem/",
+    weight = "40",
+)
+
+doc(
+    name = "networking",
+    src = "networking.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/networking/",
+    weight = "50",
+)
+
+doc(
+    name = "gpu",
+    src = "gpu.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/gpu/",
+    weight = "51",
+)
+
+doc(
+    name = "tpu",
+    src = "tpu.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/tpu/",
+    weight = "51",
+)
+
+doc(
+    name = "runtime_monitoring",
+    src = "runtime_monitoring.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/runtimemonitor/",
+    weight = "55",
+)
+
+doc(
+    name = "observability",
+    src = "observability.md",
+    category = "User Guide",
+    permalink = "/docs/user_guide/observability/",
+    weight = "56",
 )
 
 doc(
@@ -38,33 +114,9 @@ doc(
 )
 
 doc(
-    name = "filesystem",
-    src = "filesystem.md",
+    name = "systemd",
+    src = "systemd.md",
     category = "User Guide",
-    permalink = "/docs/user_guide/filesystem/",
-    weight = "40",
-)
-
-doc(
-    name = "networking",
-    src = "networking.md",
-    category = "User Guide",
-    permalink = "/docs/user_guide/networking/",
-    weight = "50",
-)
-
-doc(
-    name = "install",
-    src = "install.md",
-    category = "User Guide",
-    permalink = "/docs/user_guide/install/",
-    weight = "10",
-)
-
-doc(
-    name = "platforms",
-    src = "platforms.md",
-    category = "User Guide",
-    permalink = "/docs/user_guide/platforms/",
-    weight = "30",
+    permalink = "/docs/user_guide/systemd/",
+    weight = "91",
 )

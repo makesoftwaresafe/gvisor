@@ -333,6 +333,9 @@ PosixErrorOr<int> InotifyAddWatch(int fd, const std::string& path,
 }
 
 TEST(Inotify, IllegalSeek) {
+  // TODO: b/298787679 - this test fails on 6.0+ kernels.
+  SKIP_IF(!IsRunningOnGvisor());
+
   const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(0));
   EXPECT_THAT(lseek(fd.get(), 0, SEEK_SET), SyscallFailsWithErrno(ESPIPE));
 }
@@ -374,20 +377,27 @@ TEST(Inotify, NonBlockingReadReturnsEagain) {
 
 TEST(Inotify, AddWatchOnInvalidFdFails) {
   // Garbage fd.
-  EXPECT_THAT(inotify_add_watch(-1, "/tmp", IN_ALL_EVENTS),
-              SyscallFailsWithErrno(EBADF));
-  EXPECT_THAT(inotify_add_watch(1337, "/tmp", IN_ALL_EVENTS),
-              SyscallFailsWithErrno(EBADF));
+  EXPECT_THAT(
+      inotify_add_watch(-1, GetAbsoluteTestTmpdir().c_str(), IN_ALL_EVENTS),
+      SyscallFailsWithErrno(EBADF));
+  EXPECT_THAT(
+      inotify_add_watch(1337, GetAbsoluteTestTmpdir().c_str(), IN_ALL_EVENTS),
+      SyscallFailsWithErrno(EBADF));
 
   // Non-inotify fds.
-  EXPECT_THAT(inotify_add_watch(0, "/tmp", IN_ALL_EVENTS),
-              SyscallFailsWithErrno(EINVAL));
-  EXPECT_THAT(inotify_add_watch(1, "/tmp", IN_ALL_EVENTS),
-              SyscallFailsWithErrno(EINVAL));
-  EXPECT_THAT(inotify_add_watch(2, "/tmp", IN_ALL_EVENTS),
-              SyscallFailsWithErrno(EINVAL));
-  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(Open("/tmp", O_RDONLY));
-  EXPECT_THAT(inotify_add_watch(fd.get(), "/tmp", IN_ALL_EVENTS),
+  EXPECT_THAT(
+      inotify_add_watch(0, GetAbsoluteTestTmpdir().c_str(), IN_ALL_EVENTS),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(
+      inotify_add_watch(1, GetAbsoluteTestTmpdir().c_str(), IN_ALL_EVENTS),
+      SyscallFailsWithErrno(EINVAL));
+  EXPECT_THAT(
+      inotify_add_watch(2, GetAbsoluteTestTmpdir().c_str(), IN_ALL_EVENTS),
+      SyscallFailsWithErrno(EINVAL));
+  const FileDescriptor fd = ASSERT_NO_ERRNO_AND_VALUE(
+      Open(GetAbsoluteTestTmpdir().c_str(), O_RDONLY));
+  EXPECT_THAT(inotify_add_watch(fd.get(), GetAbsoluteTestTmpdir().c_str(),
+                                IN_ALL_EVENTS),
               SyscallFailsWithErrno(EINVAL));
 }
 
@@ -1303,8 +1313,7 @@ TEST(Inotify, SymlinkGeneratesCreateEvent) {
 
   const int root_wd = ASSERT_NO_ERRNO_AND_VALUE(
       InotifyAddWatch(fd.get(), root.path(), IN_ALL_EVENTS));
-  ASSERT_NO_ERRNO_AND_VALUE(
-      InotifyAddWatch(fd.get(), file1.path(), IN_ALL_EVENTS));
+  ASSERT_NO_ERRNO(InotifyAddWatch(fd.get(), file1.path(), IN_ALL_EVENTS));
 
   ASSERT_THAT(symlink(file1.path().c_str(), link1.path().c_str()),
               SyscallSucceeds());
@@ -1313,6 +1322,32 @@ TEST(Inotify, SymlinkGeneratesCreateEvent) {
       ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
 
   ASSERT_THAT(events, Are({Event(IN_CREATE, root_wd, Basename(link1.path()))}));
+}
+
+TEST(Inotify, SymlinkFollow) {
+  const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());
+  const TempPath link(NewTempAbsPath());
+  ASSERT_THAT(symlink(file.path().c_str(), link.path().c_str()),
+              SyscallSucceeds());
+
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const int file_wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), link.path(), IN_ALL_EVENTS));
+  const int link_wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), link.path(), IN_ALL_EVENTS | IN_DONT_FOLLOW));
+
+  ASSERT_NO_ERRNO(Unlink(file.path()));
+  ASSERT_NO_ERRNO(Unlink(link.path()));
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+
+  ASSERT_THAT(
+      events,
+      Are({Event(IN_ATTRIB, file_wd), Event(IN_DELETE_SELF, file_wd),
+           Event(IN_IGNORED, file_wd), Event(IN_ATTRIB, link_wd),
+           Event(IN_DELETE_SELF, link_wd), Event(IN_IGNORED, link_wd)}));
 }
 
 TEST(Inotify, LinkGeneratesAttribAndCreateEvents) {
@@ -1836,11 +1871,26 @@ TEST(Inotify, SpliceOnWatchTarget) {
   EXPECT_THAT(splice(pipefds[0], nullptr, fd.get(), nullptr, 1, /*flags=*/0),
               SyscallSucceedsWithValue(1));
 
+  // On Linux, between 983652c69199 ("splice: report related fsnotify events")
+  // and d53471ba6f7a ("splice: remove permission hook from
+  // iter_file_splice_write()"), splice(2) generates two modification events in
+  // many cases, by calling fsnotify_modify() in both fs/splice.c:do_splice()
+  // and fs/splice.c:iter_file_splice_write() =>
+  // fs/read_write.c:vfs_iter_write() => do_iter_write().
   events = ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(inotify_fd.get()));
-  ASSERT_THAT(events, Are({
-                          Event(IN_MODIFY, dir_wd, Basename(file.path())),
-                          Event(IN_MODIFY, file_wd),
-                      }));
+  if (events.size() == 4) {
+    EXPECT_THAT(events, Are({
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                        }));
+  } else {
+    EXPECT_THAT(events, Are({
+                            Event(IN_MODIFY, dir_wd, Basename(file.path())),
+                            Event(IN_MODIFY, file_wd),
+                        }));
+  }
 }
 
 // Watches on a parent should not be triggered by actions on a hard link to one
@@ -1937,14 +1987,18 @@ TEST(Inotify, Xattr) {
 TEST(Inotify, Exec) {
   const FileDescriptor fd =
       ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
-  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
-      InotifyAddWatch(fd.get(), "/bin/true", IN_ALL_EVENTS));
+  // Create a new executable file instead of using /bin/true directly in case
+  // the test suite uses it at any point and generates extra events.
+  TempPath p = ASSERT_NO_ERRNO_AND_VALUE(
+      TempPath::CreateFileWith(GetAbsoluteTestTmpdir(), "#!/bin/true", 0755));
 
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), p.path(), IN_ALL_EVENTS));
   // Perform exec.
   pid_t child = -1;
   int execve_errno = -1;
   auto kill = ASSERT_NO_ERRNO_AND_VALUE(
-      ForkAndExec("/bin/true", {}, {}, nullptr, &child, &execve_errno));
+      ForkAndExec(p.path(), {}, {}, nullptr, &child, &execve_errno));
   ASSERT_EQ(0, execve_errno);
 
   int status;
@@ -2474,6 +2528,25 @@ TEST(InotifyTest, NotifyNoDeadlock) {
     }
     sched_yield();
   }
+}
+
+// NOTE(b/239215242): Regression test.
+TEST(Inotify, KernfsBasic) {
+  const FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(InotifyInit1(IN_NONBLOCK));
+  const std::string procFile = "/proc/filesystems";
+
+  const int wd = ASSERT_NO_ERRNO_AND_VALUE(
+      InotifyAddWatch(fd.get(), procFile, IN_ALL_EVENTS));
+  const FileDescriptor file1_fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open(procFile, O_RDONLY));
+
+  char buf;
+  EXPECT_THAT(read(file1_fd.get(), &buf, 1), SyscallSucceeds());
+
+  const std::vector<Event> events =
+      ASSERT_NO_ERRNO_AND_VALUE(DrainEvents(fd.get()));
+  ASSERT_THAT(events, Are({Event(IN_OPEN, wd), Event(IN_ACCESS, wd)}));
 }
 
 }  // namespace

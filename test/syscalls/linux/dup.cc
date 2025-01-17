@@ -16,11 +16,16 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <memory>
+
 #include "gtest/gtest.h"
 #include "absl/memory/memory.h"
+#include "absl/strings/str_cat.h"
 #include "test/util/eventfd_util.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/posix_error.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
@@ -125,7 +130,7 @@ TEST(DupTest, Rlimit) {
     if (new_fd == -1) {
       break;
     }
-    auto f = absl::make_unique<FileDescriptor>(new_fd);
+    auto f = std::make_unique<FileDescriptor>(new_fd);
     EXPECT_LT(new_fd, kFDLimit);
     EXPECT_GT(new_fd, prev_fd);
     // Check that all fds in (prev_fd, new_fd) are used.
@@ -136,6 +141,29 @@ TEST(DupTest, Rlimit) {
     fds.push_back(std::move(f));
   }
   EXPECT_EQ(fds.size() + used_fds, kFDLimit - fd.get() - 1);
+}
+
+TEST(RlimitTest, DupLimitedByNROpenSysctl) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_RESOURCE)));
+
+  const int kNROpen = 1 << 22;
+  FileDescriptor fd =
+      ASSERT_NO_ERRNO_AND_VALUE(Open("/proc/sys/fs/nr_open", O_WRONLY));
+  auto data = absl::StrCat(kNROpen);
+  EXPECT_THAT(write(fd.get(), data.c_str(), data.size()),
+              SyscallSucceedsWithValue(data.size()));
+
+  struct rlimit rl = {
+      .rlim_cur = kNROpen + 1,
+      .rlim_max = kNROpen + 1,
+  };
+  EXPECT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallFailsWithErrno(EPERM));
+  rl.rlim_cur = kNROpen;
+  rl.rlim_max = kNROpen;
+  ASSERT_THAT(setrlimit(RLIMIT_NOFILE, &rl), SyscallSucceeds());
+
+  ASSERT_THAT(dup3(fd.get(), kNROpen, 0), SyscallFailsWithErrno(EBADF));
+  ASSERT_THAT(dup3(fd.get(), kNROpen - 1, 0), SyscallSucceeds());
 }
 
 TEST(DupTest, Dup2SameFD) {

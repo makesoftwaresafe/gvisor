@@ -19,13 +19,12 @@ package fdbased
 
 import (
 	"encoding/binary"
-	"fmt"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/rawfile"
 	"gvisor.dev/gvisor/pkg/tcpip"
-	"gvisor.dev/gvisor/pkg/tcpip/header"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
+	"gvisor.dev/gvisor/pkg/tcpip/link/stopfd"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -114,8 +113,10 @@ func (t tPacketHdr) Payload() []byte {
 
 // packetMMapDispatcher uses PACKET_RX_RING's to read/dispatch inbound packets.
 // See: mmap_amd64_unsafe.go for implementation details.
+//
+// +stateify savable
 type packetMMapDispatcher struct {
-	stopFd
+	stopfd.StopFD
 	// fd is the file descriptor used to send and receive packets.
 	fd int
 
@@ -129,20 +130,28 @@ type packetMMapDispatcher struct {
 	// ringOffset is the current offset into the ring buffer where the next
 	// inbound packet will be placed by the kernel.
 	ringOffset int
+
+	// mgr is the processor goroutine manager.
+	mgr *processorManager
 }
 
-func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, bool, tcpip.Error) {
+func (d *packetMMapDispatcher) release() {
+	d.mgr.close()
+}
+
+func (d *packetMMapDispatcher) readMMappedPackets() (stack.PacketBufferList, bool, tcpip.Error) {
+	var pkts stack.PacketBufferList
 	hdr := tPacketHdr(d.ringBuffer[d.ringOffset*tpFrameSize:])
 	for hdr.tpStatus()&tpStatusUser == 0 {
-		stopped, errno := rawfile.BlockingPollUntilStopped(d.efd, d.fd, unix.POLLIN|unix.POLLERR)
+		stopped, errno := rawfile.BlockingPollUntilStopped(d.EFD, d.fd, unix.POLLIN|unix.POLLERR)
 		if errno != 0 {
 			if errno == unix.EINTR {
 				continue
 			}
-			return nil, stopped, rawfile.TranslateErrno(errno)
+			return pkts, stopped, tcpip.TranslateErrno(errno)
 		}
 		if stopped {
-			return nil, true, nil
+			return pkts, true, nil
 		}
 		if hdr.tpStatus()&tpStatusCopy != 0 {
 			// This frame is truncated so skip it after flipping the
@@ -154,47 +163,37 @@ func (d *packetMMapDispatcher) readMMappedPacket() ([]byte, bool, tcpip.Error) {
 		}
 	}
 
-	// Copy out the packet from the mmapped frame to a locally owned buffer.
-	pkt := make([]byte, hdr.tpSnapLen())
-	copy(pkt, hdr.Payload())
-	// Release packet to kernel.
-	hdr.setTPStatus(tpStatusKernel)
-	d.ringOffset = (d.ringOffset + 1) % tpFrameNR
-	return pkt, false, nil
+	for hdr.tpStatus()&tpStatusUser == 1 {
+		// Copy out the packet from the mmapped frame to a locally owned buffer.
+		pkts.PushBack(stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Payload: buffer.MakeWithView(buffer.NewViewWithData(hdr.Payload())),
+		}))
+		// Release packet to kernel.
+		hdr.setTPStatus(tpStatusKernel)
+		d.ringOffset = (d.ringOffset + 1) % tpFrameNR
+		hdr = tPacketHdr(d.ringBuffer[d.ringOffset*tpFrameSize:])
+	}
+	return pkts, false, nil
 }
 
 // dispatch reads packets from an mmaped ring buffer and dispatches them to the
 // network stack.
 func (d *packetMMapDispatcher) dispatch() (bool, tcpip.Error) {
-	pkt, stopped, err := d.readMMappedPacket()
+	pkts, stopped, err := d.readMMappedPackets()
+	defer pkts.Reset()
 	if err != nil || stopped {
 		return false, err
 	}
-	var p tcpip.NetworkProtocolNumber
-	if d.e.hdrSize > 0 {
-		p = header.Ethernet(pkt).Type()
-	} else {
-		// We don't get any indication of what the packet is, so try to guess
-		// if it's an IPv4 or IPv6 packet.
-		switch header.IPVersion(pkt) {
-		case header.IPv4Version:
-			p = header.IPv4ProtocolNumber
-		case header.IPv6Version:
-			p = header.IPv6ProtocolNumber
-		default:
-			return true, nil
+	d.e.mu.RLock()
+	addr := d.e.addr
+	d.e.mu.RUnlock()
+	for _, pkt := range pkts.AsSlice() {
+		if d.e.parseInboundHeader(pkt, addr) {
+			d.mgr.queuePacket(pkt, d.e.hdrSize > 0)
 		}
 	}
-
-	pbuf := stack.NewPacketBuffer(stack.PacketBufferOptions{
-		Payload: buffer.NewWithData(pkt),
-	})
-	defer pbuf.DecRef()
-	if d.e.hdrSize > 0 {
-		if _, ok := pbuf.LinkHeader().Consume(d.e.hdrSize); !ok {
-			panic(fmt.Sprintf("LinkHeader().Consume(%d) must succeed", d.e.hdrSize))
-		}
+	if pkts.Len() > 0 {
+		d.mgr.wakeReady()
 	}
-	d.e.dispatcher.DeliverNetworkPacket(p, pbuf)
 	return true, nil
 }

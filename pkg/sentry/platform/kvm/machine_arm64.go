@@ -18,11 +18,13 @@
 package kvm
 
 import (
+	"fmt"
 	"runtime"
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -65,7 +67,7 @@ func (m *machine) mapUpperHalf(pageTable *pagetables.PageTables) {
 // physical regions form them.
 func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 	rdRegions := []virtualRegion{}
-	applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			return // skip region.
 		}
@@ -74,7 +76,9 @@ func archPhysicalRegions(physicalRegions []physicalRegion) []physicalRegion {
 		if !vr.accessType.Write && vr.accessType.Read {
 			rdRegions = append(rdRegions, vr)
 		}
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 
 	// Add an unreachable region.
 	rdRegions = append(rdRegions, virtualRegion{
@@ -144,31 +148,12 @@ func nonCanonical(addr uint64, signal int32, info *linux.SignalInfo) (hostarch.A
 	return hostarch.NoAccess, platform.ErrContextSignal
 }
 
-// isInstructionAbort returns true if it is an instruction abort.
-//
-//go:nosplit
-func isInstructionAbort(code uint64) bool {
-	value := (code & _ESR_ELx_EC_MASK) >> _ESR_ELx_EC_SHIFT
-	return value == _ESR_ELx_EC_IABT_LOW
-}
-
-// isWriteFault returns whether it is a write fault.
-//
-//go:nosplit
-func isWriteFault(code uint64) bool {
-	if isInstructionAbort(code) {
-		return false
-	}
-
-	return (code & _ESR_ELx_WNR) != 0
-}
-
 // fault generates an appropriate fault return.
 //
 //go:nosplit
 func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType, error) {
 	bluepill(c) // Probably no-op, but may not be.
-	faultAddr := c.GetFaultAddr()
+	faultAddr := c.FaultAddr()
 	code, user := c.ErrorCode()
 	if !user {
 		// The last fault serviced by this CPU was not a user
@@ -182,11 +167,7 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 	info.SetAddr(uint64(faultAddr))
 	accessType := hostarch.AccessType{}
 	if signal == int32(unix.SIGSEGV) {
-		accessType = hostarch.AccessType{
-			Read:    !isWriteFault(uint64(code)),
-			Write:   isWriteFault(uint64(code)),
-			Execute: isInstructionAbort(uint64(code)),
-		}
+		accessType = hostarch.ESRAccessType(uint64(code))
 	}
 
 	ret := code & _ESR_ELx_FSC
@@ -205,7 +186,7 @@ func (c *vCPU) fault(signal int32, info *linux.SignalInfo) (hostarch.AccessType,
 // getMaxVCPU get max vCPU number
 func (m *machine) getMaxVCPU() {
 	rmaxVCPUs := runtime.NumCPU()
-	smaxVCPUs, _, errno := unix.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), _KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
+	smaxVCPUs, errno := hostsyscall.RawSyscall(unix.SYS_IOCTL, uintptr(m.fd), KVM_CHECK_EXTENSION, _KVM_CAP_MAX_VCPUS)
 	// compare the max vcpu number from runtime and syscall, use smaller one.
 	if errno != 0 {
 		m.maxVCPUs = rmaxVCPUs

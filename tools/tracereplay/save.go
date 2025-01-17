@@ -21,8 +21,8 @@ import (
 	"path/filepath"
 
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck/checkers/remote/server"
-	"gvisor.dev/gvisor/pkg/sentry/seccheck/checkers/remote/wire"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck/sinks/remote/server"
+	"gvisor.dev/gvisor/pkg/sentry/seccheck/sinks/remote/wire"
 )
 
 // Save implements the functionality required for the "save" command.
@@ -58,8 +58,7 @@ func (s *Save) Start() error {
 // of messages. Both JSON and messages are prefixed by an uint64 with their
 // size.
 //
-// Ex:
-//   signature <size>Config JSON [<size>message]*
+// Ex: signature <size>Config JSON [<size>message]*
 func (s *Save) NewClient() (server.MessageHandler, error) {
 	seq := s.clientCount.Add(1)
 	filename := filepath.Join(s.dir, fmt.Sprintf("%s%04d", s.prefix, seq))

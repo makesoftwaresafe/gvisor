@@ -1,13 +1,18 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "goid",
     srcs = [
         "goid.go",
-        "goid_amd64.s",
-        "goid_arm64.s",
+        "goid_122_amd64.s",
+        "goid_122_arm64.s",
+        "goid_123_amd64.s",
+        "goid_123_arm64.s",
     ],
     stateify = False,
     visibility = ["//visibility:public"],

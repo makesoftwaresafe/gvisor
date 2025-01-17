@@ -20,6 +20,7 @@
 #include <atomic>
 #include <cerrno>
 #include <ctime>
+#include <memory>
 #include <set>
 
 #include "gmock/gmock.h"
@@ -229,7 +230,7 @@ TEST(SemaphoreTest, SemOpBlock) {
   AutoSem sem(semget(IPC_PRIVATE, 1, 0600 | IPC_CREAT));
   ASSERT_THAT(sem.get(), SyscallSucceeds());
 
-  std::atomic<int> blocked = ATOMIC_VAR_INIT(1);
+  std::atomic<int> blocked(1);
   ScopedThread th([&sem, &blocked] {
     absl::SleepFor(absl::Milliseconds(100));
     ASSERT_EQ(blocked.load(), 1);
@@ -371,7 +372,7 @@ TEST(SemaphoreTest, SemOpRandom) {
   // These threads will wait in a loop.
   std::unique_ptr<ScopedThread> decs[5];
   for (auto& dec : decs) {
-    dec = absl::make_unique<ScopedThread>([&sem, &mutex, &count, &seed, &done] {
+    dec = std::make_unique<ScopedThread>([&sem, &mutex, &count, &seed, &done] {
       for (size_t i = 0; i < 500; ++i) {
         int16_t val;
         {
@@ -393,7 +394,7 @@ TEST(SemaphoreTest, SemOpRandom) {
   // These threads will wait for zero in a loop.
   std::unique_ptr<ScopedThread> zeros[5];
   for (auto& zero : zeros) {
-    zero = absl::make_unique<ScopedThread>([&sem, &mutex, &done] {
+    zero = std::make_unique<ScopedThread>([&sem, &mutex, &done] {
       for (size_t i = 0; i < 500; ++i) {
         {
           absl::MutexLock l(&mutex);
@@ -412,7 +413,7 @@ TEST(SemaphoreTest, SemOpRandom) {
   // These threads will signal in a loop.
   std::unique_ptr<ScopedThread> incs[5];
   for (auto& inc : incs) {
-    inc = absl::make_unique<ScopedThread>([&sem, &mutex, &count, &seed] {
+    inc = std::make_unique<ScopedThread>([&sem, &mutex, &count, &seed] {
       for (size_t i = 0; i < 500; ++i) {
         int16_t val;
         {

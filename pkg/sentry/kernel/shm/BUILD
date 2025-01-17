@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "go_library")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "shm_refs",
@@ -11,7 +14,7 @@ go_template_instance(
     },
     package = "shm",
     prefix = "Shm",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Shm",
     },
@@ -20,7 +23,7 @@ go_template_instance(
 go_library(
     name = "shm",
     srcs = [
-        "device.go",
+        "context.go",
         "shm.go",
         "shm_refs.go",
     ],
@@ -33,15 +36,13 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
-        "//pkg/sentry/device",
-        "//pkg/sentry/fs",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/ipc",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/usage",
+        "//pkg/sentry/vfs",
         "//pkg/sync",
         "//pkg/usermem",
     ],

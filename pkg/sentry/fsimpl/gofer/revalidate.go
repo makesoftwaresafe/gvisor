@@ -15,9 +15,7 @@
 package gofer
 
 import (
-	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 )
@@ -46,7 +44,7 @@ func (errRevalidationStepDone) Error() string {
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
-func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig *vfs.ResolvingPath, start *dentry, ds **[]*dentry) error {
+func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig resolvingPath, start *dentry, ds **[]*dentry) error {
 	// Revalidation is done even if start is synthetic in case the path is
 	// something like: ../non_synthetic_file.
 	if fs.opts.interop != InteropModeShared {
@@ -54,26 +52,8 @@ func (fs *filesystem) revalidatePath(ctx context.Context, rpOrig *vfs.ResolvingP
 	}
 
 	// Copy resolving path to walk the path for revalidation.
-	rp := rpOrig.Copy()
-	err := fs.revalidate(ctx, rp, start, rp.Done, ds)
-	rp.Release(ctx)
-	return err
-}
-
-// revalidateParentDir does the same as revalidatePath, but stops at the parent.
-//
-// Preconditions:
-//   - fs.renameMu must be locked.
-func (fs *filesystem) revalidateParentDir(ctx context.Context, rpOrig *vfs.ResolvingPath, start *dentry, ds **[]*dentry) error {
-	// Revalidation is done even if start is synthetic in case the path is
-	// something like: ../non_synthetic_file and parent is non synthetic.
-	if fs.opts.interop != InteropModeShared {
-		return nil
-	}
-
-	// Copy resolving path to walk the path for revalidation.
-	rp := rpOrig.Copy()
-	err := fs.revalidate(ctx, rp, start, rp.Final, ds)
+	rp := rpOrig.copy()
+	err := fs.revalidate(ctx, rp, start, ds)
 	rp.Release(ctx)
 	return err
 }
@@ -82,6 +62,7 @@ func (fs *filesystem) revalidateParentDir(ctx context.Context, rpOrig *vfs.Resol
 //
 // Preconditions:
 //   - fs.renameMu must be locked.
+//   - parent must have up to date metadata.
 func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFilesystem, parent *dentry, name string, ds **[]*dentry) error {
 	// Skip revalidation for interop mode different than InteropModeShared or
 	// if the parent is synthetic (child must be synthetic too, but it cannot be
@@ -90,18 +71,19 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 		return nil
 	}
 
-	parent.dirMu.Lock()
+	parent.childrenMu.Lock()
 	child, ok := parent.children[name]
-	parent.dirMu.Unlock()
+	parent.childrenMu.Unlock()
 	if !ok {
 		return nil
 	}
 
-	state := makeRevalidateState(parent)
+	state := makeRevalidateState(parent, false /* refreshStart */)
 	defer state.release()
-
-	state.add(name, child)
-	return fs.revalidateHelper(ctx, vfsObj, state, ds)
+	// Note that child can not be nil, because we don't cache negative entries
+	// when InteropModeShared is in effect.
+	state.add(child)
+	return state.doRevalidation(ctx, vfsObj, ds)
 }
 
 // revalidate revalidates path components in rp until done returns true, or
@@ -111,37 +93,24 @@ func (fs *filesystem) revalidateOne(ctx context.Context, vfsObj *vfs.VirtualFile
 // Preconditions:
 //   - fs.renameMu must be locked.
 //   - InteropModeShared is in effect.
-func (fs *filesystem) revalidate(ctx context.Context, rp *vfs.ResolvingPath, start *dentry, done func() bool, ds **[]*dentry) error {
-	state := makeRevalidateState(start)
+func (fs *filesystem) revalidate(ctx context.Context, rp resolvingPath, start *dentry, ds **[]*dentry) error {
+	state := makeRevalidateState(start, true /* refreshStart */)
 	defer state.release()
 
-	// Skip synthetic dentries because the start dentry cannot be replaced in case
-	// it has been created in the remote file system.
-	if !start.isSynthetic() {
-		state.add("", start)
-	}
-
 done:
-	for cur := start; !done(); {
+	for cur := start; !rp.done(); {
 		var err error
 		cur, err = fs.revalidateStep(ctx, rp, cur, state)
 		if err != nil {
 			switch err.(type) {
 			case errPartialRevalidation:
-				if err := fs.revalidateHelper(ctx, rp.VirtualFilesystem(), state, ds); err != nil {
+				if err := state.doRevalidation(ctx, rp.VirtualFilesystem(), ds); err != nil {
 					return err
 				}
 
 				// Reset state to release any remaining locks and restart from where
 				// stepping stopped.
-				state.reset()
-				state.start = cur
-
-				// Skip synthetic dentries because the start dentry cannot be replaced in
-				// case it has been created in the remote file system.
-				if !cur.isSynthetic() {
-					state.add("", cur)
-				}
+				state.reset(cur /* start */, true /* refreshStart */)
 
 			case errRevalidationStepDone:
 				break done
@@ -151,7 +120,7 @@ done:
 			}
 		}
 	}
-	return fs.revalidateHelper(ctx, rp.VirtualFilesystem(), state, ds)
+	return state.doRevalidation(ctx, rp.VirtualFilesystem(), ds)
 }
 
 // revalidateStep walks one element of the path and updates revalidationState
@@ -174,7 +143,7 @@ done:
 //   - fs.renameMu must be locked.
 //   - !rp.Done().
 //   - InteropModeShared is in effect (assumes no negative dentries).
-func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath, d *dentry, state *revalidateState) (*dentry, error) {
+func (fs *filesystem) revalidateStep(ctx context.Context, rp resolvingPath, d *dentry, state *revalidateState) (*dentry, error) {
 	switch name := rp.Component(); name {
 	case ".":
 		// Do nothing.
@@ -184,7 +153,7 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath,
 		// can only be acquired from parent to child to avoid deadlocks.
 		if isRoot, err := rp.CheckRoot(ctx, &d.vfsd); err != nil {
 			return nil, errRevalidationStepDone{}
-		} else if isRoot || d.parent == nil {
+		} else if isRoot || d.parent.Load() == nil {
 			rp.Advance()
 			return d, errPartialRevalidation{}
 		}
@@ -195,22 +164,24 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath,
 		//
 		// Call rp.CheckMount() before updating d.parent's metadata, since if
 		// we traverse to another mount then d.parent's metadata is irrelevant.
-		if err := rp.CheckMount(ctx, &d.parent.vfsd); err != nil {
+		if err := rp.CheckMount(ctx, &d.parent.Load().vfsd); err != nil {
 			return nil, errRevalidationStepDone{}
 		}
 		rp.Advance()
-		return d.parent, errPartialRevalidation{}
+		return d.parent.Load(), errPartialRevalidation{}
 
 	default:
-		d.dirMu.Lock()
+		d.childrenMu.Lock()
 		child, ok := d.children[name]
-		d.dirMu.Unlock()
+		d.childrenMu.Unlock()
 		if !ok {
 			// child is not cached, no need to validate any further.
 			return nil, errRevalidationStepDone{}
 		}
 
-		state.add(name, child)
+		// Note that child can not be nil, because we don't cache negative entries
+		// when InteropModeShared is in effect.
+		state.add(child)
 
 		// Symlink must be resolved before continuing with revalidation.
 		if child.isSymlink() {
@@ -224,131 +195,96 @@ func (fs *filesystem) revalidateStep(ctx context.Context, rp *vfs.ResolvingPath,
 	return d, nil
 }
 
-// revalidateHelper calls the gofer to stat all dentries in `state`. It will
-// update or invalidate dentries in the cache based on the result.
-//
-// Preconditions:
-//   - fs.renameMu must be locked.
-//   - InteropModeShared is in effect.
-func (fs *filesystem) revalidateHelper(ctx context.Context, vfsObj *vfs.VirtualFilesystem, state *revalidateState, ds **[]*dentry) error {
-	if len(state.names) == 0 {
-		return nil
-	}
-	// Lock metadata on all dentries *before* getting attributes for them.
-	state.lockAllMetadata()
+// Precondition: fs.renameMu must be locked.
+func (d *dentry) invalidate(ctx context.Context, vfsObj *vfs.VirtualFilesystem, ds **[]*dentry) {
+	// Remove d from its parent.
+	func() {
+		parent := d.parent.Load()
+		parent.opMu.RLock()
+		defer parent.opMu.RUnlock()
+		parent.childrenMu.Lock()
+		defer parent.childrenMu.Unlock()
 
-	var (
-		stats     []p9.FullStat
-		statsLisa []linux.Statx
-		numStats  int
-	)
-	if fs.opts.lisaEnabled {
-		var err error
-		statsLisa, err = state.start.controlFDLisa.WalkStat(ctx, state.names)
-		if err != nil {
-			return err
-		}
-		numStats = len(statsLisa)
-	} else {
-		var err error
-		stats, err = state.start.file.multiGetAttr(ctx, state.names)
-		if err != nil {
-			return err
-		}
-		numStats = len(stats)
-	}
-
-	i := -1
-	for d := state.popFront(); d != nil; d = state.popFront() {
-		i++
-		found := i < numStats
-		if i == 0 && len(state.names[0]) == 0 {
-			if found && !d.isSynthetic() {
-				// First dentry is where the search is starting, just update attributes
-				// since it cannot be replaced.
-				if fs.opts.lisaEnabled {
-					d.updateFromLisaStatLocked(&statsLisa[i]) // +checklocksforce: acquired by lockAllMetadata.
-				} else {
-					d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: acquired by lockAllMetadata.
-				}
-			}
-			d.metadataMu.Unlock() // +checklocksforce: see above.
-			continue
+		if d.isSynthetic() {
+			// Normally we don't mark invalidated dentries as deleted since
+			// they may still exist (but at a different path), and also for
+			// consistency with Linux. However, synthetic files are guaranteed
+			// to become unreachable if their dentries are invalidated, so
+			// treat their invalidation as deletion.
+			d.deleteSynthetic(parent, ds)
 		}
 
-		// Note that synthetic dentries will always fail this comparison check.
-		var shouldInvalidate bool
-		if fs.opts.lisaEnabled {
-			shouldInvalidate = !found || d.inoKey != inoKeyFromStat(&statsLisa[i])
-		} else {
-			shouldInvalidate = !found || d.qidPath != stats[i].QID.Path
+		// Since the opMu was just reacquired above, re-check that the
+		// parent's child with this name is still the same. Do not touch it if
+		// it has been replaced with a different one.
+		if child := parent.children[d.name]; child == d {
+			// Invalidate dentry so it gets reloaded next time it's accessed.
+			delete(parent.children, d.name)
 		}
-		if shouldInvalidate {
-			d.metadataMu.Unlock() // +checklocksforce: see above.
-			if !found && d.isSynthetic() {
-				// We have a synthetic file, and no remote file has arisen to replace
-				// it.
-				return nil
-			}
-			// The file at this path has changed or no longer exists. Mark the
-			// dentry invalidated, and re-evaluate its caching status (i.e. if
-			// it has 0 references, drop it). The dentry will be reloaded next
-			// time it's accessed.
-			//
-			// If the dentry is a mountpoint, InvalidateDentry may drop the
-			// last reference on it, resulting in lock recursion. To avoid
-			// this, take a dentry reference first, then drop it while
-			// deferring the call to dentry.checkCachingLocked().
-			d.IncRef()
-			vfsObj.InvalidateDentry(ctx, &d.vfsd)
+	}()
+
+	// Invalidate d and its descendants.
+	toInvalidate := []*dentry{d}
+	for len(toInvalidate) != 0 {
+		d := toInvalidate[len(toInvalidate)-1]
+		toInvalidate = toInvalidate[:len(toInvalidate)-1]
+
+		// If the dentry is a mountpoint, InvalidateDentry may drop the
+		// last reference on it, resulting in lock recursion. To avoid
+		// this, take a dentry reference first, then drop it while
+		// deferring the call to dentry.checkCachingLocked().
+		d.IncRef()
+		rcs := vfsObj.InvalidateDentry(ctx, &d.vfsd)
+		for _, rc := range rcs {
+			rc.DecRef(ctx)
+		}
+		d.decRefNoCaching()
+		if d.isSynthetic() || d.endpoint != nil {
 			d.decRefNoCaching()
-			*ds = appendDentry(*ds, d)
-
-			name := state.names[i]
-			d.parent.dirMu.Lock()
-
-			if d.isSynthetic() {
-				// Normally we don't mark invalidated dentries as deleted since
-				// they may still exist (but at a different path), and also for
-				// consistency with Linux. However, synthetic files are guaranteed
-				// to become unreachable if their dentries are invalidated, so
-				// treat their invalidation as deletion.
-				d.setDeleted()
-				d.decRefNoCaching()
-				*ds = appendDentry(*ds, d)
-
-				d.parent.syntheticChildren--
-				d.parent.clearDirentsLocked()
-			}
-
-			// Since the dirMu was released and reacquired, re-check that the
-			// parent's child with this name is still the same. Do not touch it if
-			// it has been replaced with a different one.
-			if child := d.parent.children[name]; child == d {
-				// Invalidate dentry so it gets reloaded next time it's accessed.
-				delete(d.parent.children, name)
-			}
-			d.parent.dirMu.Unlock()
-
-			return nil
 		}
 
-		// The file at this path hasn't changed. Just update cached metadata.
-		if fs.opts.lisaEnabled {
-			d.updateFromLisaStatLocked(&statsLisa[i]) // +checklocksforce: see above.
-		} else {
-			d.updateFromP9AttrsLocked(stats[i].Valid, &stats[i].Attr) // +checklocksforce: see above.
+		// Re-evaluate its caching status (i.e. if it has 0 references, drop it).
+		// The dentry will be reloaded next time it's accessed.
+		*ds = appendDentry(*ds, d)
+
+		if d.isDir() {
+			toInvalidate = d.disownAllChildrenForInvalidation(ctx, vfsObj, toInvalidate, ds)
 		}
-		d.metadataMu.Unlock()
 	}
+}
 
-	return nil
+// +checklocks:parent.childrenMu
+func (d *dentry) deleteSynthetic(parent *dentry, ds **[]*dentry) {
+	d.setDeleted()
+	*ds = appendDentry(*ds, d)
+	parent.syntheticChildren--
+	parent.clearDirentsLocked()
+}
+
+// disownAllChildrenForInvalidation removes all child dentries from d, appends
+// them to children, and returns an updated slice. Consistent with
+// dentry.invalidate(), removed synthetic dentries are marked deleted.
+//
+// Precondition: fs.renameMu must be locked.
+func (d *dentry) disownAllChildrenForInvalidation(ctx context.Context, vfsObj *vfs.VirtualFilesystem, children []*dentry, ds **[]*dentry) []*dentry {
+	d.opMu.RLock()
+	defer d.opMu.RUnlock()
+	d.childrenMu.Lock()
+	defer d.childrenMu.Unlock()
+	for name, child := range d.children {
+		children = append(children, child)
+		delete(d.children, name)
+		if child.isSynthetic() {
+			child.deleteSynthetic(d, ds)
+		}
+	}
+	return children
 }
 
 // revalidateStatePool caches revalidateState instances to save array
 // allocations for dentries and names.
 var revalidateStatePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &revalidateState{}
 	},
 }
@@ -358,71 +294,51 @@ var revalidateStatePool = sync.Pool{
 // dentries. The list must be in ancestry order, in other words `n` must be
 // `n-1` child.
 type revalidateState struct {
-	// start is the dentry where to start the attributes search.
+	// start is the dentry where to start the revalidation of dentries.
 	start *dentry
 
-	// List of names of entries to refresh attributes. Names length must be the
-	// same as detries length. They are kept in separate slices because names is
-	// used to call File.MultiGetAttr().
+	// refreshStart indicates whether the attributes of the start dentry should
+	// be refreshed.
+	refreshStart bool
+
+	// names is just a slice of names which can be used while making LISAFS RPCs.
+	// This exists to avoid the cost of repeated string slice allocation to make
+	// RPCs.
 	names []string
 
-	// dentries is the list of dentries that correspond to the names above.
-	// dentry.metadataMu is acquired as each dentry is added to this list.
+	// dentries is the list of dentries that need to be revalidated. The first
+	// dentry is a child of start and each successive dentry is a child of the
+	// previous.
 	dentries []*dentry
-
-	// locked indicates if metadata lock has been acquired on dentries.
-	locked bool
 }
 
-func makeRevalidateState(start *dentry) *revalidateState {
+func makeRevalidateState(start *dentry, refreshStart bool) *revalidateState {
 	r := revalidateStatePool.Get().(*revalidateState)
 	r.start = start
+	r.refreshStart = refreshStart
 	return r
 }
 
 // release must be called after the caller is done with this object. It releases
 // all metadata locks and resources.
 func (r *revalidateState) release() {
-	r.reset()
+	r.reset(nil /* start */, false /* refreshStart */)
 	revalidateStatePool.Put(r)
 }
 
 // Preconditions:
+//   - d != nil.
 //   - d is a descendant of all dentries in r.dentries.
-func (r *revalidateState) add(name string, d *dentry) {
-	r.names = append(r.names, name)
+func (r *revalidateState) add(d *dentry) {
 	r.dentries = append(r.dentries, d)
-}
-
-// +checklocksignore
-func (r *revalidateState) lockAllMetadata() {
-	for _, d := range r.dentries {
-		d.metadataMu.Lock()
-	}
-	r.locked = true
-}
-
-func (r *revalidateState) popFront() *dentry {
-	if len(r.dentries) == 0 {
-		return nil
-	}
-	d := r.dentries[0]
-	r.dentries = r.dentries[1:]
-	return d
 }
 
 // reset releases all metadata locks and resets all fields to allow this
 // instance to be reused.
 // +checklocksignore
-func (r *revalidateState) reset() {
-	if r.locked {
-		// Unlock any remaining dentries.
-		for _, d := range r.dentries {
-			d.metadataMu.Unlock()
-		}
-		r.locked = false
-	}
-	r.start = nil
+func (r *revalidateState) reset(start *dentry, refreshStart bool) {
+	r.start = start
+	r.refreshStart = refreshStart
 	r.names = r.names[:0]
 	r.dentries = r.dentries[:0]
 }

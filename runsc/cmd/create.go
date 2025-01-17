@@ -45,7 +45,7 @@ type Create struct {
 	// userLog is the path to send user-visible logs to. This log is different
 	// from debug logs. The former is meant to be consumed by the users and should
 	// contain only information that is relevant to the person running the
-	// container, e.g. unsuported syscalls, while the later is more verbose and
+	// container, e.g. unsupported syscalls, while the later is more verbose and
 	// consumed by developers.
 	userLog string
 }
@@ -62,8 +62,7 @@ func (*Create) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Create) Usage() string {
-	return `create [flags] <container id> - create a secure container
-`
+	return "create [flags] <container id> - create a secure container\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
@@ -75,7 +74,7 @@ func (c *Create) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.Execute.
-func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -96,7 +95,7 @@ func (c *Create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 	if err != nil {
 		return util.Errorf("reading spec: %v", err)
 	}
-	specutils.LogSpec(spec)
+	specutils.LogSpecDebug(spec, conf.OCISeccomp)
 
 	// Create the container. A new sandbox will be created for the
 	// container unless the metadata specifies that it should be run in an

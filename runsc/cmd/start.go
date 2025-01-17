@@ -40,14 +40,14 @@ func (*Start) Synopsis() string {
 
 // Usage implements subcommands.Command.Usage.
 func (*Start) Usage() string {
-	return `start <container id> - start a secure container.`
+	return "start <container id> - start a secure container.\n"
 }
 
 // SetFlags implements subcommands.Command.SetFlags.
 func (*Start) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.Execute.
-func (*Start) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*Start) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError

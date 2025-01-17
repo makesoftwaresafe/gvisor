@@ -18,7 +18,7 @@ import (
 	"fmt"
 )
 
-// Addr represents a generic virtual address.
+// Addr represents an address in an unspecified address space.
 //
 // +stateify savable
 type Addr uintptr
@@ -33,57 +33,62 @@ type Addr uintptr
 // expected to ever come up in practice.
 func (v Addr) AddLength(length uint64) (end Addr, ok bool) {
 	end = v + Addr(length)
-	// The second half of the following check is needed in case uintptr is
-	// smaller than 64 bits.
-	ok = end >= v && length <= uint64(^Addr(0))
+	// As of this writing (Go 1.21), addrAtLeast64b is required to prevent the
+	// compiler from generating a tautological `length <= MaxUint64` check on
+	// 64-bit architectures.
+	ok = end >= v && (addrAtLeast64b || length <= uint64(^Addr(0)))
 	return
 }
 
-// RoundDown returns the address rounded down to the nearest page boundary.
+// RoundDown is equivalent to function PageRoundDown.
 func (v Addr) RoundDown() Addr {
-	return v & ^Addr(PageSize-1)
+	return PageRoundDown(v)
 }
 
-// RoundUp returns the address rounded up to the nearest page boundary. ok is
-// true iff rounding up did not wrap around.
-func (v Addr) RoundUp() (addr Addr, ok bool) {
-	addr = Addr(v + PageSize - 1).RoundDown()
-	ok = addr >= v
-	return
+// RoundUp is equivalent to function PageRoundUp.
+func (v Addr) RoundUp() (Addr, bool) {
+	return PageRoundUp(v)
 }
 
-// MustRoundUp is equivalent to RoundUp, but panics if rounding up wraps
-// around.
+// MustRoundUp is equivalent to function MustPageRoundUp.
 func (v Addr) MustRoundUp() Addr {
-	addr, ok := v.RoundUp()
-	if !ok {
-		panic(fmt.Sprintf("hostarch.Addr(%d).RoundUp() wraps", v))
-	}
-	return addr
+	return MustPageRoundUp(v)
 }
 
-// HugeRoundDown returns the address rounded down to the nearest huge page
-// boundary.
+// HugeRoundDown is equivalent to function HugePageRoundDown.
 func (v Addr) HugeRoundDown() Addr {
-	return v & ^Addr(HugePageSize-1)
+	return HugePageRoundDown(v)
 }
 
-// HugeRoundUp returns the address rounded up to the nearest huge page boundary.
-// ok is true iff rounding up did not wrap around.
-func (v Addr) HugeRoundUp() (addr Addr, ok bool) {
-	addr = Addr(v + HugePageSize - 1).HugeRoundDown()
-	ok = addr >= v
-	return
+// HugeRoundUp is equivalent to function HugePageRoundUp.
+func (v Addr) HugeRoundUp() (Addr, bool) {
+	return HugePageRoundUp(v)
 }
 
-// PageOffset returns the offset of v into the current page.
+// MustHugeRoundUp is equivalent to function MustHugePageRoundUp.
+func (v Addr) MustHugeRoundUp() Addr {
+	return MustHugePageRoundUp(v)
+}
+
+// PageOffset is equivalent to function PageOffset, except that it casts the
+// result to uint64.
 func (v Addr) PageOffset() uint64 {
-	return uint64(v & Addr(PageSize-1))
+	return uint64(PageOffset(v))
 }
 
-// IsPageAligned returns true if v.PageOffset() == 0.
+// IsPageAligned is equivalent to function IsPageAligned.
 func (v Addr) IsPageAligned() bool {
-	return v.PageOffset() == 0
+	return IsPageAligned(v)
+}
+
+// HugePageOffset is equivalent to function HugePageOffset.
+func (v Addr) HugePageOffset() uint64 {
+	return uint64(HugePageOffset(v))
+}
+
+// IsHugePageAligned is equivalent to function IsHugePageAligned.
+func (v Addr) IsHugePageAligned() bool {
+	return IsHugePageAligned(v)
 }
 
 // AddrRange is a range of Addrs.
@@ -102,34 +107,13 @@ func (ar AddrRange) IsPageAligned() bool {
 	return ar.Start.IsPageAligned() && ar.End.IsPageAligned()
 }
 
+// IsHugePageAligned returns true if ar.Start.IsHugePageAligned() and
+// ar.End.IsHugePageAligned().
+func (ar AddrRange) IsHugePageAligned() bool {
+	return ar.Start.IsHugePageAligned() && ar.End.IsHugePageAligned()
+}
+
 // String implements fmt.Stringer.String.
 func (ar AddrRange) String() string {
 	return fmt.Sprintf("[%#x, %#x)", ar.Start, ar.End)
-}
-
-// PageRoundDown/Up are equivalent to Addr.RoundDown/Up, but without the
-// potentially truncating conversion from uint64 to Addr. This is necessary
-// because there is no way to define generic "PageRoundDown/Up" functions in Go.
-
-// PageRoundDown returns x rounded down to the nearest page boundary.
-func PageRoundDown(x uint64) uint64 {
-	return x &^ (PageSize - 1)
-}
-
-// PageRoundUp returns x rounded up to the nearest page boundary.
-// ok is true iff rounding up did not wrap around.
-func PageRoundUp(x uint64) (addr uint64, ok bool) {
-	addr = PageRoundDown(x + PageSize - 1)
-	ok = addr >= x
-	return
-}
-
-// ToPages returns number of Pages for x.
-// x is rounded up to the nearest page boundary.
-func ToPages(x uint64) (uint64, bool) {
-	xRoundedUp, ok := PageRoundUp(x)
-	if !ok {
-		return 0, false
-	}
-	return xRoundedUp / PageSize, true
 }

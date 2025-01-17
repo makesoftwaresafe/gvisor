@@ -1,7 +1,10 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ilist",
@@ -53,4 +56,51 @@ go_template(
         "Linker",
     ],
     visibility = ["//visibility:public"],
+)
+
+go_template(
+    name = "generic_ring",
+    srcs = [
+        "ring.go",
+    ],
+    opt_types = [
+        "Container",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+go_template_instance(
+    name = "test_ring",
+    out = "test_ring.go",
+    package = "ring",
+    prefix = "test",
+    template = "//pkg/ilist:generic_ring",
+    types = {
+        "Container": "*testContainer",
+    },
+)
+
+go_library(
+    name = "ring",
+    srcs = [
+        "interface_ring.go",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+go_template_instance(
+    name = "interface_ring",
+    out = "interface_ring.go",
+    package = "ring",
+    template = ":generic_ring",
+    types = {},
+)
+
+go_test(
+    name = "ring_test",
+    srcs = [
+        "ring_test.go",
+        "test_ring.go",
+    ],
+    library = ":ring",
 )

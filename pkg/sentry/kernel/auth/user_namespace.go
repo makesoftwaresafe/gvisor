@@ -33,6 +33,9 @@ type UserNamespace struct {
 	// namespace. owner is immutable.
 	owner KUID
 
+	// Keys is the set of keys in this namespace.
+	Keys KeySet
+
 	// mu protects the following fields.
 	//
 	// If mu will be locked in multiple UserNamespaces, it must be locked in
@@ -52,7 +55,10 @@ type UserNamespace struct {
 }
 
 // NewRootUserNamespace returns a UserNamespace that is appropriate for a
-// system's root user namespace.
+// system's root user namespace. Note that namespaces returned by separate calls
+// to this function are *distinct* namespaces. Once a root namespace is created
+// by this function, the returned value must be reused to refer to the same
+// namespace.
 func NewRootUserNamespace() *UserNamespace {
 	var ns UserNamespace
 	// """
@@ -70,9 +76,8 @@ func NewRootUserNamespace() *UserNamespace {
 		&ns.gidMapFromParent,
 		&ns.gidMapToParent,
 	} {
-		if !m.Add(idMapRange{0, math.MaxUint32}, 0) {
-			panic("Failed to insert into empty ID map")
-		}
+		// Insertion into an empty map shouldn't fail.
+		m.InsertRange(idMapRange{0, math.MaxUint32}, 0)
 	}
 	return &ns
 }

@@ -28,7 +28,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -148,14 +147,14 @@ func (c *testContext) DeliverNetworkPacket(proto tcpip.NetworkProtocolNumber, pk
 	c.mu.Lock()
 	c.packets = append(c.packets, packetInfo{
 		proto: proto,
-		data:  pkt.Data().AsRange().ToOwnedView(),
+		data:  pkt.Data().AsRange().ToSlice(),
 	})
 	c.mu.Unlock()
 
 	c.packetCh <- struct{}{}
 }
 
-func (c *testContext) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer, bool) {
+func (c *testContext) DeliverLinkPacket(tcpip.NetworkProtocolNumber, *stack.PacketBuffer) {
 	c.t.Fatal("DeliverLinkPacket not implemented")
 }
 
@@ -172,7 +171,7 @@ func (c *testContext) waitForPackets(n int, to <-chan time.Time, errorStr string
 		select {
 		case <-c.packetCh:
 		case <-to:
-			c.t.Fatalf(errorStr)
+			c.t.Fatal(errorStr)
 		}
 	}
 }
@@ -221,7 +220,7 @@ func TestSimpleSend(t *testing.T) {
 
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: hdrLen + int(c.ep.MaxHeaderLength()),
-				Payload:            buffer.NewWithData(data),
+				Payload:            buffer.MakeWithData(data),
 			})
 			copy(pkt.NetworkHeader().Push(hdrLen), hdrBuf)
 			proto := tcpip.NetworkProtocolNumber(rand.Intn(0x10000))
@@ -360,7 +359,7 @@ func TestFillTxQueue(t *testing.T) {
 	for i := queuePipeSize / 40; i > 0; i-- {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(buf),
+			Payload:            buffer.MakeWithData(buf),
 		})
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 		pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -386,7 +385,7 @@ func TestFillTxQueue(t *testing.T) {
 	// Next attempt to write must fail.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-		Payload:            buffer.NewWithData(buf),
+		Payload:            buffer.MakeWithData(buf),
 	})
 	pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -419,7 +418,7 @@ func TestFillTxQueueAfterBadCompletion(t *testing.T) {
 		for i := 2; i > 0; i-- {
 			pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 				ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-				Payload:            buffer.NewWithData(buf),
+				Payload:            buffer.MakeWithData(buf),
 			})
 			pkts.PushBack(pkt)
 			pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
@@ -448,7 +447,7 @@ func TestFillTxQueueAfterBadCompletion(t *testing.T) {
 	for i := queuePipeSize / 40; i > 0; i-- {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(buf),
+			Payload:            buffer.MakeWithData(buf),
 		})
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 		pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -473,7 +472,7 @@ func TestFillTxQueueAfterBadCompletion(t *testing.T) {
 	// Next attempt to write must fail.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-		Payload:            buffer.NewWithData(buf),
+		Payload:            buffer.MakeWithData(buf),
 	})
 	pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -502,7 +501,7 @@ func TestFillTxMemory(t *testing.T) {
 	for i := queueDataSize / bufferSize; i > 0; i-- {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(buf),
+			Payload:            buffer.MakeWithData(buf),
 		})
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 		pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -528,7 +527,7 @@ func TestFillTxMemory(t *testing.T) {
 	// Next attempt to write must fail.
 	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 		ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-		Payload:            buffer.NewWithData(buf),
+		Payload:            buffer.MakeWithData(buf),
 	})
 	pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
 	pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
@@ -556,7 +555,7 @@ func TestFillTxMemoryWithMultiBuffer(t *testing.T) {
 	for i := queueDataSize/bufferSize - 1; i > 0; i-- {
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(buf),
+			Payload:            buffer.MakeWithData(buf),
 		})
 		var pkts stack.PacketBufferList
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
@@ -577,7 +576,7 @@ func TestFillTxMemoryWithMultiBuffer(t *testing.T) {
 		var pkts stack.PacketBufferList
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(make([]byte, bufferSize)),
+			Payload:            buffer.MakeWithData(make([]byte, bufferSize)),
 		})
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 		pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -596,7 +595,7 @@ func TestFillTxMemoryWithMultiBuffer(t *testing.T) {
 		var pkts stack.PacketBufferList
 		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
 			ReserveHeaderBytes: int(c.ep.MaxHeaderLength()),
-			Payload:            buffer.NewWithData(buf),
+			Payload:            buffer.MakeWithData(buf),
 		})
 		pkt.EgressRoute.RemoteLinkAddress = remoteLinkAddr
 		pkt.NetworkProtocolNumber = header.IPv4ProtocolNumber
@@ -822,9 +821,37 @@ func TestCloseWhileWaitingToPost(t *testing.T) {
 	c.ep.Wait()
 }
 
+func TestSetLinkAddress(t *testing.T) {
+	c := newTestContext(t, 20000, 1500, tcpip.LinkAddress("xyz"))
+	defer c.cleanup()
+
+	addrs := []tcpip.LinkAddress{"abc", "def"}
+	for _, addr := range addrs {
+		c.ep.SetLinkAddress(addr)
+
+		if want, v := addr, c.ep.LinkAddress(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
+func TestMTU(t *testing.T) {
+	c := newTestContext(t, 20000, 1500, "")
+	defer c.cleanup()
+
+	mtus := []uint32{1000, 2000}
+	for _, mtu := range mtus {
+		c.ep.SetMTU(mtu)
+
+		if want, v := mtu, c.ep.MTU(); want != v {
+			t.Errorf("MTU() = %v, want %v", v, want)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

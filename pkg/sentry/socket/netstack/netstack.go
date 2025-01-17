@@ -29,31 +29,32 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math"
 	"reflect"
 	"time"
 
 	"golang.org/x/sys/unix"
+	"google.golang.org/protobuf/proto"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/abi/linux/errno"
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
+	"gvisor.dev/gvisor/pkg/eventchannel"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/metric"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/sockfs"
 	"gvisor.dev/gvisor/pkg/sentry/inet"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/socket"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netfilter"
-	"gvisor.dev/gvisor/pkg/sentry/unimpl"
+	epb "gvisor.dev/gvisor/pkg/sentry/socket/netstack/events_go_proto"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -67,15 +68,32 @@ import (
 
 const bitsPerUint32 = 32
 
+// statCounterValue returns a function usable as callback function when defining a gVisor Sentry
+// metric that contains the value counted by the StatCounter.
+// This avoids a dependency loop in the tcpip package.
+func statCounterValue(cm *tcpip.StatCounter) func(...*metric.FieldValue) uint64 {
+	return func(...*metric.FieldValue) uint64 {
+		return cm.Value()
+	}
+}
+
 func mustCreateMetric(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, true /* cumulative */, false /* sync */, description, cm.Value)
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  true,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
 func mustCreateGauge(name, description string) *tcpip.StatCounter {
 	var cm tcpip.StatCounter
-	metric.MustRegisterCustomUint64Metric(name, false /* cumulative */, false /* sync */, description, cm.Value)
+	metric.MustRegisterCustomUint64Metric(name,
+		metric.Uint64Metadata{
+			Cumulative:  false,
+			Description: description,
+		}, statCounterValue(&cm))
 	return &cm
 }
 
@@ -98,7 +116,9 @@ var Metrics = tcpip.Stats{
 			Bytes:   mustCreateMetric("/netstack/nic/disabled_rx/bytes", "Number of bytes received on disabled NICs."),
 		},
 		Neighbor: tcpip.NICNeighborStats{
-			UnreachableEntryLookups: mustCreateMetric("/netstack/nic/neighbor/unreachable_entry_loopups", "Number of lookups performed on a neighbor entry in Unreachable state."),
+			UnreachableEntryLookups:                    mustCreateMetric("/netstack/nic/neighbor/unreachable_entry_loopups", "Number of lookups performed on a neighbor entry in Unreachable state."),
+			DroppedConfirmationForNoninitiatedNeighbor: mustCreateMetric("/netstack/nic/neighbor/dropped_confirmation_for_noninitiated_neighbor", "Number of advertisements received that don't match an entry in the neighbor cache."),
+			DroppedInvalidLinkAddressConfirmations:     mustCreateMetric("/netstack/nic/neighbor/dropped_invalid_link_address_confirmations", "Number of advertisements dropped because they have empty source link-layer addresses"),
 		},
 	},
 	ICMP: tcpip.ICMPStats{
@@ -277,6 +297,7 @@ var Metrics = tcpip.Stats{
 		SegmentsAckedWithDSACK:             mustCreateMetric("/netstack/tcp/segments_acked_with_dsack", "Number of segments for which DSACK was received."),
 		SpuriousRecovery:                   mustCreateMetric("/netstack/tcp/spurious_recovery", "Number of times the connection entered loss recovery spuriously."),
 		SpuriousRTORecovery:                mustCreateMetric("/netstack/tcp/spurious_rto_recovery", "Number of times the connection entered RTO spuriously."),
+		ForwardMaxInFlightDrop:             mustCreateMetric("/netstack/tcp/forward_max_in_flight_drop", "Number of connection requests dropped due to exceeding in-flight limit."),
 	},
 	UDP: tcpip.UDPStats{
 		PacketsReceived:          mustCreateMetric("/netstack/udp/packets_received", "Number of UDP datagrams received via HandlePacket."),
@@ -300,14 +321,6 @@ var errStackType = syserr.New("expected but did not receive a netstack.Stack", e
 // commonEndpoint represents the intersection of a tcpip.Endpoint and a
 // transport.Endpoint.
 type commonEndpoint interface {
-	// GetLocalAddress implements tcpip.Endpoint.GetLocalAddress and
-	// transport.Endpoint.GetLocalAddress.
-	GetLocalAddress() (tcpip.FullAddress, tcpip.Error)
-
-	// GetRemoteAddress implements tcpip.Endpoint.GetRemoteAddress and
-	// transport.Endpoint.GetRemoteAddress.
-	GetRemoteAddress() (tcpip.FullAddress, tcpip.Error)
-
 	// Readiness implements tcpip.Endpoint.Readiness and
 	// transport.Endpoint.Readiness.
 	Readiness(mask waiter.EventMask) waiter.EventMask
@@ -341,27 +354,15 @@ type commonEndpoint interface {
 	SocketOptions() *tcpip.SocketOptions
 }
 
-// LINT.IfChange
-
-// SocketOperations encapsulates all the state needed to represent a network stack
+// sock encapsulates all the state needed to represent a network stack
 // endpoint in the kernel context.
 //
 // +stateify savable
-type SocketOperations struct {
-	fsutil.FilePipeSeek             `state:"nosave"`
-	fsutil.FileNotDirReaddir        `state:"nosave"`
-	fsutil.FileNoopFlush            `state:"nosave"`
-	fsutil.FileNoFsync              `state:"nosave"`
-	fsutil.FileNoMMap               `state:"nosave"`
-	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
-
-	socketOpsCommon
-}
-
-// socketOpsCommon contains the socket operations common to VFS1 and VFS2.
-//
-// +stateify savable
-type socketOpsCommon struct {
+type sock struct {
+	vfsfd vfs.FileDescription
+	vfs.FileDescriptionDefaultImpl
+	vfs.DentryMetadataFileDescriptionImpl
+	vfs.LockFD
 	socket.SendReceiveTimeout
 	*waiter.Queue
 
@@ -369,6 +370,13 @@ type socketOpsCommon struct {
 	Endpoint tcpip.Endpoint
 	skType   linux.SockType
 	protocol int
+
+	namespace *inet.Namespace
+
+	mu sync.Mutex `state:"nosave"`
+	// readWriter is an optimization to avoid allocations.
+	// +checklocks:mu
+	readWriter usermem.IOSequenceReadWriter `state:"nosave"`
 
 	// readMu protects access to the below fields.
 	readMu sync.Mutex `state:"nosave"`
@@ -390,23 +398,238 @@ type socketOpsCommon struct {
 	sockOptInq bool
 }
 
+var _ = socket.Socket(&sock{})
+
 // New creates a new endpoint socket.
-func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*fs.File, *syserr.Error) {
+func New(t *kernel.Task, family int, skType linux.SockType, protocol int, queue *waiter.Queue, endpoint tcpip.Endpoint) (*vfs.FileDescription, *syserr.Error) {
 	if skType == linux.SOCK_STREAM {
 		endpoint.SocketOptions().SetDelayOption(true)
 	}
 
-	dirent := socket.NewDirent(t, netstackDevice)
-	defer dirent.DecRef(t)
-	return fs.NewFile(t, dirent, fs.FileFlags{Read: true, Write: true, NonSeekable: true}, &SocketOperations{
-		socketOpsCommon: socketOpsCommon{
-			Queue:    queue,
-			family:   family,
-			Endpoint: endpoint,
-			skType:   skType,
-			protocol: protocol,
-		},
-	}), nil
+	mnt := t.Kernel().SocketMount()
+	d := sockfs.NewDentry(t, mnt)
+	defer d.DecRef(t)
+
+	namespace := t.NetworkNamespace()
+	s := &sock{
+		Queue:     queue,
+		family:    family,
+		Endpoint:  endpoint,
+		skType:    skType,
+		protocol:  protocol,
+		namespace: namespace,
+	}
+	s.LockFD.Init(&vfs.FileLocks{})
+	vfsfd := &s.vfsfd
+	if err := vfsfd.Init(s, linux.O_RDWR, mnt, d, &vfs.FileDescriptionOptions{
+		DenyPRead:         true,
+		DenyPWrite:        true,
+		UseDentryMetadata: true,
+	}); err != nil {
+		return nil, syserr.FromError(err)
+	}
+	namespace.IncRef()
+	return vfsfd, nil
+}
+
+// Release implements vfs.FileDescriptionImpl.Release.
+func (s *sock) Release(ctx context.Context) {
+	kernel.KernelFromContext(ctx).DeleteSocket(&s.vfsfd)
+	e, ch := waiter.NewChannelEntry(waiter.EventHUp | waiter.EventErr)
+	s.EventRegister(&e)
+	defer s.EventUnregister(&e)
+
+	s.Endpoint.Close()
+
+	// SO_LINGER option is valid only for TCP. For other socket types
+	// return after endpoint close.
+	if family, skType, _ := s.Type(); skType == linux.SOCK_STREAM && (family == linux.AF_INET || family == linux.AF_INET6) {
+		v := s.Endpoint.SocketOptions().GetLinger()
+		// The case for zero timeout is handled in tcp endpoint close function.
+		// Close is blocked until either:
+		// 1. The endpoint state is not in any of the states: FIN-WAIT1,
+		// CLOSING and LAST_ACK.
+		// 2. Timeout is reached.
+		if v.Enabled && v.Timeout != 0 {
+			t := kernel.TaskFromContext(ctx)
+			start := t.Kernel().MonotonicClock().Now()
+			deadline := start.Add(v.Timeout)
+			_ = t.BlockWithDeadline(ch, true, deadline)
+		}
+	}
+	s.namespace.DecRef(ctx)
+}
+
+// Epollable implements FileDescriptionImpl.Epollable.
+func (s *sock) Epollable() bool {
+	return true
+}
+
+// Read implements vfs.FileDescriptionImpl.
+func (s *sock) Read(ctx context.Context, dst usermem.IOSequence, opts vfs.ReadOptions) (int64, error) {
+	// All flags other than RWF_NOWAIT should be ignored.
+	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
+	if opts.Flags != 0 {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+
+	if dst.NumBytes() == 0 {
+		return 0, nil
+	}
+	n, _, _, _, _, err := s.nonBlockingRead(ctx, dst, false, false, false)
+	if err == syserr.ErrWouldBlock {
+		return int64(n), linuxerr.ErrWouldBlock
+	}
+	if err != nil {
+		return 0, err.ToError()
+	}
+	return int64(n), nil
+}
+
+// Write implements vfs.FileDescriptionImpl.
+func (s *sock) Write(ctx context.Context, src usermem.IOSequence, opts vfs.WriteOptions) (int64, error) {
+	// All flags other than RWF_NOWAIT should be ignored.
+	// TODO(gvisor.dev/issue/2601): Support RWF_NOWAIT.
+	if opts.Flags != 0 {
+		return 0, linuxerr.EOPNOTSUPP
+	}
+
+	var n int64
+	var err tcpip.Error
+	switch s.Endpoint.(type) {
+	case *tcp.Endpoint:
+		s.mu.Lock()
+		s.readWriter.Init(ctx, src)
+		n, err = s.Endpoint.Write(&s.readWriter, tcpip.WriteOptions{})
+		s.mu.Unlock()
+	default:
+		n, err = s.Endpoint.Write(src.Reader(ctx), tcpip.WriteOptions{})
+	}
+	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
+		return 0, linuxerr.ErrWouldBlock
+	}
+	if err != nil {
+		return 0, syserr.TranslateNetstackError(err).ToError()
+	}
+
+	if n < src.NumBytes() {
+		return n, linuxerr.ErrWouldBlock
+	}
+
+	return n, nil
+}
+
+// Accept implements the linux syscall accept(2) for sockets backed by
+// tcpip.Endpoint.
+func (s *sock) Accept(t *kernel.Task, peerRequested bool, flags int, blocking bool) (int32, linux.SockAddr, uint32, *syserr.Error) {
+	// Issue the accept request to get the new endpoint.
+	var peerAddr *tcpip.FullAddress
+	if peerRequested {
+		peerAddr = &tcpip.FullAddress{}
+	}
+	ep, wq, terr := s.Endpoint.Accept(peerAddr)
+	if terr != nil {
+		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
+			return 0, nil, 0, syserr.TranslateNetstackError(terr)
+		}
+
+		var err *syserr.Error
+		ep, wq, err = s.blockingAccept(t, peerAddr)
+		if err != nil {
+			return 0, nil, 0, err
+		}
+	}
+
+	ns, err := New(t, s.family, s.skType, s.protocol, wq, ep)
+	if err != nil {
+		return 0, nil, 0, err
+	}
+	defer ns.DecRef(t)
+
+	if err := ns.SetStatusFlags(t, t.Credentials(), uint32(flags&linux.SOCK_NONBLOCK)); err != nil {
+		return 0, nil, 0, syserr.FromError(err)
+	}
+
+	var addr linux.SockAddr
+	var addrLen uint32
+	if peerAddr != nil {
+		// Get address of the peer and write it to peer slice.
+		addr, addrLen = socket.ConvertAddress(s.family, *peerAddr)
+	}
+
+	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
+		CloseOnExec: flags&linux.SOCK_CLOEXEC != 0,
+	})
+
+	t.Kernel().RecordSocket(ns)
+
+	return fd, addr, addrLen, syserr.FromError(e)
+}
+
+// GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
+// tcpip.Endpoint.
+func (s *sock) GetSockOpt(t *kernel.Task, level, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
+	// implemented specifically for netstack.Socket rather than
+	// commonEndpoint. commonEndpoint should be extended to support socket
+	// options where the implementation is not shared, as unix sockets need
+	// their own support for SO_TIMESTAMP.
+	if level == linux.SOL_SOCKET && name == linux.SO_TIMESTAMP {
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+		val := primitive.Int32(0)
+		s.readMu.Lock()
+		defer s.readMu.Unlock()
+		if s.sockOptTimestamp {
+			val = 1
+		}
+		return &val, nil
+	}
+	if level == linux.SOL_TCP && name == linux.TCP_INQ {
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+		val := primitive.Int32(0)
+		s.readMu.Lock()
+		defer s.readMu.Unlock()
+		if s.sockOptInq {
+			val = 1
+		}
+		return &val, nil
+	}
+
+	return GetSockOpt(t, s, s.Endpoint, s.family, s.skType, level, name, outPtr, outLen)
+}
+
+// SetSockOpt implements the linux syscall setsockopt(2) for sockets backed by
+// tcpip.Endpoint.
+func (s *sock) SetSockOpt(t *kernel.Task, level int, name int, optVal []byte) *syserr.Error {
+	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
+	// implemented specifically for netstack.Socket rather than
+	// commonEndpoint. commonEndpoint should be extended to support socket
+	// options where the implementation is not shared, as unix sockets need
+	// their own support for SO_TIMESTAMP.
+	if level == linux.SOL_SOCKET && name == linux.SO_TIMESTAMP {
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		s.readMu.Lock()
+		defer s.readMu.Unlock()
+		s.sockOptTimestamp = hostarch.ByteOrder.Uint32(optVal) != 0
+		return nil
+	}
+	if level == linux.SOL_TCP && name == linux.TCP_INQ {
+		if len(optVal) < sizeOfInt32 {
+			return syserr.ErrInvalidArgument
+		}
+		s.readMu.Lock()
+		defer s.readMu.Unlock()
+		s.sockOptInq = hostarch.ByteOrder.Uint32(optVal) != 0
+		return nil
+	}
+
+	return SetSockOpt(t, s, s.Endpoint, level, name, optVal)
 }
 
 var sockAddrInetSize = (*linux.SockAddrInet)(nil).SizeBytes()
@@ -415,7 +638,7 @@ var sockAddrLinkSize = (*linux.SockAddrLink)(nil).SizeBytes()
 
 // minSockAddrLen returns the minimum length in bytes of a socket address for
 // the socket's family.
-func (s *socketOpsCommon) minSockAddrLen() int {
+func (s *sock) minSockAddrLen() int {
 	const addressFamilySize = 2
 
 	switch s.family {
@@ -434,129 +657,12 @@ func (s *socketOpsCommon) minSockAddrLen() int {
 	}
 }
 
-func (s *socketOpsCommon) isPacketBased() bool {
+func (s *sock) isPacketBased() bool {
 	return s.skType == linux.SOCK_DGRAM || s.skType == linux.SOCK_SEQPACKET || s.skType == linux.SOCK_RDM || s.skType == linux.SOCK_RAW
 }
 
-// Release implements fs.FileOperations.Release.
-func (s *socketOpsCommon) Release(ctx context.Context) {
-	e, ch := waiter.NewChannelEntry(waiter.EventHUp | waiter.EventErr)
-	s.EventRegister(&e)
-	defer s.EventUnregister(&e)
-
-	s.Endpoint.Close()
-
-	// SO_LINGER option is valid only for TCP. For other socket types
-	// return after endpoint close.
-	if family, skType, _ := s.Type(); skType != linux.SOCK_STREAM || (family != linux.AF_INET && family != linux.AF_INET6) {
-		return
-	}
-
-	v := s.Endpoint.SocketOptions().GetLinger()
-	// The case for zero timeout is handled in tcp endpoint close function.
-	// Close is blocked until either:
-	// 1. The endpoint state is not in any of the states: FIN-WAIT1,
-	// CLOSING and LAST_ACK.
-	// 2. Timeout is reached.
-	if v.Enabled && v.Timeout != 0 {
-		t := kernel.TaskFromContext(ctx)
-		start := t.Kernel().MonotonicClock().Now()
-		deadline := start.Add(v.Timeout)
-		_ = t.BlockWithDeadline(ch, true, deadline)
-	}
-}
-
-// Read implements fs.FileOperations.Read.
-func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOSequence, _ int64) (int64, error) {
-	if dst.NumBytes() == 0 {
-		return 0, nil
-	}
-	n, _, _, _, _, err := s.nonBlockingRead(ctx, dst, false, false, false)
-	if err == syserr.ErrWouldBlock {
-		return int64(n), linuxerr.ErrWouldBlock
-	}
-	if err != nil {
-		return 0, err.ToError()
-	}
-	return int64(n), nil
-}
-
-// WriteTo implements fs.FileOperations.WriteTo.
-func (s *SocketOperations) WriteTo(_ context.Context, _ *fs.File, dst io.Writer, count int64, dup bool) (int64, error) {
-	s.readMu.Lock()
-	defer s.readMu.Unlock()
-
-	w := tcpip.LimitedWriter{
-		W: dst,
-		N: count,
-	}
-
-	// This may return a blocking error.
-	res, err := s.Endpoint.Read(&w, tcpip.ReadOptions{
-		Peek: dup,
-	})
-	if err != nil {
-		return 0, syserr.TranslateNetstackError(err).ToError()
-	}
-	return int64(res.Count), nil
-}
-
-// Write implements fs.FileOperations.Write.
-func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
-	r := src.Reader(ctx)
-	n, err := s.Endpoint.Write(r, tcpip.WriteOptions{})
-	if _, ok := err.(*tcpip.ErrWouldBlock); ok {
-		return 0, linuxerr.ErrWouldBlock
-	}
-	if err != nil {
-		return 0, syserr.TranslateNetstackError(err).ToError()
-	}
-
-	if n < src.NumBytes() {
-		return n, linuxerr.ErrWouldBlock
-	}
-
-	return n, nil
-}
-
-var _ tcpip.Payloader = (*limitedPayloader)(nil)
-
-type limitedPayloader struct {
-	inner io.LimitedReader
-	err   error
-}
-
-func (l *limitedPayloader) Read(p []byte) (int, error) {
-	n, err := l.inner.Read(p)
-	l.err = err
-	return n, err
-}
-
-func (l *limitedPayloader) Len() int {
-	return int(l.inner.N)
-}
-
-// ReadFrom implements fs.FileOperations.ReadFrom.
-func (s *SocketOperations) ReadFrom(_ context.Context, _ *fs.File, r io.Reader, count int64) (int64, error) {
-	f := limitedPayloader{
-		inner: io.LimitedReader{
-			R: r,
-			N: count,
-		},
-	}
-	n, err := s.Endpoint.Write(&f, tcpip.WriteOptions{
-		// Reads may be destructive but should be very fast,
-		// so we can't release the lock while copying data.
-		Atomic: true,
-	})
-	if _, ok := err.(*tcpip.ErrBadBuffer); ok {
-		return n, f.err
-	}
-	return n, syserr.TranslateNetstackError(err).ToError()
-}
-
 // Readiness returns a mask of ready events for socket s.
-func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (s *sock) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return s.Endpoint.Readiness(mask)
 }
 
@@ -565,7 +671,7 @@ func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 //
 // If exact is true, then the specified address family must be an exact match
 // with the socket's family.
-func (s *socketOpsCommon) checkFamily(family uint16, exact bool) bool {
+func (s *sock) checkFamily(family uint16, exact bool) bool {
 	if family == uint16(s.family) {
 		return true
 	}
@@ -584,16 +690,16 @@ func (s *socketOpsCommon) checkFamily(family uint16, exact bool) bool {
 // represented by the empty string.
 //
 // TODO(gvisor.dev/issue/1556): remove this function.
-func (s *socketOpsCommon) mapFamily(addr tcpip.FullAddress, family uint16) tcpip.FullAddress {
-	if len(addr.Addr) == 0 && s.family == linux.AF_INET6 && family == linux.AF_INET {
-		addr.Addr = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\xff\x00\x00\x00\x00"
+func (s *sock) mapFamily(addr tcpip.FullAddress, family uint16) tcpip.FullAddress {
+	if addr.Addr.BitLen() == 0 && s.family == linux.AF_INET6 && family == linux.AF_INET {
+		addr.Addr = tcpip.AddrFrom16([16]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00})
 	}
 	return addr
 }
 
 // Connect implements the linux syscall connect(2) for sockets backed by
 // tpcip.Endpoint.
-func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
+func (s *sock) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
 	addr, family, err := socket.AddressAndFamily(sockaddr)
 	if err != nil {
 		return err
@@ -648,7 +754,7 @@ func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool
 
 // Bind implements the linux syscall bind(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
+func (s *sock) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
 	if len(sockaddr) < 2 {
 		return syserr.ErrInvalidArgument
 	}
@@ -667,8 +773,11 @@ func (s *socketOpsCommon) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
 		a.UnmarshalBytes(sockaddr)
 
 		addr = tcpip.FullAddress{
-			NIC:  tcpip.NICID(a.InterfaceIndex),
-			Addr: tcpip.Address(a.HardwareAddr[:header.EthernetAddressSize]),
+			NIC: tcpip.NICID(a.InterfaceIndex),
+			Addr: tcpip.AddrFrom16Slice(append(
+				a.HardwareAddr[:header.EthernetAddressSize],
+				[]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}...,
+			)),
 			Port: socket.Ntohs(a.Protocol),
 		}
 	} else {
@@ -708,13 +817,28 @@ func (s *socketOpsCommon) Bind(_ *kernel.Task, sockaddr []byte) *syserr.Error {
 
 // Listen implements the linux syscall listen(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) Listen(_ *kernel.Task, backlog int) *syserr.Error {
-	return syserr.TranslateNetstackError(s.Endpoint.Listen(backlog))
+func (s *sock) Listen(_ *kernel.Task, backlog int) *syserr.Error {
+	if err := s.Endpoint.Listen(backlog); err != nil {
+		return syserr.TranslateNetstackError(err)
+	}
+	if !socket.IsTCP(s) {
+		return nil
+	}
+
+	// Emit SentryTCPListenEvent with the bound port for tcp sockets.
+	addr, err := s.Endpoint.GetLocalAddress()
+	if err != nil {
+		panic(fmt.Sprintf("GetLocalAddress failed for tcp socket: %s", err))
+	}
+	eventchannel.Emit(&epb.SentryTcpListenEvent{
+		Port: proto.Int32(int32(addr.Port)),
+	})
+	return nil
 }
 
 // blockingAccept implements a blocking version of accept(2), that is, if no
 // connections are ready to be accept, it will block until one becomes ready.
-func (s *socketOpsCommon) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *syserr.Error) {
+func (s *sock) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (tcpip.Endpoint, *waiter.Queue, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(waiter.ReadableEvents)
 	s.EventRegister(&e)
@@ -732,53 +856,6 @@ func (s *socketOpsCommon) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAdd
 			return nil, nil, syserr.FromError(err)
 		}
 	}
-}
-
-// Accept implements the linux syscall accept(2) for sockets backed by
-// tcpip.Endpoint.
-func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int, blocking bool) (int32, linux.SockAddr, uint32, *syserr.Error) {
-	var peerAddr *tcpip.FullAddress
-	if peerRequested {
-		peerAddr = &tcpip.FullAddress{}
-	}
-	ep, wq, terr := s.Endpoint.Accept(peerAddr)
-	if terr != nil {
-		if _, ok := terr.(*tcpip.ErrWouldBlock); !ok || !blocking {
-			return 0, nil, 0, syserr.TranslateNetstackError(terr)
-		}
-
-		var err *syserr.Error
-		ep, wq, err = s.blockingAccept(t, peerAddr)
-		if err != nil {
-			return 0, nil, 0, err
-		}
-	}
-
-	ns, err := New(t, s.family, s.skType, s.protocol, wq, ep)
-	if err != nil {
-		return 0, nil, 0, err
-	}
-	defer ns.DecRef(t)
-
-	if flags&linux.SOCK_NONBLOCK != 0 {
-		flags := ns.Flags()
-		flags.NonBlocking = true
-		ns.SetFlags(flags.Settable())
-	}
-
-	var addr linux.SockAddr
-	var addrLen uint32
-	if peerAddr != nil {
-		addr, addrLen = socket.ConvertAddress(s.family, *peerAddr)
-	}
-
-	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
-		CloseOnExec: flags&linux.SOCK_CLOEXEC != 0,
-	})
-
-	t.Kernel().RecordSocket(ns)
-
-	return fd, addr, addrLen, syserr.FromError(e)
 }
 
 // ConvertShutdown converts Linux shutdown flags into tcpip shutdown flags.
@@ -799,7 +876,7 @@ func ConvertShutdown(how int) (tcpip.ShutdownFlags, *syserr.Error) {
 
 // Shutdown implements the linux syscall shutdown(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) Shutdown(_ *kernel.Task, how int) *syserr.Error {
+func (s *sock) Shutdown(_ *kernel.Task, how int) *syserr.Error {
 	f, err := ConvertShutdown(how)
 	if err != nil {
 		return err
@@ -809,45 +886,9 @@ func (s *socketOpsCommon) Shutdown(_ *kernel.Task, how int) *syserr.Error {
 	return syserr.TranslateNetstackError(s.Endpoint.Shutdown(f))
 }
 
-// GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
-// tcpip.Endpoint.
-func (s *SocketOperations) GetSockOpt(t *kernel.Task, level, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
-	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
-	// implemented specifically for netstack.SocketOperations rather than
-	// commonEndpoint. commonEndpoint should be extended to support socket
-	// options where the implementation is not shared, as unix sockets need
-	// their own support for SO_TIMESTAMP.
-	if level == linux.SOL_SOCKET && name == linux.SO_TIMESTAMP {
-		if outLen < sizeOfInt32 {
-			return nil, syserr.ErrInvalidArgument
-		}
-		val := primitive.Int32(0)
-		s.readMu.Lock()
-		defer s.readMu.Unlock()
-		if s.sockOptTimestamp {
-			val = 1
-		}
-		return &val, nil
-	}
-	if level == linux.SOL_TCP && name == linux.TCP_INQ {
-		if outLen < sizeOfInt32 {
-			return nil, syserr.ErrInvalidArgument
-		}
-		val := primitive.Int32(0)
-		s.readMu.Lock()
-		defer s.readMu.Unlock()
-		if s.sockOptInq {
-			val = 1
-		}
-		return &val, nil
-	}
-
-	return GetSockOpt(t, s, s.Endpoint, s.family, s.skType, level, name, outPtr, outLen)
-}
-
 // GetSockOpt can be used to implement the linux syscall getsockopt(2) for
 // sockets backed by a commonEndpoint.
-func GetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, family int, skType linux.SockType, level, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+func GetSockOpt(t *kernel.Task, s socket.Socket, ep commonEndpoint, family int, skType linux.SockType, level, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
 	switch level {
 	case linux.SOL_SOCKET:
 		return getSockOptSocket(t, s, ep, family, skType, name, outLen)
@@ -867,8 +908,7 @@ func GetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, family in
 	case linux.SOL_UDP,
 		linux.SOL_RAW,
 		linux.SOL_PACKET:
-
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 	}
 
 	return nil, syserr.ErrProtocolNotAvailable
@@ -882,7 +922,7 @@ func boolToInt32(v bool) int32 {
 }
 
 // getSockOptSocket implements GetSockOpt when level is SOL_SOCKET.
-func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, family int, _ linux.SockType, name, outLen int) (marshal.Marshallable, *syserr.Error) {
+func getSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, family int, _ linux.SockType, name, outLen int) (marshal.Marshallable, *syserr.Error) {
 	// TODO(b/124056281): Stop rejecting short optLen values in getsockopt.
 	switch name {
 	case linux.SO_ERROR:
@@ -1057,13 +1097,8 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 			return nil, syserr.ErrInvalidArgument
 		}
 
-		// This option is only viable for TCP endpoints.
-		var v bool
-		if _, skType, skProto := s.Type(); isTCPSocket(skType, skProto) {
-			v = tcp.EndpointState(ep.State()) == tcp.StateListen
-		}
-		vP := primitive.Int32(boolToInt32(v))
-		return &vP, nil
+		v := primitive.Int32(boolToInt32(ep.SocketOptions().GetAcceptConn()))
+		return &v, nil
 
 	case linux.SO_RCVLOWAT:
 		if outLen < sizeOfInt32 {
@@ -1072,17 +1107,17 @@ func getSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, fam
 
 		v := primitive.Int32(ep.SocketOptions().GetRcvlowat())
 		return &v, nil
-
 	default:
-		socket.GetSockOptEmitUnimplementedEvent(t, name)
+		if v, err, handled := getSockOptSocketCustom(t, s, ep, name, outLen); handled {
+			return v, err
+		}
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
 // getSockOptTCP implements GetSockOpt when level is SOL_TCP.
-func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, outLen int) (marshal.Marshallable, *syserr.Error) {
-	if _, skType, skProto := s.Type(); !isTCPSocket(skType, skProto) {
-		log.Warningf("SOL_TCP options are only supported on TCP sockets: skType, skProto = %v, %d", skType, skProto)
+func getSockOptTCP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name, outLen int) (marshal.Marshallable, *syserr.Error) {
+	if !socket.IsTCP(s) {
 		return nil, syserr.ErrUnknownProtocolOption
 	}
 
@@ -1177,8 +1212,6 @@ func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, 
 			return nil, syserr.TranslateNetstackError(err)
 		}
 
-		// TODO(b/64800844): Translate fields once they are added to
-		// tcpip.TCPInfoOption.
 		info := linux.TCPInfo{
 			State:       uint8(v.State),
 			RTO:         uint32(v.RTO / time.Microsecond),
@@ -1219,7 +1252,7 @@ func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, 
 		linux.TCP_NOTSENT_LOWAT,
 		linux.TCP_ZEROCOPY_RECEIVE:
 
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 
 	case linux.TCP_CONGESTION:
 		if outLen <= 0 {
@@ -1300,13 +1333,11 @@ func getSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name, 
 		}
 		vP := primitive.Int32(v)
 		return &vP, nil
-	default:
-		emitUnimplementedEventTCP(t, name)
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
-func getSockOptICMPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, outLen int) (marshal.Marshallable, *syserr.Error) {
+func getSockOptICMPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outLen int) (marshal.Marshallable, *syserr.Error) {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
 		log.Warningf("SOL_ICMPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
 		return nil, syserr.ErrUnknownProtocolOption
@@ -1333,8 +1364,6 @@ func getSockOptICMPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		}
 		bufP := primitive.ByteSlice(buf)
 		return &bufP, nil
-	default:
-		t.Kernel().EmitUnimplementedEvent(t)
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
@@ -1349,7 +1378,7 @@ func defaultTTL(t *kernel.Task, network tcpip.NetworkProtocolNumber) (primitive.
 }
 
 // getSockOptIPv6 implements GetSockOpt when level is SOL_IPV6.
-func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+func getSockOptIPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
 		log.Warningf("SOL_IPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
 		return nil, syserr.ErrUnknownProtocolOption
@@ -1412,7 +1441,7 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		return &v, nil
 
 	case linux.IPV6_PATHMTU:
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 
 	case linux.IPV6_TCLASS:
 		// Length handling for parity with Linux.
@@ -1539,17 +1568,14 @@ func getSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return nil, err
 		}
 		return &ret, nil
-
-	default:
-		emitUnimplementedEventIPv6(t, name)
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
 // getSockOptIP implements GetSockOpt when level is SOL_IP.
-func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int, _ int) (marshal.Marshallable, *syserr.Error) {
+func getSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, outPtr hostarch.Addr, outLen int, _ int) (marshal.Marshallable, *syserr.Error) {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return nil, syserr.ErrUnknownProtocolOption
 	}
 
@@ -1748,45 +1774,36 @@ func getSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		}
 		return &ret, nil
 
-	default:
-		emitUnimplementedEventIP(t, name)
+	case linux.IP_MTU_DISCOVER:
+		if outLen < sizeOfInt32 {
+			return nil, syserr.ErrInvalidArgument
+		}
+
+		v, err := ep.GetSockOptInt(tcpip.MTUDiscoverOption)
+		if err != nil {
+			return nil, syserr.TranslateNetstackError(err)
+		}
+		switch tcpip.PMTUDStrategy(v) {
+		case tcpip.PMTUDiscoveryWant:
+			v = linux.IP_PMTUDISC_WANT
+		case tcpip.PMTUDiscoveryDont:
+			v = linux.IP_PMTUDISC_DONT
+		case tcpip.PMTUDiscoveryDo:
+			v = linux.IP_PMTUDISC_DO
+		case tcpip.PMTUDiscoveryProbe:
+			v = linux.IP_PMTUDISC_PROBE
+		default:
+			panic(fmt.Errorf("unknown PMTUD option: %d", v))
+		}
+		vP := primitive.Int32(v)
+		return &vP, nil
 	}
 	return nil, syserr.ErrProtocolNotAvailable
 }
 
-// SetSockOpt implements the linux syscall setsockopt(2) for sockets backed by
-// tcpip.Endpoint.
-func (s *SocketOperations) SetSockOpt(t *kernel.Task, level int, name int, optVal []byte) *syserr.Error {
-	// TODO(b/78348848): Unlike other socket options, SO_TIMESTAMP is
-	// implemented specifically for netstack.SocketOperations rather than
-	// commonEndpoint. commonEndpoint should be extended to support socket
-	// options where the implementation is not shared, as unix sockets need
-	// their own support for SO_TIMESTAMP.
-	if level == linux.SOL_SOCKET && name == linux.SO_TIMESTAMP {
-		if len(optVal) < sizeOfInt32 {
-			return syserr.ErrInvalidArgument
-		}
-		s.readMu.Lock()
-		defer s.readMu.Unlock()
-		s.sockOptTimestamp = hostarch.ByteOrder.Uint32(optVal) != 0
-		return nil
-	}
-	if level == linux.SOL_TCP && name == linux.TCP_INQ {
-		if len(optVal) < sizeOfInt32 {
-			return syserr.ErrInvalidArgument
-		}
-		s.readMu.Lock()
-		defer s.readMu.Unlock()
-		s.sockOptInq = hostarch.ByteOrder.Uint32(optVal) != 0
-		return nil
-	}
-
-	return SetSockOpt(t, s, s.Endpoint, level, name, optVal)
-}
-
 // SetSockOpt can be used to implement the linux syscall setsockopt(2) for
 // sockets backed by a commonEndpoint.
-func SetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, level int, name int, optVal []byte) *syserr.Error {
+func SetSockOpt(t *kernel.Task, s socket.Socket, ep commonEndpoint, level int, name int, optVal []byte) *syserr.Error {
 	switch level {
 	case linux.SOL_SOCKET:
 		return setSockOptSocket(t, s, ep, name, optVal)
@@ -1807,13 +1824,11 @@ func SetSockOpt(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, level int
 		// gVisor doesn't support any SOL_PACKET options just return not
 		// supported. Returning nil here will result in tcpdump thinking AF_PACKET
 		// features are supported and proceed to use them and break.
-		t.Kernel().EmitUnimplementedEvent(t)
 		return syserr.ErrProtocolNotAvailable
 
 	case linux.SOL_UDP,
 		linux.SOL_RAW:
-
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 	}
 
 	return nil
@@ -1840,7 +1855,7 @@ func clampBufSize(newSz, min, max int64, ignoreMax bool) int64 {
 }
 
 // setSockOptSocket implements SetSockOpt when level is SOL_SOCKET.
-func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+func setSockOptSocket(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	switch name {
 	case linux.SO_SNDBUF:
 		if len(optVal) < sizeOfInt32 {
@@ -1996,10 +2011,6 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		var v linux.Linger
 		v.UnmarshalBytes(optVal)
 
-		if v != (linux.Linger{}) {
-			socket.SetSockOptEmitUnimplementedEvent(t, name)
-		}
-
 		ep.SocketOptions().SetLinger(tcpip.LingerOption{
 			Enabled: v.OnOff != 0,
 			Timeout: time.Second * time.Duration(v.Linger),
@@ -2021,18 +2032,18 @@ func setSockOptSocket(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 		v := hostarch.ByteOrder.Uint32(optVal)
 		ep.SocketOptions().SetRcvlowat(int32(v))
 		return nil
-
 	default:
-		socket.SetSockOptEmitUnimplementedEvent(t, name)
+		if err, handled := setSockOptSocketCustom(t, s, ep, name, optVal); handled {
+			return err
+		}
 	}
 
 	return nil
 }
 
 // setSockOptTCP implements SetSockOpt when level is SOL_TCP.
-func setSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
-	if _, skType, skProto := s.Type(); !isTCPSocket(skType, skProto) {
-		log.Warningf("SOL_TCP options are only supported on TCP sockets: skType, skProto = %v, %d", skType, skProto)
+func setSockOptTCP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+	if !socket.IsTCP(s) {
 		return syserr.ErrUnknownProtocolOption
 	}
 
@@ -2163,16 +2174,13 @@ func setSockOptTCP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name i
 		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.TCPWindowClampOption, int(v)))
 
 	case linux.TCP_REPAIR_OPTIONS:
-		t.Kernel().EmitUnimplementedEvent(t)
-
-	default:
-		emitUnimplementedEventTCP(t, name)
+		// Not supported.
 	}
 
 	return nil
 }
 
-func setSockOptICMPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+func setSockOptICMPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
 		log.Warningf("SOL_ICMPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
 		return syserr.ErrUnknownProtocolOption
@@ -2191,21 +2199,19 @@ func setSockOptICMPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, nam
 
 		req.UnmarshalUnsafe(optVal)
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.ICMPv6Filter{DenyType: req.Filter}))
-	default:
-		t.Kernel().EmitUnimplementedEvent(t)
 	}
 
 	return nil
 }
 
 // setSockOptIPv6 implements SetSockOpt when level is SOL_IPV6.
-func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+func setSockOptIPv6(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
 		log.Warningf("SOL_IPV6 options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
 		return syserr.ErrUnknownProtocolOption
 	}
 
-	family, skType, skProto := s.Type()
+	family, _, _ := s.Type()
 	if family != linux.AF_INET6 {
 		return syserr.ErrUnknownProtocolOption
 	}
@@ -2225,9 +2231,9 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return syserr.ErrInvalidArgument
 		}
 
-		if isTCPSocket(skType, skProto) && tcp.EndpointState(ep.State()) != tcp.StateInitial {
+		if socket.IsTCP(s) && tcp.EndpointState(ep.State()) != tcp.StateInitial {
 			return syserr.ErrInvalidEndpointState
-		} else if isUDPSocket(skType, skProto) && transport.DatagramEndpointState(ep.State()) != transport.DatagramEndpointStateInitial {
+		} else if socket.IsUDP(s) && transport.DatagramEndpointState(ep.State()) != transport.DatagramEndpointStateInitial {
 			return syserr.ErrInvalidEndpointState
 		}
 
@@ -2243,7 +2249,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.AddMembershipOption{
 			NIC:           tcpip.NICID(req.InterfaceIndex),
-			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+			MulticastAddr: tcpip.AddrFrom16(req.MulticastAddr),
 		}))
 
 	case linux.IPV6_DROP_MEMBERSHIP:
@@ -2254,7 +2260,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 
 		return syserr.TranslateNetstackError(ep.SetSockOpt(&tcpip.RemoveMembershipOption{
 			NIC:           tcpip.NICID(req.InterfaceIndex),
-			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+			MulticastAddr: tcpip.AddrFrom16(req.MulticastAddr),
 		}))
 
 	case linux.IPV6_IPSEC_POLICY,
@@ -2270,8 +2276,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		linux.MCAST_LEAVE_GROUP,
 		linux.MCAST_LEAVE_SOURCE_GROUP,
 		linux.MCAST_UNBLOCK_SOURCE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 
 	case linux.IPV6_RECVORIGDSTADDR:
 		if len(optVal) < sizeOfInt32 {
@@ -2348,7 +2353,7 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 		}
 
 		// Only valid for raw IPv6 sockets.
-		if skType != linux.SOCK_RAW {
+		if !socket.IsRaw(s) {
 			return syserr.ErrProtocolNotAvailable
 		}
 
@@ -2357,14 +2362,11 @@ func setSockOptIPv6(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name 
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(t, stk.(*Stack).Stack, optVal, true)
+		return netfilter.SetEntries(t.Credentials().UserNamespace, stk.(*Stack).Stack, optVal, true)
 
 	case linux.IP6T_SO_SET_ADD_COUNTERS:
 		log.Infof("IP6T_SO_SET_ADD_COUNTERS is not supported")
 		return nil
-
-	default:
-		emitUnimplementedEventIPv6(t, name)
 	}
 
 	return nil
@@ -2433,9 +2435,9 @@ func parseIntOrChar(buf []byte) (int32, *syserr.Error) {
 }
 
 // setSockOptIP implements SetSockOpt when level is SOL_IP.
-func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
+func setSockOptIP(t *kernel.Task, s socket.Socket, ep commonEndpoint, name int, optVal []byte) *syserr.Error {
 	if _, ok := ep.(tcpip.Endpoint); !ok {
-		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d", name)
+		log.Warningf("SOL_IP options not supported on endpoints other than tcpip.Endpoint: option = %d, endpoint = %T", name, ep)
 		return syserr.ErrUnknownProtocolOption
 	}
 
@@ -2465,8 +2467,8 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			NIC: tcpip.NICID(req.InterfaceIndex),
 			// TODO(igudger): Change AddMembership to use the standard
 			// any address representation.
-			InterfaceAddr: tcpip.Address(req.InterfaceAddr[:]),
-			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+			InterfaceAddr: tcpip.AddrFrom4(req.InterfaceAddr),
+			MulticastAddr: tcpip.AddrFrom4(req.MulticastAddr),
 		}))
 
 	case linux.IP_DROP_MEMBERSHIP:
@@ -2479,8 +2481,8 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			NIC: tcpip.NICID(req.InterfaceIndex),
 			// TODO(igudger): Change DropMembership to use the standard
 			// any address representation.
-			InterfaceAddr: tcpip.Address(req.InterfaceAddr[:]),
-			MulticastAddr: tcpip.Address(req.MulticastAddr[:]),
+			InterfaceAddr: tcpip.AddrFrom4(req.InterfaceAddr),
+			MulticastAddr: tcpip.AddrFrom4(req.MulticastAddr),
 		}))
 
 	case linux.IP_MULTICAST_IF:
@@ -2505,7 +2507,6 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 
 	case linux.MCAST_JOIN_GROUP:
 		// FIXME(b/124219304): Implement MCAST_JOIN_GROUP.
-		t.Kernel().EmitUnimplementedEvent(t)
 		return syserr.ErrInvalidArgument
 
 	case linux.IP_TTL:
@@ -2608,11 +2609,35 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 			return syserr.ErrNoDevice
 		}
 		// Stack must be a netstack stack.
-		return netfilter.SetEntries(t, stk.(*Stack).Stack, optVal, false)
+		return netfilter.SetEntries(t.Credentials().UserNamespace, stk.(*Stack).Stack, optVal, false)
 
 	case linux.IPT_SO_SET_ADD_COUNTERS:
 		log.Infof("IPT_SO_SET_ADD_COUNTERS is not supported")
 		return nil
+
+	case linux.IP_MTU_DISCOVER:
+		if len(optVal) == 0 {
+			return nil
+		}
+		v, err := parseIntOrChar(optVal)
+		if err != nil {
+			return err
+		}
+		switch v {
+		case linux.IP_PMTUDISC_DONT:
+			v = int32(tcpip.PMTUDiscoveryDont)
+		case linux.IP_PMTUDISC_WANT:
+			v = int32(tcpip.PMTUDiscoveryWant)
+		case linux.IP_PMTUDISC_DO:
+			v = int32(tcpip.PMTUDiscoveryDo)
+		case linux.IP_PMTUDISC_PROBE:
+			v = int32(tcpip.PMTUDiscoveryProbe)
+		case linux.IP_PMTUDISC_INTERFACE, linux.IP_PMTUDISC_OMIT:
+			return nil // Noop.
+		default:
+			return syserr.ErrNotSupported
+		}
+		return syserr.TranslateNetstackError(ep.SetSockOptInt(tcpip.MTUDiscoverOption, int(v)))
 
 	case linux.IP_ADD_SOURCE_MEMBERSHIP,
 		linux.IP_BIND_ADDRESS_NO_PORT,
@@ -2623,7 +2648,6 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		linux.IP_IPSEC_POLICY,
 		linux.IP_MINTTL,
 		linux.IP_MSFILTER,
-		linux.IP_MTU_DISCOVER,
 		linux.IP_MULTICAST_ALL,
 		linux.IP_NODEFRAG,
 		linux.IP_OPTIONS,
@@ -2641,140 +2665,15 @@ func setSockOptIP(t *kernel.Task, s socket.SocketOps, ep commonEndpoint, name in
 		linux.MCAST_LEAVE_SOURCE_GROUP,
 		linux.MCAST_MSFILTER,
 		linux.MCAST_UNBLOCK_SOURCE:
-
-		t.Kernel().EmitUnimplementedEvent(t)
+		// Not supported.
 	}
 
 	return nil
 }
 
-// emitUnimplementedEventTCP emits unimplemented event if name is valid. This
-// function contains names that are common between Get and SetSockOpt when
-// level is SOL_TCP.
-func emitUnimplementedEventTCP(t *kernel.Task, name int) {
-	switch name {
-	case linux.TCP_CONGESTION,
-		linux.TCP_CORK,
-		linux.TCP_FASTOPEN,
-		linux.TCP_FASTOPEN_CONNECT,
-		linux.TCP_FASTOPEN_KEY,
-		linux.TCP_FASTOPEN_NO_COOKIE,
-		linux.TCP_QUEUE_SEQ,
-		linux.TCP_REPAIR,
-		linux.TCP_REPAIR_QUEUE,
-		linux.TCP_REPAIR_WINDOW,
-		linux.TCP_SAVED_SYN,
-		linux.TCP_SAVE_SYN,
-		linux.TCP_THIN_DUPACK,
-		linux.TCP_THIN_LINEAR_TIMEOUTS,
-		linux.TCP_TIMESTAMP,
-		linux.TCP_ULP:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-	}
-}
-
-// emitUnimplementedEventIPv6 emits unimplemented event if name is valid. It
-// contains names that are common between Get and SetSockOpt when level is
-// SOL_IPV6.
-func emitUnimplementedEventIPv6(t *kernel.Task, name int) {
-	switch name {
-	case linux.IPV6_2292DSTOPTS,
-		linux.IPV6_2292HOPLIMIT,
-		linux.IPV6_2292HOPOPTS,
-		linux.IPV6_2292PKTINFO,
-		linux.IPV6_2292PKTOPTIONS,
-		linux.IPV6_2292RTHDR,
-		linux.IPV6_ADDR_PREFERENCES,
-		linux.IPV6_AUTOFLOWLABEL,
-		linux.IPV6_DONTFRAG,
-		linux.IPV6_DSTOPTS,
-		linux.IPV6_FLOWINFO,
-		linux.IPV6_FLOWINFO_SEND,
-		linux.IPV6_FLOWLABEL_MGR,
-		linux.IPV6_FREEBIND,
-		linux.IPV6_HOPOPTS,
-		linux.IPV6_MINHOPCOUNT,
-		linux.IPV6_MTU,
-		linux.IPV6_MTU_DISCOVER,
-		linux.IPV6_MULTICAST_ALL,
-		linux.IPV6_MULTICAST_HOPS,
-		linux.IPV6_MULTICAST_IF,
-		linux.IPV6_MULTICAST_LOOP,
-		linux.IPV6_RECVDSTOPTS,
-		linux.IPV6_RECVFRAGSIZE,
-		linux.IPV6_RECVHOPLIMIT,
-		linux.IPV6_RECVHOPOPTS,
-		linux.IPV6_RECVPATHMTU,
-		linux.IPV6_RECVRTHDR,
-		linux.IPV6_RTHDR,
-		linux.IPV6_RTHDRDSTOPTS,
-		linux.IPV6_TCLASS,
-		linux.IPV6_TRANSPARENT,
-		linux.IPV6_UNICAST_HOPS,
-		linux.IPV6_UNICAST_IF,
-		linux.MCAST_MSFILTER,
-		linux.IPV6_ADDRFORM:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-	}
-}
-
-// emitUnimplementedEventIP emits unimplemented event if name is valid. It
-// contains names that are common between Get and SetSockOpt when level is
-// SOL_IP.
-func emitUnimplementedEventIP(t *kernel.Task, name int) {
-	switch name {
-	case linux.IP_TOS,
-		linux.IP_TTL,
-		linux.IP_OPTIONS,
-		linux.IP_ROUTER_ALERT,
-		linux.IP_RECVOPTS,
-		linux.IP_RETOPTS,
-		linux.IP_PKTINFO,
-		linux.IP_PKTOPTIONS,
-		linux.IP_MTU_DISCOVER,
-		linux.IP_RECVTTL,
-		linux.IP_RECVTOS,
-		linux.IP_MTU,
-		linux.IP_FREEBIND,
-		linux.IP_IPSEC_POLICY,
-		linux.IP_XFRM_POLICY,
-		linux.IP_PASSSEC,
-		linux.IP_TRANSPARENT,
-		linux.IP_ORIGDSTADDR,
-		linux.IP_MINTTL,
-		linux.IP_NODEFRAG,
-		linux.IP_CHECKSUM,
-		linux.IP_BIND_ADDRESS_NO_PORT,
-		linux.IP_RECVFRAGSIZE,
-		linux.IP_MULTICAST_IF,
-		linux.IP_MULTICAST_TTL,
-		linux.IP_MULTICAST_LOOP,
-		linux.IP_ADD_MEMBERSHIP,
-		linux.IP_DROP_MEMBERSHIP,
-		linux.IP_UNBLOCK_SOURCE,
-		linux.IP_BLOCK_SOURCE,
-		linux.IP_ADD_SOURCE_MEMBERSHIP,
-		linux.IP_DROP_SOURCE_MEMBERSHIP,
-		linux.IP_MSFILTER,
-		linux.MCAST_JOIN_GROUP,
-		linux.MCAST_BLOCK_SOURCE,
-		linux.MCAST_UNBLOCK_SOURCE,
-		linux.MCAST_LEAVE_GROUP,
-		linux.MCAST_JOIN_SOURCE_GROUP,
-		linux.MCAST_LEAVE_SOURCE_GROUP,
-		linux.MCAST_MSFILTER,
-		linux.IP_MULTICAST_ALL,
-		linux.IP_UNICAST_IF:
-
-		t.Kernel().EmitUnimplementedEvent(t)
-	}
-}
-
 // GetSockName implements the linux syscall getsockname(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) GetSockName(*kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
+func (s *sock) GetSockName(*kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
 	addr, err := s.Endpoint.GetLocalAddress()
 	if err != nil {
 		return nil, 0, syserr.TranslateNetstackError(err)
@@ -2786,7 +2685,7 @@ func (s *socketOpsCommon) GetSockName(*kernel.Task) (linux.SockAddr, uint32, *sy
 
 // GetPeerName implements the linux syscall getpeername(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) GetPeerName(*kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
+func (s *sock) GetPeerName(*kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
 	addr, err := s.Endpoint.GetRemoteAddress()
 	if err != nil {
 		return nil, 0, syserr.TranslateNetstackError(err)
@@ -2796,7 +2695,7 @@ func (s *socketOpsCommon) GetPeerName(*kernel.Task) (linux.SockAddr, uint32, *sy
 	return a, l, nil
 }
 
-func (s *socketOpsCommon) fillCmsgInq(cmsg *socket.ControlMessages) {
+func (s *sock) fillCmsgInq(cmsg *socket.ControlMessages) {
 	if !s.sockOptInq {
 		return
 	}
@@ -2828,7 +2727,7 @@ func toLinuxPacketType(pktType tcpip.PacketType) uint8 {
 // nonBlockingRead issues a non-blocking read.
 //
 // TODO(b/78348848): Support timestamps for stream sockets.
-func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek, trunc, senderRequested bool) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
+func (s *sock) nonBlockingRead(ctx context.Context, dst usermem.IOSequence, peek, trunc, senderRequested bool) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
 	isPacket := s.isPacketBased()
 
 	readOptions := tcpip.ReadOptions{
@@ -2845,19 +2744,30 @@ func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSeq
 	// bytes of data to be discarded, rather than passed back in a
 	// caller-supplied  buffer.
 	var w io.Writer
-	if !isPacket && trunc {
-		w = &tcpip.LimitedWriter{
-			W: ioutil.Discard,
-			N: dst.NumBytes(),
-		}
-	} else {
-		w = dst.Writer(ctx)
-	}
+	var res tcpip.ReadResult
+	var err tcpip.Error
 
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
-	res, err := s.Endpoint.Read(w, readOptions)
+	if !isPacket && trunc {
+		w = &tcpip.LimitedWriter{
+			W: io.Discard,
+			N: dst.NumBytes(),
+		}
+		res, err = s.Endpoint.Read(w, readOptions)
+	} else {
+		switch s.Endpoint.(type) {
+		case *tcp.Endpoint:
+			s.mu.Lock()
+			s.readWriter.Init(ctx, dst)
+			res, err = s.Endpoint.Read(&s.readWriter, readOptions)
+			s.mu.Unlock()
+		default:
+			res, err = s.Endpoint.Read(dst.Writer(ctx), readOptions)
+		}
+	}
+
 	if _, ok := err.(*tcpip.ErrBadBuffer); ok && dst.NumBytes() == 0 {
 		err = nil
 	}
@@ -2917,7 +2827,7 @@ func (s *socketOpsCommon) nonBlockingRead(ctx context.Context, dst usermem.IOSeq
 	return res.Count, 0, nil, 0, cmsg, syserr.TranslateNetstackError(err)
 }
 
-func (s *socketOpsCommon) netstackToLinuxControlMessages(cm tcpip.ReceivableControlMessages) socket.ControlMessages {
+func (s *sock) netstackToLinuxControlMessages(cm tcpip.ReceivableControlMessages) socket.ControlMessages {
 	readCM := socket.NewIPControlMessages(s.family, cm)
 	return socket.ControlMessages{
 		IP: socket.IPControlMessages{
@@ -2943,7 +2853,7 @@ func (s *socketOpsCommon) netstackToLinuxControlMessages(cm tcpip.ReceivableCont
 	}
 }
 
-func (s *socketOpsCommon) linuxToNetstackControlMessages(cm socket.ControlMessages) tcpip.SendableControlMessages {
+func (s *sock) linuxToNetstackControlMessages(cm socket.ControlMessages) tcpip.SendableControlMessages {
 	return tcpip.SendableControlMessages{
 		HasTTL:      cm.IP.HasTTL,
 		TTL:         uint8(cm.IP.TTL),
@@ -2956,7 +2866,7 @@ func (s *socketOpsCommon) linuxToNetstackControlMessages(cm socket.ControlMessag
 // successfully writing packet data out to userspace.
 //
 // Precondition: s.readMu must be locked.
-func (s *socketOpsCommon) updateTimestamp(cm tcpip.ReceivableControlMessages) {
+func (s *sock) updateTimestamp(cm tcpip.ReceivableControlMessages) {
 	// Save the SIOCGSTAMP timestamp only if SO_TIMESTAMP is disabled.
 	if !s.sockOptTimestamp {
 		s.timestampValid = true
@@ -2965,7 +2875,7 @@ func (s *socketOpsCommon) updateTimestamp(cm tcpip.ReceivableControlMessages) {
 }
 
 // dequeueErr is analogous to net/core/skbuff.c:sock_dequeue_err_skb().
-func (s *socketOpsCommon) dequeueErr() *tcpip.SockError {
+func (s *sock) dequeueErr() *tcpip.SockError {
 	so := s.Endpoint.SocketOptions()
 	err := so.DequeueErr()
 	if err == nil {
@@ -2996,19 +2906,22 @@ func addrFamilyFromNetProto(net tcpip.NetworkProtocolNumber) int {
 
 // recvErr handles MSG_ERRQUEUE for recvmsg(2).
 // This is analogous to net/ipv4/ip_sockglue.c:ip_recv_error().
-func (s *socketOpsCommon) recvErr(t *kernel.Task, dst usermem.IOSequence) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
+func (s *sock) recvErr(t *kernel.Task, dst usermem.IOSequence) (int, int, linux.SockAddr, uint32, socket.ControlMessages, *syserr.Error) {
 	sockErr := s.dequeueErr()
 	if sockErr == nil {
 		return 0, 0, nil, 0, socket.ControlMessages{}, syserr.ErrTryAgain
+	}
+	if sockErr.Payload != nil {
+		defer sockErr.Payload.Release()
 	}
 
 	// The payload of the original packet that caused the error is passed as
 	// normal data via msg_iovec.  -- recvmsg(2)
 	msgFlags := linux.MSG_ERRQUEUE
-	if int(dst.NumBytes()) < len(sockErr.Payload) {
+	if int(dst.NumBytes()) < sockErr.Payload.Size() {
 		msgFlags |= linux.MSG_TRUNC
 	}
-	n, err := dst.CopyOut(t, sockErr.Payload)
+	n, err := dst.CopyOut(t, sockErr.Payload.AsSlice())
 
 	// The original destination address of the datagram that caused the error is
 	// supplied via msg_name.  -- recvmsg(2)
@@ -3019,7 +2932,7 @@ func (s *socketOpsCommon) recvErr(t *kernel.Task, dst usermem.IOSequence) (int, 
 
 // RecvMsg implements the linux syscall recvmsg(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, _ uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
+func (s *sock) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, _ uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
 	if flags&linux.MSG_ERRQUEUE != 0 {
 		return s.recvErr(t, dst)
 	}
@@ -3091,7 +3004,7 @@ func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags 
 
 // SendMsg implements the linux syscall sendmsg(2) for sockets backed by
 // tcpip.Endpoint.
-func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *sock) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	// Reject Unix control messages.
 	if !controlMessages.Unix.Empty() {
 		return 0, syserr.ErrInvalidArgument
@@ -3163,12 +3076,8 @@ func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []b
 	}
 }
 
-// Ioctl implements fs.FileOperations.Ioctl.
-func (s *SocketOperations) Ioctl(ctx context.Context, _ *fs.File, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
-	return s.socketOpsCommon.ioctl(ctx, io, args)
-}
-
-func (s *socketOpsCommon) ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+// Ioctl implements vfs.FileDescriptionImpl.
+func (s *sock) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		panic("ioctl(2) may only be called from a task goroutine")
@@ -3205,11 +3114,11 @@ func (s *socketOpsCommon) ioctl(ctx context.Context, io usermem.IO, args arch.Sy
 		return 0, err
 	}
 
-	return Ioctl(ctx, s.Endpoint, io, args)
+	return Ioctl(ctx, s.Endpoint, uio, sysno, args)
 }
 
 // Ioctl performs a socket ioctl.
-func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		panic("ioctl(2) may only be called from a task goroutine")
@@ -3285,7 +3194,7 @@ func Ioctl(ctx context.Context, ep commonEndpoint, io usermem.IO, args arch.Sysc
 		return 0, err
 
 	case linux.SIOCGIFMEM, linux.SIOCGIFPFLAGS, linux.SIOCGMIIPHY, linux.SIOCGMIIREG:
-		unimpl.EmitUnimplementedEvent(ctx)
+		// Not supported.
 	}
 
 	return 0, linuxerr.ENOTTY
@@ -3511,28 +3420,16 @@ func nicStateFlagsToLinux(f stack.NICStateFlags) uint32 {
 	return rv
 }
 
-func isTCPSocket(skType linux.SockType, skProto int) bool {
-	return skType == linux.SOCK_STREAM && (skProto == 0 || skProto == unix.IPPROTO_TCP)
-}
-
-func isUDPSocket(skType linux.SockType, skProto int) bool {
-	return skType == linux.SOCK_DGRAM && (skProto == 0 || skProto == unix.IPPROTO_UDP)
-}
-
-func isICMPSocket(skType linux.SockType, skProto int) bool {
-	return skType == linux.SOCK_DGRAM && (skProto == unix.IPPROTO_ICMP || skProto == unix.IPPROTO_ICMPV6)
-}
-
 // State implements socket.Socket.State. State translates the internal state
 // returned by netstack to values defined by Linux.
-func (s *socketOpsCommon) State() uint32 {
+func (s *sock) State() uint32 {
 	if s.family != linux.AF_INET && s.family != linux.AF_INET6 {
 		// States not implemented for this socket's family.
 		return 0
 	}
 
 	switch {
-	case isTCPSocket(s.skType, s.protocol):
+	case socket.IsTCP(s):
 		// TCP socket.
 		switch tcp.EndpointState(s.Endpoint.State()) {
 		case tcp.StateEstablished:
@@ -3561,7 +3458,7 @@ func (s *socketOpsCommon) State() uint32 {
 			// Internal or unknown state.
 			return 0
 		}
-	case isUDPSocket(s.skType, s.protocol):
+	case socket.IsUDP(s):
 		// UDP socket.
 		switch transport.DatagramEndpointState(s.Endpoint.State()) {
 		case transport.DatagramEndpointStateInitial, transport.DatagramEndpointStateBound, transport.DatagramEndpointStateClosed:
@@ -3571,10 +3468,10 @@ func (s *socketOpsCommon) State() uint32 {
 		default:
 			return 0
 		}
-	case isICMPSocket(s.skType, s.protocol):
-		// TODO(b/112063468): Export states for ICMP sockets.
-	case s.skType == linux.SOCK_RAW:
-		// TODO(b/112063468): Export states for raw sockets.
+	case socket.IsICMP(s):
+		// We don't support this yet.
+	case socket.IsRaw(s):
+		// We don't support this yet.
 	default:
 		// Unknown transport protocol, how did we make this socket?
 		log.Warningf("Unknown transport protocol for an existing socket: family=%v, type=%v, protocol=%v, internal type %v", s.family, s.skType, s.protocol, reflect.TypeOf(s.Endpoint).Elem())
@@ -3585,14 +3482,17 @@ func (s *socketOpsCommon) State() uint32 {
 }
 
 // Type implements socket.Socket.Type.
-func (s *socketOpsCommon) Type() (family int, skType linux.SockType, protocol int) {
+func (s *sock) Type() (family int, skType linux.SockType, protocol int) {
 	return s.family, s.skType, s.protocol
 }
 
 // EventRegister implements waiter.Waitable.
-func (s *socketOpsCommon) EventRegister(e *waiter.Entry) error {
+func (s *sock) EventRegister(e *waiter.Entry) error {
 	s.Queue.EventRegister(e)
 	return nil
 }
 
-// LINT.ThenChange(./netstack_vfs2.go)
+// EventUnregister implements waiter.Waitable.EventUnregister.
+func (s *sock) EventUnregister(e *waiter.Entry) {
+	s.Queue.EventUnregister(e)
+}

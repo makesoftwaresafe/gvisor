@@ -25,6 +25,8 @@ import (
 )
 
 // NullClock implements a clock that never advances.
+//
+// +stateify savable
 type NullClock struct{}
 
 var _ tcpip.Clock = (*NullClock)(nil)
@@ -39,9 +41,24 @@ func (*NullClock) NowMonotonic() tcpip.MonotonicTime {
 	return tcpip.MonotonicTime{}
 }
 
+// nullTimer implements a timer that never fires.
+//
+// +stateify savable
+type nullTimer struct{}
+
+var _ tcpip.Timer = (*nullTimer)(nil)
+
+// Stop implements tcpip.Timer.
+func (*nullTimer) Stop() bool {
+	return true
+}
+
+// Reset implements tcpip.Timer.
+func (*nullTimer) Reset(time.Duration) {}
+
 // AfterFunc implements tcpip.Clock.AfterFunc.
 func (*NullClock) AfterFunc(time.Duration, func()) tcpip.Timer {
-	return nil
+	return &nullTimer{}
 }
 
 type notificationChannels struct {
@@ -79,26 +96,31 @@ func (n *notificationChannels) wait() {
 	}
 }
 
+// +stateify savable
+type manualClockMutex struct {
+	sync.RWMutex `state:"nosave"`
+
+	// now is the current (fake) time of the clock.
+	now time.Time
+
+	// times is min-heap of times.
+	times timeHeap
+
+	// timers holds the timers scheduled for each time.
+	timers map[time.Time]map[*manualTimer]struct{}
+}
+
 // ManualClock implements tcpip.Clock and only advances manually with Advance
 // method.
+//
+// +stateify savable
 type ManualClock struct {
 	// runningTimers tracks the completion of timer callbacks that began running
 	// immediately upon their scheduling. It is used to ensure the proper ordering
 	// of timer callback dispatch.
 	runningTimers notificationChannels
 
-	mu struct {
-		sync.RWMutex
-
-		// now is the current (fake) time of the clock.
-		now time.Time
-
-		// times is min-heap of times.
-		times timeHeap
-
-		// timers holds the timers scheduled for each time.
-		timers map[time.Time]map[*manualTimer]struct{}
-	}
+	mu manualClockMutex
 }
 
 // NewManualClock creates a new ManualClock instance.
@@ -312,18 +334,23 @@ func (mc *ManualClock) stopTimer(mt *manualTimer) bool {
 	return true
 }
 
+// +stateify savable
+type manualTimerMu struct {
+	sync.Mutex `state:"nosave"`
+
+	// firesAt is the time when the timer will fire.
+	//
+	// Zero only when the timer is not active.
+	firesAt time.Time
+}
+
+// +stateify savable
 type manualTimer struct {
 	clock *ManualClock
-	f     func()
+	// TODO(b/341946753): Restore when netstack is savable.
+	f func() `state:"nosave"`
 
-	mu struct {
-		sync.Mutex
-
-		// firesAt is the time when the timer will fire.
-		//
-		// Zero only when the timer is not active.
-		firesAt time.Time
-	}
+	mu manualTimerMu
 }
 
 var _ tcpip.Timer = (*manualTimer)(nil)
@@ -354,11 +381,11 @@ func (h timeHeap) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 }
 
-func (h *timeHeap) Push(x interface{}) {
+func (h *timeHeap) Push(x any) {
 	*h = append(*h, x.(time.Time))
 }
 
-func (h *timeHeap) Pop() interface{} {
+func (h *timeHeap) Pop() any {
 	last := (*h)[len(*h)-1]
 	*h = (*h)[:len(*h)-1]
 	return last

@@ -60,15 +60,8 @@ type tuple struct {
 	// packet seen on the connection.
 	reply bool
 
-	mu sync.RWMutex `state:"nosave"`
-	// +checklocks:mu
+	// tupleID is set at initialization and is immutable.
 	tupleID tupleID
-}
-
-func (t *tuple) id() tupleID {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	return t.tupleID
 }
 
 // tupleID uniquely identifies a trackable connection in one direction.
@@ -142,11 +135,12 @@ type conn struct {
 	// reply is the tuple in reply direction.
 	reply tuple
 
-	finalizeOnce sync.Once
+	// TODO(b/341946753): Restore when netstack is savable.
+	finalizeOnce sync.Once `state:"nosave"`
 	// Holds a finalizeResult.
 	finalizeResult atomicbitops.Uint32
 
-	mu sync.RWMutex `state:"nosave"`
+	mu connRWMutex `state:"nosave"`
 	// sourceManip indicates the source manipulation type.
 	//
 	// +checklocks:mu
@@ -156,7 +150,7 @@ type conn struct {
 	// +checklocks:mu
 	destinationManip manipType
 
-	stateMu sync.RWMutex `state:"nosave"`
+	stateMu stateConnRWMutex `state:"nosave"`
 	// tcb is TCB control block. It is used to keep track of states
 	// of tcp connection.
 	//
@@ -195,7 +189,7 @@ func (cn *conn) update(pkt *PacketBuffer, reply bool) {
 		return
 	}
 
-	tcpHeader := header.TCP(pkt.TransportHeader().View())
+	tcpHeader := header.TCP(pkt.TransportHeader().Slice())
 
 	// Update the state of tcb. tcb assumes it's always initialized on the
 	// client. However, we only need to know whether the connection is
@@ -235,9 +229,10 @@ type ConnTrack struct {
 
 	// clock provides timing used to determine conntrack reapings.
 	clock tcpip.Clock
-	rand  *rand.Rand
+	// TODO(b/341946753): Restore when netstack is savable.
+	rand *rand.Rand `state:"nosave"`
 
-	mu sync.RWMutex `state:"nosave"`
+	mu connTrackRWMutex `state:"nosave"`
 	// mu protects the buckets slice, but not buckets' contents. Only take
 	// the write lock if you are modifying the slice or saving for S/R.
 	//
@@ -247,7 +242,7 @@ type ConnTrack struct {
 
 // +stateify savable
 type bucket struct {
-	mu sync.RWMutex `state:"nosave"`
+	mu bucketRWMutex `state:"nosave"`
 	// +checklocks:mu
 	tuples tupleList
 }
@@ -295,17 +290,17 @@ func getEmbeddedNetAndTransHeaders(pkt *PacketBuffer, netHdrLength int, getNetAn
 func getHeaders(pkt *PacketBuffer) (netHdr header.Network, transHdr header.Transport, isICMPError bool, ok bool) {
 	switch pkt.TransportProtocolNumber {
 	case header.TCPProtocolNumber:
-		if tcpHeader := header.TCP(pkt.TransportHeader().View()); len(tcpHeader) >= header.TCPMinimumSize {
+		if tcpHeader := header.TCP(pkt.TransportHeader().Slice()); len(tcpHeader) >= header.TCPMinimumSize {
 			return pkt.Network(), tcpHeader, false, true
 		}
 		return nil, nil, false, false
 	case header.UDPProtocolNumber:
-		if udpHeader := header.UDP(pkt.TransportHeader().View()); len(udpHeader) >= header.UDPMinimumSize {
+		if udpHeader := header.UDP(pkt.TransportHeader().Slice()); len(udpHeader) >= header.UDPMinimumSize {
 			return pkt.Network(), udpHeader, false, true
 		}
 		return nil, nil, false, false
 	case header.ICMPv4ProtocolNumber:
-		icmpHeader := header.ICMPv4(pkt.TransportHeader().View())
+		icmpHeader := header.ICMPv4(pkt.TransportHeader().Slice())
 		if len(icmpHeader) < header.ICMPv4MinimumSize {
 			return nil, nil, false, false
 		}
@@ -328,12 +323,12 @@ func getHeaders(pkt *PacketBuffer) (netHdr header.Network, transHdr header.Trans
 			panic("should have dropped packets with IPv4 options")
 		}
 
-		if netHdr, transHdr, ok := getEmbeddedNetAndTransHeaders(pkt, header.IPv4MinimumSize, v4NetAndTransHdr, pkt.tuple.id().transProto); ok {
+		if netHdr, transHdr, ok := getEmbeddedNetAndTransHeaders(pkt, header.IPv4MinimumSize, v4NetAndTransHdr, pkt.tuple.tupleID.transProto); ok {
 			return netHdr, transHdr, true, true
 		}
 		return nil, nil, false, false
 	case header.ICMPv6ProtocolNumber:
-		icmpHeader := header.ICMPv6(pkt.TransportHeader().View())
+		icmpHeader := header.ICMPv6(pkt.TransportHeader().Slice())
 		if len(icmpHeader) < header.ICMPv6MinimumSize {
 			return nil, nil, false, false
 		}
@@ -355,7 +350,7 @@ func getHeaders(pkt *PacketBuffer) (netHdr header.Network, transHdr header.Trans
 		// in the IPv6 packet should be a tracked protocol if we reach this point.
 		//
 		// TODO(https://gvisor.dev/issue/6789): Support extension headers.
-		transProto := pkt.tuple.id().transProto
+		transProto := pkt.tuple.tupleID.transProto
 		if got := header.IPv6(h).TransportProtocol(); got != transProto {
 			panic(fmt.Sprintf("got TransportProtocol() = %d, want = %d", got, transProto))
 		}
@@ -424,15 +419,15 @@ func getTupleIDForEchoPacket(pkt *PacketBuffer, ident uint16, request bool) tupl
 func getTupleID(pkt *PacketBuffer) (tupleID, getTupleIDDisposition) {
 	switch pkt.TransportProtocolNumber {
 	case header.TCPProtocolNumber:
-		if transHeader := header.TCP(pkt.TransportHeader().View()); len(transHeader) >= header.TCPMinimumSize {
+		if transHeader := header.TCP(pkt.TransportHeader().Slice()); len(transHeader) >= header.TCPMinimumSize {
 			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), getTupleIDOKAndAllowNewConn
 		}
 	case header.UDPProtocolNumber:
-		if transHeader := header.UDP(pkt.TransportHeader().View()); len(transHeader) >= header.UDPMinimumSize {
+		if transHeader := header.UDP(pkt.TransportHeader().Slice()); len(transHeader) >= header.UDPMinimumSize {
 			return getTupleIDForRegularPacket(pkt.Network(), pkt.NetworkProtocolNumber, transHeader, pkt.TransportProtocolNumber), getTupleIDOKAndAllowNewConn
 		}
 	case header.ICMPv4ProtocolNumber:
-		icmp := header.ICMPv4(pkt.TransportHeader().View())
+		icmp := header.ICMPv4(pkt.TransportHeader().Slice())
 		if len(icmp) < header.ICMPv4MinimumSize {
 			return tupleID{}, getTupleIDNotOK
 		}
@@ -467,7 +462,7 @@ func getTupleID(pkt *PacketBuffer) (tupleID, getTupleIDDisposition) {
 			return tid, getTupleIDOKAndDontAllowNewConn
 		}
 	case header.ICMPv6ProtocolNumber:
-		icmp := header.ICMPv6(pkt.TransportHeader().View())
+		icmp := header.ICMPv6(pkt.TransportHeader().Slice())
 		if len(icmp) < header.ICMPv6MinimumSize {
 			return tupleID{}, getTupleIDNotOK
 		}
@@ -532,33 +527,31 @@ func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer, skipChecksumValidation 
 		switch pkt.TransportProtocolNumber {
 		case header.TCPProtocolNumber:
 			_, csumValid, ok := header.TCPValid(
-				header.TCP(pkt.TransportHeader().View()),
-				func() uint16 { return pkt.Data().AsRange().Checksum() },
+				header.TCP(pkt.TransportHeader().Slice()),
+				func() uint16 { return pkt.Data().Checksum() },
 				uint16(pkt.Data().Size()),
 				tid.srcAddr,
 				tid.dstAddr,
-				pkt.RXTransportChecksumValidated || skipChecksumValidation)
+				pkt.RXChecksumValidated || skipChecksumValidation)
 			if !csumValid || !ok {
 				return nil
 			}
 		case header.UDPProtocolNumber:
 			lengthValid, csumValid := header.UDPValid(
-				header.UDP(pkt.TransportHeader().View()),
-				func() uint16 { return pkt.Data().AsRange().Checksum() },
+				header.UDP(pkt.TransportHeader().Slice()),
+				func() uint16 { return pkt.Data().Checksum() },
 				uint16(pkt.Data().Size()),
 				pkt.NetworkProtocolNumber,
 				tid.srcAddr,
 				tid.dstAddr,
-				pkt.RXTransportChecksumValidated || skipChecksumValidation)
+				pkt.RXChecksumValidated || skipChecksumValidation)
 			if !lengthValid || !csumValid {
 				return nil
 			}
 		}
 
-		bktID := ct.bucket(tid)
-
 		ct.mu.RLock()
-		bkt := &ct.buckets[bktID]
+		bkt := &ct.buckets[ct.bucket(tid)]
 		ct.mu.RUnlock()
 
 		now := ct.clock.NowMonotonic()
@@ -610,10 +603,8 @@ func (ct *ConnTrack) getConnAndUpdate(pkt *PacketBuffer, skipChecksumValidation 
 }
 
 func (ct *ConnTrack) connForTID(tid tupleID) *tuple {
-	bktID := ct.bucket(tid)
-
 	ct.mu.RLock()
-	bkt := &ct.buckets[bktID]
+	bkt := &ct.buckets[ct.bucket(tid)]
 	ct.mu.RUnlock()
 
 	return bkt.connForTID(tid, ct.clock.NowMonotonic())
@@ -628,7 +619,7 @@ func (bkt *bucket) connForTID(tid tupleID, now tcpip.MonotonicTime) *tuple {
 // +checklocksread:bkt.mu
 func (bkt *bucket) connForTIDRLocked(tid tupleID, now tcpip.MonotonicTime) *tuple {
 	for other := bkt.tuples.Front(); other != nil; other = other.Next() {
-		if tid == other.id() && !other.conn.timedOut(now) {
+		if tid == other.tupleID && !other.conn.timedOut(now) {
 			return other
 		}
 	}
@@ -641,8 +632,8 @@ func (ct *ConnTrack) finalize(cn *conn) finalizeResult {
 	ct.mu.RUnlock()
 
 	{
-		tid := cn.reply.id()
-		id := ct.bucket(tid)
+		tid := cn.reply.tupleID
+		id := ct.bucketWithTableLength(tid, len(buckets))
 
 		bkt := &buckets[id]
 		bkt.mu.Lock()
@@ -669,8 +660,8 @@ func (ct *ConnTrack) finalize(cn *conn) finalizeResult {
 	// TODO(https://gvisor.dev/issue/6850): Investigate handling this clash
 	// better.
 
-	tid := cn.original.id()
-	id := ct.bucket(tid)
+	tid := cn.original.tupleID
+	id := ct.bucketWithTableLength(tid, len(buckets))
 	bkt := &buckets[id]
 	bkt.mu.Lock()
 	defer bkt.mu.Unlock()
@@ -706,20 +697,41 @@ func (cn *conn) finalize() bool {
 	}
 }
 
-func (cn *conn) maybePerformNoopNAT(dnat bool) {
+// If NAT has not been configured for this connection, either mark the
+// connection as configured for "no-op NAT", in the case of DNAT, or, in the
+// case of SNAT, perform source port remapping so that source ports used by
+// locally-generated traffic do not conflict with ports occupied by existing NAT
+// bindings.
+//
+// Note that in the typical case this is also a no-op, because `snatAction`
+// will do nothing if the original tuple is already unique.
+func (cn *conn) maybePerformNoopNAT(pkt *PacketBuffer, hook Hook, r *Route, dnat bool) {
 	cn.mu.Lock()
-	defer cn.mu.Unlock()
-
 	var manip *manipType
 	if dnat {
 		manip = &cn.destinationManip
 	} else {
 		manip = &cn.sourceManip
 	}
-
-	if *manip == manipNotPerformed {
-		*manip = manipPerformedNoop
+	if *manip != manipNotPerformed {
+		cn.mu.Unlock()
+		_ = cn.handlePacket(pkt, hook, r)
+		return
 	}
+	if dnat {
+		*manip = manipPerformedNoop
+		cn.mu.Unlock()
+		_ = cn.handlePacket(pkt, hook, r)
+		return
+	}
+	cn.mu.Unlock()
+
+	// At this point, we know that NAT has not yet been performed on this
+	// connection, and the DNAT case has been handled with a no-op. For SNAT, we
+	// simply perform source port remapping to ensure that source ports for
+	// locally generated traffic do not clash with ports used by existing NAT
+	// bindings.
+	_, _ = snatAction(pkt, hook, r, 0, tcpip.Address{}, true /* changePort */, false /* changeAddress */)
 }
 
 type portOrIdentRange struct {
@@ -736,7 +748,7 @@ type portOrIdentRange struct {
 //
 // Generally, only the first packet of a connection reaches this method; other
 // packets will be manipulated without needing to modify the connection.
-func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, portsOrIdents portOrIdentRange, natAddress tcpip.Address, dnat bool) {
+func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, portsOrIdents portOrIdentRange, natAddress tcpip.Address, dnat, changePort, changeAddress bool) {
 	lastPortOrIdent := func() uint16 {
 		lastPortOrIdent := uint32(portsOrIdents.start) + portsOrIdents.size - 1
 		if lastPortOrIdent > math.MaxUint16 {
@@ -756,9 +768,6 @@ func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, portsOrIdents
 	cn.mu.Lock()
 	defer cn.mu.Unlock()
 
-	cn.reply.mu.Lock()
-	defer cn.reply.mu.Unlock()
-
 	var manip *manipType
 	var address *tcpip.Address
 	var portOrIdent *uint16
@@ -776,12 +785,24 @@ func (cn *conn) performNAT(pkt *PacketBuffer, hook Hook, r *Route, portsOrIdents
 		return
 	}
 	*manip = manipPerformed
-	*address = natAddress
+	if changeAddress {
+		*address = natAddress
+	}
+
+	// Everything below here is port-fiddling.
+	if !changePort {
+		return
+	}
 
 	// Does the current port/ident fit in the range?
 	if portsOrIdents.start <= *portOrIdent && *portOrIdent <= lastPortOrIdent {
 		// Yes, is the current reply tuple unique?
-		if other := cn.ct.connForTID(cn.reply.tupleID); other == nil {
+		//
+		// Or, does the reply tuple refer to the same connection as the current one that
+		// we are NATing? This would apply, for example, to a self-connected socket,
+		// where the original and reply tuples are identical.
+		other := cn.ct.connForTID(cn.reply.tupleID)
+		if other == nil || other.conn == cn {
 			// Yes! No need to change the port.
 			return
 		}
@@ -892,7 +913,7 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 		defer cn.mu.RUnlock()
 
 		if reply {
-			tid := cn.original.id()
+			tid := cn.original.tupleID
 
 			if dnat {
 				return tid, cn.sourceManip
@@ -900,7 +921,7 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 			return tid, cn.destinationManip
 		}
 
-		tid := cn.reply.id()
+		tid := cn.reply.tupleID
 		if dnat {
 			return tid, cn.destinationManip
 		}
@@ -944,19 +965,19 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 	// not the ICMP packet itself.
 	switch pkt.TransportProtocolNumber {
 	case header.ICMPv4ProtocolNumber:
-		icmp := header.ICMPv4(pkt.TransportHeader().View())
+		icmp := header.ICMPv4(pkt.TransportHeader().Slice())
 		// TODO(https://gvisor.dev/issue/6788): Incrementally update ICMP checksum.
 		icmp.SetChecksum(0)
-		icmp.SetChecksum(header.ICMPv4Checksum(icmp, pkt.Data().AsRange().Checksum()))
+		icmp.SetChecksum(header.ICMPv4Checksum(icmp, pkt.Data().Checksum()))
 
-		network := header.IPv4(pkt.NetworkHeader().View())
+		network := header.IPv4(pkt.NetworkHeader().Slice())
 		if dnat {
 			network.SetDestinationAddressWithChecksumUpdate(tid.srcAddr)
 		} else {
 			network.SetSourceAddressWithChecksumUpdate(tid.dstAddr)
 		}
 	case header.ICMPv6ProtocolNumber:
-		network := header.IPv6(pkt.NetworkHeader().View())
+		network := header.IPv6(pkt.NetworkHeader().Slice())
 		srcAddr := network.SourceAddress()
 		dstAddr := network.DestinationAddress()
 		if dnat {
@@ -965,7 +986,7 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 			srcAddr = tid.dstAddr
 		}
 
-		icmp := header.ICMPv6(pkt.TransportHeader().View())
+		icmp := header.ICMPv6(pkt.TransportHeader().Slice())
 		// TODO(https://gvisor.dev/issue/6788): Incrementally update ICMP checksum.
 		icmp.SetChecksum(0)
 		payload := pkt.Data()
@@ -973,7 +994,7 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 			Header:      icmp,
 			Src:         srcAddr,
 			Dst:         dstAddr,
-			PayloadCsum: payload.AsRange().Checksum(),
+			PayloadCsum: payload.Checksum(),
 			PayloadLen:  payload.Size(),
 		}))
 
@@ -988,10 +1009,15 @@ func (cn *conn) handlePacket(pkt *PacketBuffer, hook Hook, rt *Route) bool {
 }
 
 // bucket gets the conntrack bucket for a tupleID.
+// +checklocksread:ct.mu
 func (ct *ConnTrack) bucket(id tupleID) int {
+	return ct.bucketWithTableLength(id, len(ct.buckets))
+}
+
+func (ct *ConnTrack) bucketWithTableLength(id tupleID, tableLength int) int {
 	h := jenkins.Sum32(ct.seed)
-	h.Write([]byte(id.srcAddr))
-	h.Write([]byte(id.dstAddr))
+	h.Write(id.srcAddr.AsSlice())
+	h.Write(id.dstAddr.AsSlice())
 	shortBuf := make([]byte, 2)
 	binary.LittleEndian.PutUint16(shortBuf, id.srcPortOrEchoRequestIdent)
 	h.Write([]byte(shortBuf))
@@ -1001,9 +1027,7 @@ func (ct *ConnTrack) bucket(id tupleID) int {
 	h.Write([]byte(shortBuf))
 	binary.LittleEndian.PutUint16(shortBuf, uint16(id.netProto))
 	h.Write([]byte(shortBuf))
-	ct.mu.RLock()
-	defer ct.mu.RUnlock()
-	return int(h.Sum32()) % len(ct.buckets)
+	return int(h.Sum32()) % tableLength
 }
 
 // reapUnused deletes timed out entries from the conntrack map. The rules for
@@ -1086,7 +1110,7 @@ func (ct *ConnTrack) reapTupleLocked(reapingTuple *tuple, bktID int, bkt *bucket
 		otherTuple = &reapingTuple.conn.reply
 	}
 
-	otherTupleBktID := ct.bucket(otherTuple.id())
+	otherTupleBktID := ct.bucket(otherTuple.tupleID)
 	replyTupleInserted := reapingTuple.conn.getFinalizeResult() == finalizeResultSuccess
 
 	// To maintain lock order, we can only reap both tuples if the tuple for the
@@ -1108,9 +1132,9 @@ func (ct *ConnTrack) reapTupleLocked(reapingTuple *tuple, bktID int, bkt *bucket
 		bkt.tuples.Remove(otherTuple)
 	} else {
 		otherTupleBkt := &ct.buckets[otherTupleBktID]
-		otherTupleBkt.mu.Lock()
+		otherTupleBkt.mu.NestedLock(bucketLockOthertuple)
 		otherTupleBkt.tuples.Remove(otherTuple)
-		otherTupleBkt.mu.Unlock()
+		otherTupleBkt.mu.NestedUnlock(bucketLockOthertuple)
 	}
 
 	return true
@@ -1130,16 +1154,16 @@ func (ct *ConnTrack) originalDst(epID TransportEndpointID, netProto tcpip.Networ
 	t := ct.connForTID(tid)
 	if t == nil {
 		// Not a tracked connection.
-		return "", 0, &tcpip.ErrNotConnected{}
+		return tcpip.Address{}, 0, &tcpip.ErrNotConnected{}
 	}
 
 	t.conn.mu.RLock()
 	defer t.conn.mu.RUnlock()
 	if t.conn.destinationManip == manipNotPerformed {
 		// Unmanipulated destination.
-		return "", 0, &tcpip.ErrInvalidOptionValue{}
+		return tcpip.Address{}, 0, &tcpip.ErrInvalidOptionValue{}
 	}
 
-	id := t.conn.original.id()
+	id := t.conn.original.tupleID
 	return id.dstAddr, id.dstPortOrEchoReplyIdent, nil
 }

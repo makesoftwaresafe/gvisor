@@ -27,13 +27,13 @@ import (
 	"go/token"
 	"go/types"
 	"io"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 
@@ -58,6 +58,19 @@ var (
 	releaseTagsVal []string
 	releaseTagsErr error
 )
+
+// Hack! factFacts only provides facts loaded from directly imported packages
+// for efficiency (see importer.cache). In general, if you need a fact from a
+// package that isn't otherwise imported, the expectation is that you will add
+// a dummy import/use of the desired package to ensure it is a dependency.
+//
+// Unfortunately, some packages need facts from internal packages. Since
+// internal packages cannot be imported we explicitly import in this tool to
+// ensure the facts are available to ImportPackageFact.
+var internalPackages = []string{
+	// Required by pkg/sync for internal/abi.MapType.
+	"internal/abi",
+}
 
 // shouldInclude indicates whether the file should be included.
 func shouldInclude(path string) (bool, error) {
@@ -213,9 +226,9 @@ func (i *importer) fastFacts(pkg *types.Package) *facts.Package {
 	// Load the facts.
 	facts, err := i.loadFacts(pkg)
 	if err != nil {
-		// We have no available to propagate an error when attempting
-		// to import a fact, so we must simply issue a warning.
-		log.Printf("WARNING: error loading facts for %s: %v", pkg.Path(), err)
+		// There are no facts available, but no good way to propagate
+		// this minor error. It may be intentional that no analysis was
+		// performed on some part of the standard library, for example.
 		return nil
 	}
 	e.facts = facts // Cache the result.
@@ -337,7 +350,7 @@ func (i *errorImporter) Import(path string) (*types.Package, error) {
 // [2] golang.org/x/tools/go/checker/internal/checker
 func (i *importer) checkPackage(path string, srcs []string) (*types.Package, FindingSet, *facts.Package, error) {
 	// Load all source files.
-	goFiles, _ := sortSrcs(srcs)
+	goFiles, nonGoFiles := sortSrcs(srcs)
 	syntax := make([]*ast.File, 0, len(goFiles))
 	for _, file := range goFiles {
 		include, err := shouldInclude(file)
@@ -353,6 +366,17 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 		}
 		syntax = append(syntax, s)
 	}
+	otherFiles := make([]string, 0, len(nonGoFiles))
+	for _, file := range nonGoFiles {
+		include, err := shouldInclude(file)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("error evaluating non-Go file %q: %w", file, err)
+		}
+		if !include {
+			continue
+		}
+		otherFiles = append(otherFiles, file)
+	}
 
 	// Check type information.
 	ei := &errorImporter{
@@ -365,6 +389,7 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 	}
 	typesInfo := &types.Info{
 		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Instances:  make(map[*ast.Ident]types.Instance),
 		Uses:       make(map[*ast.Ident]types.Object),
 		Defs:       make(map[*ast.Ident]types.Object),
 		Implicits:  make(map[ast.Node]types.Object),
@@ -388,7 +413,7 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 		resultsMu sync.RWMutex // protects results & errs, findings.
 		factsMu   sync.RWMutex // protects facts.
 		ready     = make(map[*analysis.Analyzer]*sync.WaitGroup)
-		results   = make(map[*analysis.Analyzer]interface{})
+		results   = make(map[*analysis.Analyzer]any)
 		errs      = make(map[*analysis.Analyzer]error)
 		findings  = make(FindingSet, 0)
 	)
@@ -430,17 +455,20 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 			// Run the analysis.
 			var localFindings FindingSet
 			p := &analysis.Pass{
-				Analyzer:  a,
-				Fset:      i.fset,
-				Files:     syntax,
-				Pkg:       astPackage,
-				TypesInfo: typesInfo,
-				ResultOf:  results, // All results.
+				Analyzer:   a,
+				Fset:       i.fset,
+				Files:      syntax,
+				OtherFiles: otherFiles,
+				Pkg:        astPackage,
+				TypesInfo:  typesInfo,
+				ResultOf:   results, // All results.
 				Report: func(d analysis.Diagnostic) {
 					localFindings = append(localFindings, Finding{
 						Category: a.Name,
 						Position: i.fset.Position(d.Pos),
 						Message:  d.Message,
+						GOOS:     flags.GOOS,
+						GOARCH:   flags.GOARCH,
 					})
 				},
 				ImportPackageFact: func(pkg *types.Package, ptr analysis.Fact) bool {
@@ -541,7 +569,7 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 			// specific analyzers. The only panic that can happen
 			// is while resultsMu is held as a read-only lock.
 			var (
-				result interface{}
+				result any
 				err    error
 			)
 			defer func() {
@@ -597,6 +625,8 @@ func (i *importer) checkPackage(path string, srcs []string) (*types.Package, Fin
 				Category: a.Name,
 				Position: token.Position{Filename: filename},
 				Message:  errs[a].Error(),
+				GOOS:     flags.GOOS,
+				GOARCH:   flags.GOARCH,
 			})
 			continue
 		}
@@ -619,6 +649,14 @@ func Package(path string, srcs []string) (FindingSet, facts.Serializer, error) {
 		cache:   make(map[string]*importerEntry),
 		imports: make(map[string]*types.Package),
 	}
+
+	// See comment on internalPackages.
+	for _, pkg := range internalPackages {
+		if _, err := i.Import(pkg); err != nil {
+			return nil, nil, fmt.Errorf("error importing %s: %w", pkg, err)
+		}
+	}
+
 	_, findings, facts, err := i.checkPackage(path, srcs)
 	if err != nil {
 		return nil, nil, err
@@ -639,55 +677,33 @@ func (i *importer) allFactsAndFindings() (FindingSet, *facts.Bundle) {
 	return findings, allFacts
 }
 
-// Facts runs all analyzers, and returns human-readable facts.
-//
-// These facts are essentially a dictionary tree (split across all '.'
-// characters in the canonical human representation) that can be used for
-// rendering via a template.
-func Facts(path string, srcs []string) (facts.Resolved, error) {
-	i := &importer{
-		fset:    token.NewFileSet(),
-		cache:   make(map[string]*importerEntry),
-		imports: make(map[string]*types.Package),
-	}
-	pkg, _, localFacts, err := i.checkPackage(path, srcs)
-	if localFacts == nil && err != nil {
-		// Allow failure here, since we may not care about some
-		// analyzers for these packages.
-		return nil, err
-	}
-	_, allFacts := i.allFactsAndFindings()
-	return facts.Resolve(pkg, localFacts, allFacts, allFactNames)
-}
-
-// FindRoot finds a package root.
-func FindRoot(srcs []string, srcRootRegex string) (string, error) {
+// FindRoots finds a package roots.
+func FindRoots(srcs []string, srcRootRegex string) ([]string, error) {
 	if srcRootRegex == "" {
-		return "", nil
+		return nil, nil
 	}
 
-	// Calculate the root source directory. This is always a directory
-	// named 'src', of which we simply take the first we find. This is a
-	// bit fragile, but works for all currently known Go source
-	// configurations.
+	// Calculate the root source directories. This is always a directory
+	// named 'src'. It's possible that there are more than one of these
+	// directories.
 	//
 	// Note that there may be extra files outside of the root source
 	// directory; we simply ignore those.
 	re, err := regexp.Compile(srcRootRegex)
 	if err != nil {
-		return "", fmt.Errorf("srcRootRegex is not valid: %w", err)
+		return nil, fmt.Errorf("srcRootRegex is not valid: %w", err)
 	}
-	srcRootPrefix := ""
+	var srcRootPrefixes []string
 	for _, filename := range srcs {
-		if s := re.FindString(filename); len(s) > len(srcRootPrefix) {
-			srcRootPrefix = s
+		if s := re.FindString(filename); s != "" && !slices.Contains(srcRootPrefixes, s) {
+			srcRootPrefixes = append(srcRootPrefixes, s)
 		}
 	}
-	if srcRootPrefix == "" {
+	if len(srcRootPrefixes) == 0 {
 		// For whatever reason, we didn't identify a good common prefix to use here.
-		return "", fmt.Errorf("unable to identify src prefix for %v with regex %s", srcs, srcRootRegex)
+		return nil, fmt.Errorf("unable to identify src prefix for %v with regex %s", srcs, srcRootRegex)
 	}
-	return srcRootPrefix, nil
+	return srcRootPrefixes, nil
 }
 
 // SplitPackages splits a typical package structure into packages.
@@ -726,9 +742,14 @@ func SplitPackages(srcs []string, srcRootPrefix string) map[string][]string {
 			continue
 		}
 
-		// Skip unsupported packages explicitly.
-		if _, ok := usesTypeParams[pkg]; ok {
-			log.Printf("WARNING: Skipping package %q: type param analysis not yet supported.", pkg)
+		if strings.Contains(filename, "cmd/compile/internal/typecheck/_builtin/runtime.go") {
+			// Place the special runtime package (functions emitted by the
+			// compiler itself) into the runtime packages.
+			pkg = "runtime"
+		} else if strings.HasPrefix(pkg, "cmd") {
+			// Ignore packages in cmd, these are packages that are needed to build Go
+			// programs (like the Go tool or the compiler), but they are not part of
+			// the standard library and can't be in the set of transitive dependencies.
 			continue
 		}
 
@@ -737,16 +758,6 @@ func SplitPackages(srcs []string, srcRootPrefix string) map[string][]string {
 	}
 
 	return sources
-}
-
-// Go standard library packages using Go 1.18 type parameter features.
-//
-// As of writing, analysis tooling is not updated to support type parameters
-// and will choke on these packages. We skip these packages entirely for now.
-//
-// TODO(b/201686256): remove once tooling can handle type parameters.
-var usesTypeParams = map[string]struct{}{
-	"sync/atomic": {}, // https://go.dev/issue/50860
 }
 
 // Bundle checks a bundle of files (typically the standard library).

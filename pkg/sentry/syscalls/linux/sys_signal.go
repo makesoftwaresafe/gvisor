@@ -22,9 +22,8 @@ import (
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
+	"gvisor.dev/gvisor/pkg/sentry/fsimpl/signalfd"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
-	"gvisor.dev/gvisor/pkg/sentry/kernel/signalfd"
 )
 
 // "For a process to have permission to send a signal it must
@@ -66,7 +65,7 @@ func mayKill(t *kernel.Task, target *kernel.Task, sig linux.Signal) bool {
 }
 
 // Kill implements linux syscall kill(2).
-func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Kill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	pid := kernel.ThreadID(args[0].Int())
 	sig := linux.Signal(args[1].Int())
 
@@ -111,7 +110,8 @@ func Kill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 			if tg == t.ThreadGroup() {
 				continue
 			}
-			if t.PIDNamespace().IDOfThreadGroup(tg) == kernel.InitTID {
+			// Don't send the signal to the init process in t's PID namespace.
+			if tg.IsInitIn(t.PIDNamespace()) {
 				continue
 			}
 
@@ -196,7 +196,7 @@ func tkillSigInfo(sender, receiver *kernel.Task, sig linux.Signal) *linux.Signal
 }
 
 // Tkill implements linux syscall tkill(2).
-func Tkill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Tkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	tid := kernel.ThreadID(args[0].Int())
 	sig := linux.Signal(args[1].Int())
 
@@ -218,7 +218,7 @@ func Tkill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 }
 
 // Tgkill implements linux syscall tgkill(2).
-func Tgkill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Tgkill(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	tgid := kernel.ThreadID(args[0].Int())
 	tid := kernel.ThreadID(args[1].Int())
 	sig := linux.Signal(args[2].Int())
@@ -242,7 +242,7 @@ func Tgkill(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 }
 
 // RtSigaction implements linux syscall rt_sigaction(2).
-func RtSigaction(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigaction(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	sig := linux.Signal(args[0].Int())
 	newactarg := args[1].Pointer()
 	oldactarg := args[2].Pointer()
@@ -273,19 +273,19 @@ func RtSigaction(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 }
 
 // Sigreturn implements linux syscall sigreturn(2).
-func Sigreturn(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Sigreturn(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	ctrl, err := t.SignalReturn(false)
 	return 0, ctrl, err
 }
 
 // RtSigreturn implements linux syscall rt_sigreturn(2).
-func RtSigreturn(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigreturn(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	ctrl, err := t.SignalReturn(true)
 	return 0, ctrl, err
 }
 
 // RtSigprocmask implements linux syscall rt_sigprocmask(2).
-func RtSigprocmask(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigprocmask(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	how := args[0].Int()
 	setaddr := args[1].Pointer()
 	oldaddr := args[2].Pointer()
@@ -296,7 +296,7 @@ func RtSigprocmask(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel
 	}
 	oldmask := t.SignalMask()
 	if setaddr != 0 {
-		mask, err := CopyInSigSet(t, setaddr, sigsetsize)
+		mask, err := copyInSigSet(t, setaddr, sigsetsize)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -320,39 +320,21 @@ func RtSigprocmask(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel
 }
 
 // Sigaltstack implements linux syscall sigaltstack(2).
-func Sigaltstack(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Sigaltstack(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	setaddr := args[0].Pointer()
 	oldaddr := args[1].Pointer()
 
-	alt := t.SignalStack()
-	if oldaddr != 0 {
-		if _, err := alt.CopyOut(t, oldaddr); err != nil {
-			return 0, nil, err
-		}
-	}
-	if setaddr != 0 {
-		if _, err := alt.CopyIn(t, setaddr); err != nil {
-			return 0, nil, err
-		}
-		// The signal stack cannot be changed if the task is currently
-		// on the stack. This is enforced at the lowest level because
-		// these semantics apply to changing the signal stack via a
-		// ucontext during a signal handler.
-		if !t.SetSignalStack(alt) {
-			return 0, nil, linuxerr.EPERM
-		}
-	}
-
-	return 0, nil, nil
+	ctrl, err := t.SigaltStack(setaddr, oldaddr)
+	return 0, ctrl, err
 }
 
 // Pause implements linux syscall pause(2).
-func Pause(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Pause(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	return 0, nil, linuxerr.ConvertIntr(t.Block(nil), linuxerr.ERESTARTNOHAND)
 }
 
 // RtSigpending implements linux syscall rt_sigpending(2).
-func RtSigpending(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigpending(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	addr := args[0].Pointer()
 	pending := t.PendingSignals()
 	_, err := pending.CopyOut(t, addr)
@@ -360,13 +342,13 @@ func RtSigpending(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 }
 
 // RtSigtimedwait implements linux syscall rt_sigtimedwait(2).
-func RtSigtimedwait(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigtimedwait(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	sigset := args[0].Pointer()
 	siginfo := args[1].Pointer()
 	timespec := args[2].Pointer()
 	sigsetsize := args[3].SizeT()
 
-	mask, err := CopyInSigSet(t, sigset, sigsetsize)
+	mask, err := copyInSigSet(t, sigset, sigsetsize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -400,7 +382,7 @@ func RtSigtimedwait(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kerne
 }
 
 // RtSigqueueinfo implements linux syscall rt_sigqueueinfo(2).
-func RtSigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigqueueinfo(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	pid := kernel.ThreadID(args[0].Int())
 	sig := linux.Signal(args[1].Int())
 	infoAddr := args[2].Pointer()
@@ -441,7 +423,7 @@ func RtSigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kerne
 }
 
 // RtTgsigqueueinfo implements linux syscall rt_tgsigqueueinfo(2).
-func RtTgsigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtTgsigqueueinfo(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	tgid := kernel.ThreadID(args[0].Int())
 	tid := kernel.ThreadID(args[1].Int())
 	sig := linux.Signal(args[2].Int())
@@ -480,7 +462,7 @@ func RtTgsigqueueinfo(t *kernel.Task, args arch.SyscallArguments) (uintptr, *ker
 }
 
 // RtSigsuspend implements linux syscall rt_sigsuspend(2).
-func RtSigsuspend(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RtSigsuspend(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	sigset := args[0].Pointer()
 
 	// Copy in the signal mask.
@@ -500,7 +482,7 @@ func RtSigsuspend(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 }
 
 // RestartSyscall implements the linux syscall restart_syscall(2).
-func RestartSyscall(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func RestartSyscall(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	if r := t.SyscallRestartBlock(); r != nil {
 		n, err := r.Restart(t)
 		return n, nil, err
@@ -518,7 +500,7 @@ func RestartSyscall(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kerne
 // sharedSignalfd is shared between the two calls.
 func sharedSignalfd(t *kernel.Task, fd int32, sigset hostarch.Addr, sigsetsize uint, flags int32) (uintptr, *kernel.SyscallControl, error) {
 	// Copy in the signal mask.
-	mask, err := CopyInSigSet(t, sigset, sigsetsize)
+	mask, err := copyInSigSet(t, sigset, sigsetsize)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -539,8 +521,8 @@ func sharedSignalfd(t *kernel.Task, fd int32, sigset hostarch.Addr, sigsetsize u
 		defer file.DecRef(t)
 
 		// Is this a signalfd?
-		if s, ok := file.FileOperations.(*signalfd.SignalOperations); ok {
-			s.SetMask(mask)
+		if sfd, ok := file.Impl().(*signalfd.SignalFileDescription); ok {
+			sfd.SetMask(mask)
 			return 0, nil, nil
 		}
 
@@ -548,17 +530,18 @@ func sharedSignalfd(t *kernel.Task, fd int32, sigset hostarch.Addr, sigsetsize u
 		return 0, nil, linuxerr.EINVAL
 	}
 
+	fileFlags := uint32(linux.O_RDWR)
+	if flags&linux.SFD_NONBLOCK != 0 {
+		fileFlags |= linux.O_NONBLOCK
+	}
+
 	// Create a new file.
-	file, err := signalfd.New(t, mask)
+	vfsObj := t.Kernel().VFS()
+	file, err := signalfd.New(vfsObj, t, mask, fileFlags)
 	if err != nil {
 		return 0, nil, err
 	}
 	defer file.DecRef(t)
-
-	// Set appropriate flags.
-	file.SetFlags(fs.SettableFileFlags{
-		NonBlocking: flags&linux.SFD_NONBLOCK != 0,
-	})
 
 	// Create a new descriptor.
 	fd, err = t.NewFDFrom(0, file, kernel.FDFlags{
@@ -573,7 +556,7 @@ func sharedSignalfd(t *kernel.Task, fd int32, sigset hostarch.Addr, sigsetsize u
 }
 
 // Signalfd implements the linux syscall signalfd(2).
-func Signalfd(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Signalfd(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
 	sigset := args[1].Pointer()
 	sigsetsize := args[2].SizeT()
@@ -581,7 +564,7 @@ func Signalfd(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 }
 
 // Signalfd4 implements the linux syscall signalfd4(2).
-func Signalfd4(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
+func Signalfd4(t *kernel.Task, sysno uintptr, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
 	fd := args[0].Int()
 	sigset := args[1].Pointer()
 	sigsetsize := args[2].SizeT()

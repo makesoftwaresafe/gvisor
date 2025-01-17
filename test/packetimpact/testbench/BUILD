@@ -1,6 +1,7 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
+    default_applicable_licenses = ["//:license"],
     licenses = ["notice"],
 )
 
@@ -20,7 +21,9 @@ go_library(
         "//pkg/binary",
         "//pkg/buffer",
         "//pkg/hostarch",
+        "//pkg/rand",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "//test/packetimpact/proto:posix_server_go_proto",

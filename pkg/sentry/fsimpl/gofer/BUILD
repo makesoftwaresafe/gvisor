@@ -1,7 +1,21 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
+
+go_template_instance(
+    name = "string_list",
+    out = "string_list.go",
+    package = "gofer",
+    prefix = "string",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*stringListElem",
+        "Linker": "*stringListElem",
+    },
+)
 
 go_template_instance(
     name = "dentry_list",
@@ -10,8 +24,20 @@ go_template_instance(
     prefix = "dentry",
     template = "//pkg/ilist:generic_list",
     types = {
-        "Element": "*dentry",
-        "Linker": "*dentry",
+        "Element": "*dentryListElem",
+        "Linker": "*dentryListElem",
+    },
+)
+
+go_template_instance(
+    name = "special_fd_list",
+    out = "special_fd_list.go",
+    package = "gofer",
+    prefix = "specialFD",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*specialFileFD",
+        "Linker": "*specialFileFD",
     },
 )
 
@@ -23,25 +49,30 @@ go_template_instance(
     template = "//pkg/sentry/vfs/genericfstree:generic_fstree",
     types = {
         "Dentry": "dentry",
+        "Filesystem": "filesystem",
     },
 )
 
 go_library(
     name = "gofer",
     srcs = [
+        "dentry_impl.go",
         "dentry_list.go",
+        "directfs_dentry.go",
         "directory.go",
         "filesystem.go",
         "fstree.go",
         "gofer.go",
         "handle.go",
         "host_named_pipe.go",
-        "p9file.go",
+        "lisafs_dentry.go",
         "regular_file.go",
         "revalidate.go",
         "save_restore.go",
         "socket.go",
+        "special_fd_list.go",
         "special_file.go",
+        "string_list.go",
         "symlink.go",
         "time.go",
     ],
@@ -49,30 +80,30 @@ go_library(
     deps = [
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
+        "//pkg/cleanup",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/fd",
         "//pkg/fdnotifier",
         "//pkg/fspath",
+        "//pkg/fsutil",
         "//pkg/hostarch",
         "//pkg/lisafs",
         "//pkg/log",
         "//pkg/marshal",
         "//pkg/marshal/primitive",
         "//pkg/metric",
-        "//pkg/p9",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
-        "//pkg/sentry/fs/fsutil",
-        "//pkg/sentry/fs/lock",
         "//pkg/sentry/fsimpl/host",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
+        "//pkg/sentry/fsutil",
         "//pkg/sentry/hostfd",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/kernel/pipe",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/memmap",
         "//pkg/sentry/pgalloc",
         "//pkg/sentry/platform",
@@ -95,8 +126,10 @@ go_test(
     srcs = ["gofer_test.go"],
     library = ":gofer",
     deps = [
-        "//pkg/p9",
+        "//pkg/abi/linux",
+        "//pkg/lisafs",
         "//pkg/sentry/contexttest",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/pgalloc",
     ],
 )

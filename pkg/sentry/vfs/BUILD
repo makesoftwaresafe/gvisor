@@ -1,6 +1,8 @@
-load("//tools:defs.bzl", "go_library", "go_test")
-load("//tools/go_generics:defs.bzl", "go_template_instance")
 load("//pkg/sync/locking:locking.bzl", "declare_mutex")
+load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
+load("//tools/go_generics:defs.bzl", "go_template_instance")
+
+package(default_applicable_licenses = ["//:license"])
 
 licenses(["notice"])
 
@@ -52,6 +54,29 @@ go_template_instance(
 )
 
 go_template_instance(
+    name = "mount_ring",
+    out = "mount_ring.go",
+    package = "vfs",
+    prefix = "mount",
+    template = "//pkg/ilist:generic_ring",
+    types = {
+        "Container": "*Mount",
+    },
+)
+
+go_template_instance(
+    name = "mount_list",
+    out = "mount_list.go",
+    package = "vfs",
+    prefix = "follower",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*Mount",
+        "Linker": "*Mount",
+    },
+)
+
+go_template_instance(
     name = "event_list",
     out = "event_list.go",
     package = "vfs",
@@ -68,7 +93,7 @@ go_template_instance(
     out = "file_description_refs.go",
     package = "vfs",
     prefix = "FileDescription",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "FileDescription",
     },
@@ -78,8 +103,8 @@ go_template_instance(
     name = "mount_namespace_refs",
     out = "mount_namespace_refs.go",
     package = "vfs",
-    prefix = "MountNamespace",
-    template = "//pkg/refsvfs2:refs_template",
+    prefix = "namespace",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "MountNamespace",
     },
@@ -90,10 +115,16 @@ go_template_instance(
     out = "filesystem_refs.go",
     package = "vfs",
     prefix = "Filesystem",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "Filesystem",
     },
+)
+
+proto_library(
+    name = "events",
+    srcs = ["events.proto"],
+    visibility = ["//visibility:public"],
 )
 
 go_library(
@@ -102,6 +133,7 @@ go_library(
         "anonfs.go",
         "context.go",
         "debug.go",
+        "debug_testonly.go",
         "dentry.go",
         "device.go",
         "epoll.go",
@@ -121,12 +153,16 @@ go_library(
         "inotify_mutex.go",
         "lock.go",
         "mount.go",
+        "mount_list.go",
         "mount_namespace_refs.go",
+        "mount_ring.go",
         "mount_unsafe.go",
+        "namespace.go",
         "opath.go",
         "options.go",
         "pathname.go",
         "permissions.go",
+        "propagation.go",
         "resolving_path.go",
         "save_restore.go",
         "vfs.go",
@@ -134,10 +170,15 @@ go_library(
     ],
     visibility = ["//pkg/sentry:internal"],
     deps = [
+        ":events_go_proto",
         "//pkg/abi/linux",
         "//pkg/atomicbitops",
+        "//pkg/bitmap",
+        "//pkg/bits",
+        "//pkg/cleanup",
         "//pkg/context",
         "//pkg/errors/linuxerr",
+        "//pkg/eventchannel",
         "//pkg/fd",
         "//pkg/fdnotifier",
         "//pkg/fspath",
@@ -145,14 +186,12 @@ go_library(
         "//pkg/hostarch",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/safemem",
         "//pkg/sentry/arch",
-        "//pkg/sentry/fs",
-        "//pkg/sentry/fs/lock",
+        "//pkg/sentry/fsimpl/lock",
         "//pkg/sentry/fsmetric",
         "//pkg/sentry/kernel/auth",
-        "//pkg/sentry/kernel/time",
+        "//pkg/sentry/ktime",
         "//pkg/sentry/limits",
         "//pkg/sentry/memmap",
         "//pkg/sentry/socket/unix/transport",

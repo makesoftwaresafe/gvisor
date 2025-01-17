@@ -35,14 +35,20 @@ type taskInode struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotSymlink
 	kernfs.InodeTemporary
+	kernfs.InodeWatches
 	kernfs.OrderedChildren
 	taskInodeRefs
 
 	locks vfs.FileLocks
 
 	task *kernel.Task
+
+	dentriesMu dentriesRWMutex `state:"nosave"`
+	// dentries is a list of dentries to be invalidated when the task is destroyed.
+	dentries map[*kernfs.Dentry]struct{}
 }
 
 var _ kernfs.Inode = (*taskInode)(nil)
@@ -55,7 +61,7 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	contents := map[string]kernfs.Inode{
 		"auxv":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &auxvData{task: task}),
 		"cmdline":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Cmdline}),
-		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0444),
+		"comm":      fs.newComm(ctx, task, fs.NextIno(), 0644),
 		"cwd":       fs.newCwdSymlink(ctx, task, fs.NextIno()),
 		"environ":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &metadataData{task: task, metaType: Environ}),
 		"exe":       fs.newExeSymlink(ctx, task, fs.NextIno()),
@@ -63,18 +69,23 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		"fdinfo":    fs.newFDInfoDirInode(ctx, task),
 		"gid_map":   fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &idMapData{task: task, gids: true}),
 		"io":        fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0400, newIO(task, isThreadGroup)),
+		"limits":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &limitsData{task: task}),
 		"maps":      fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mapsData{task: task}),
 		"mem":       fs.newMemInode(ctx, task, fs.NextIno(), 0400),
 		"mountinfo": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountInfoData{fs: fs, task: task}),
 		"mounts":    fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &mountsData{fs: fs, task: task}),
 		"net":       fs.newTaskNetDir(ctx, task),
 		"ns": fs.newTaskOwnedDir(ctx, task, fs.NextIno(), 0511, map[string]kernfs.Inode{
-			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "net"),
-			"pid":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "pid"),
-			"user": fs.newNamespaceSymlink(ctx, task, fs.NextIno(), "user"),
+			"net":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNET),
+			"mnt":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWNS),
+			"pid":  fs.newPIDNamespaceSymlink(ctx, task, fs.NextIno()),
+			"user": fs.newFakeNamespaceSymlink(ctx, task, fs.NextIno(), "user"),
+			"ipc":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWIPC),
+			"uts":  fs.newNamespaceSymlink(ctx, task, fs.NextIno(), linux.CLONE_NEWUTS),
 		}),
 		"oom_score":     fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newStaticFile("0\n")),
 		"oom_score_adj": fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &oomScoreAdj{task: task}),
+		"root":          fs.newRootSymlink(ctx, task, fs.NextIno()),
 		"smaps":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &smapsData{task: task}),
 		"stat":          fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskStatData{task: task, pidns: pidns, tgstats: isThreadGroup}),
 		"statm":         fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &statmData{task: task}),
@@ -83,6 +94,8 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	}
 	if isThreadGroup {
 		contents["task"] = fs.newSubtasks(ctx, task, pidns, fakeCgroupControllers)
+	} else {
+		contents["children"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0644, &childrenData{task: task, pidns: pidns})
 	}
 	if len(fakeCgroupControllers) > 0 {
 		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, newFakeCgroupData(fakeCgroupControllers))
@@ -90,7 +103,10 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 		contents["cgroup"] = fs.newTaskOwnedInode(ctx, task, fs.NextIno(), 0444, &taskCgroupData{task: task})
 	}
 
-	taskInode := &taskInode{task: task}
+	taskInode := &taskInode{
+		task:     task,
+		dentries: make(map[*kernfs.Dentry]struct{}),
+	}
 	// Note: credentials are overridden by taskOwnedInode.
 	taskInode.InodeAttrs.Init(ctx, task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, fs.NextIno(), linux.ModeDirectory|0555)
 	taskInode.InitRefs()
@@ -104,10 +120,48 @@ func (fs *filesystem) newTaskInode(ctx context.Context, task *kernel.Task, pidns
 	return inode, nil
 }
 
+func (i *taskInode) TaskDestroyAction(ctx context.Context) {
+	i.dentriesMu.Lock()
+	dentries := i.dentries
+	i.dentries = nil
+	i.dentriesMu.Unlock()
+
+	for d := range dentries {
+		d.Invalidate(ctx)
+	}
+}
+
+// RegisterDentry implements kernfs.Inode.RegisterDentry.
+func (i *taskInode) RegisterDentry(d *kernfs.Dentry) {
+	i.dentriesMu.Lock()
+	defer i.dentriesMu.Unlock()
+
+	if i.dentries == nil {
+		return
+	}
+	if len(i.dentries) == 0 && !i.task.RegisterOnDestroyAction(i) {
+		// The task has been destroyed.
+		i.dentries = nil
+		return
+	}
+	i.dentries[d] = struct{}{}
+}
+
+// UnregisterDentry implements kernfs.Inode.RegisterDentry.
+func (i *taskInode) UnregisterDentry(d *kernfs.Dentry) {
+	i.dentriesMu.Lock()
+	defer i.dentriesMu.Unlock()
+
+	delete(i.dentries, d)
+	if len(i.dentries) == 0 {
+		i.task.UnregisterOnDestroyAction(i)
+	}
+}
+
 // Valid implements kernfs.Inode.Valid. This inode remains valid as long
 // as the task is still running. When it's dead, another tasks with the same
 // PID could replace it.
-func (i *taskInode) Valid(ctx context.Context) bool {
+func (i *taskInode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
 	return i.task.ExitState() != kernel.TaskExitDead
 }
 
@@ -130,6 +184,17 @@ func (*taskInode) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, v
 // DecRef implements kernfs.Inode.DecRef.
 func (i *taskInode) DecRef(ctx context.Context) {
 	i.taskInodeRefs.DecRef(func() { i.Destroy(ctx) })
+}
+
+func (i *taskInode) Lookup(ctx context.Context, name string) (kernfs.Inode, error) {
+	i.dentriesMu.RLock()
+	if i.dentries == nil {
+		// The task has been destroyed and the inode invalidate callback has been executed.
+		i.dentriesMu.RUnlock()
+		return nil, linuxerr.ESRCH
+	}
+	i.dentriesMu.RUnlock()
+	return i.OrderedChildren.Lookup(ctx, name)
 }
 
 // taskOwnedInode implements kernfs.Inode and overrides inode owner with task
@@ -160,8 +225,8 @@ func (fs *filesystem) newTaskOwnedDir(ctx context.Context, task *kernel.Task, in
 	return &taskOwnedInode{Inode: dir, owner: task}
 }
 
-func (i *taskOwnedInode) Valid(ctx context.Context) bool {
-	return i.owner.ExitState() != kernel.TaskExitDead && i.Inode.Valid(ctx)
+func (i *taskOwnedInode) Valid(ctx context.Context, parent *kernfs.Dentry, name string) bool {
+	return i.owner.ExitState() != kernel.TaskExitDead && i.Inode.Valid(ctx, parent, name)
 }
 
 // Stat implements kernfs.Inode.Stat.

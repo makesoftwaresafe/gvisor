@@ -1,6 +1,8 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
+package(default_applicable_licenses = ["//:license"])
+
 licenses(["notice"])
 
 go_template_instance(
@@ -8,7 +10,7 @@ go_template_instance(
     out = "dir_refs.go",
     package = "sys",
     prefix = "dir",
-    template = "//pkg/refsvfs2:refs_template",
+    template = "//pkg/refs:refs_template",
     types = {
         "T": "dir",
     },
@@ -19,6 +21,7 @@ go_library(
     srcs = [
         "dir_refs.go",
         "kcov.go",
+        "pci.go",
         "sys.go",
     ],
     visibility = ["//pkg/sentry:internal"],
@@ -28,22 +31,31 @@ go_library(
         "//pkg/context",
         "//pkg/coverage",
         "//pkg/errors/linuxerr",
+        "//pkg/fsutil",
         "//pkg/log",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sentry/arch",
+        "//pkg/sentry/fsimpl/host",
         "//pkg/sentry/fsimpl/kernfs",
+        "//pkg/sentry/inet",
         "//pkg/sentry/kernel",
         "//pkg/sentry/kernel/auth",
         "//pkg/sentry/memmap",
         "//pkg/sentry/vfs",
         "//pkg/usermem",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
 go_test(
     name = "sys_test",
     srcs = ["sys_test.go"],
+    library = ":sys",
+)
+
+go_test(
+    name = "sys_integration_test",
+    srcs = ["sys_integration_test.go"],
     deps = [
         ":sys",
         "//pkg/abi/linux",

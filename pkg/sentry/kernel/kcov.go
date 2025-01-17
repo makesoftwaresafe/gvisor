@@ -41,8 +41,8 @@ const kcovAreaSizeMax = 10 * 1024 * 1024
 // To give the illusion that the data is always up to date, we update the shared
 // memory every time before we return to userspace.
 type Kcov struct {
-	// mfp provides application memory. It is immutable after creation.
-	mfp pgalloc.MemoryFileProvider
+	// mf stores application memory. It is immutable after creation.
+	mf *pgalloc.MemoryFile
 
 	// mu protects all of the fields below.
 	mu sync.RWMutex
@@ -74,12 +74,12 @@ type Kcov struct {
 // NewKcov creates and returns a Kcov instance.
 func (k *Kernel) NewKcov() *Kcov {
 	return &Kcov{
-		mfp: k,
+		mf: k.mf,
 	}
 }
 
 var coveragePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make([]byte, 0)
 	},
 }
@@ -94,12 +94,12 @@ func (kcov *Kcov) TaskWork(t *Task) {
 	}
 
 	rw := &kcovReadWriter{
-		mf: kcov.mfp.MemoryFile(),
+		mf: kcov.mf,
 		fr: kcov.mappable.FileRange(),
 	}
 
 	// Read in the PC count.
-	if _, err := safemem.ReadFullToBlocks(rw, kcov.countBlock()); err != nil {
+	if _, err := safemem.ReadFullToBlocks(rw.ReadToBlocks, kcov.countBlock()); err != nil {
 		panic(fmt.Sprintf("Internal error reading count from kcov area: %v", err))
 	}
 
@@ -111,7 +111,7 @@ func (kcov *Kcov) TaskWork(t *Task) {
 	// output.
 	kcov.count += uint64(n / 8)
 	rw.off = 0
-	if _, err := safemem.WriteFullFromBlocks(rw, kcov.countBlock()); err != nil {
+	if _, err := safemem.WriteFullFromBlocks(rw.WriteFromBlocks, kcov.countBlock()); err != nil {
 		panic(fmt.Sprintf("Internal error writing count to kcov area: %v", err))
 	}
 
@@ -242,7 +242,11 @@ func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 
 	if kcov.mappable == nil {
 		// Set up the kcov area.
-		fr, err := kcov.mfp.MemoryFile().Allocate(kcov.size*8, pgalloc.AllocOpts{Kind: usage.Anonymous})
+		opts := pgalloc.AllocOpts{
+			Kind:    usage.Anonymous,
+			MemCgID: pgalloc.MemoryCgroupIDFromContext(ctx),
+		}
+		fr, err := kcov.mf.Allocate(kcov.size*8, opts)
 		if err != nil {
 			return err
 		}
@@ -254,7 +258,7 @@ func (kcov *Kcov) ConfigureMMap(ctx context.Context, opts *memmap.MMapOpts) erro
 		}
 		// For convenience, a special mappable is used here. Note that these mappings
 		// will look different under /proc/[pid]/maps than they do on Linux.
-		kcov.mappable = mm.NewSpecialMappable(fmt.Sprintf("[kcov:%d]", t.ThreadID()), kcov.mfp, fr)
+		kcov.mappable = mm.NewSpecialMappable(fmt.Sprintf("[kcov:%d]", t.ThreadID()), kcov.mf, fr)
 	}
 	kcov.mappable.IncRef()
 	opts.Mappable = kcov.mappable
@@ -333,6 +337,6 @@ type kcovIOWriter struct {
 // Write implements io.Writer.Write.
 func (w *kcovIOWriter) Write(p []byte) (int, error) {
 	bs := safemem.BlockSeqOf(safemem.BlockFromSafeSlice(p))
-	n, err := safemem.WriteFullFromBlocks(w.rw, bs)
+	n, err := safemem.WriteFullFromBlocks(w.rw.WriteFromBlocks, bs)
 	return int(n), err
 }

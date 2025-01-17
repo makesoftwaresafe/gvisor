@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "checker",
@@ -10,6 +13,7 @@ go_library(
     deps = [
         "//pkg/buffer",
         "//pkg/tcpip",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/seqnum",
         "@com_github_google_go_cmp//cmp:go_default_library",

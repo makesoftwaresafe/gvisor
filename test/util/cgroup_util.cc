@@ -93,7 +93,6 @@ PosixError Cgroup::PollControlFileForChange(absl::string_view name,
 PosixError Cgroup::PollControlFileForChangeAfter(
     absl::string_view name, absl::Duration timeout,
     std::function<void()> body) const {
-  const absl::Duration poll_interval = absl::Milliseconds(10);
   const absl::Time deadline = absl::Now() + timeout;
   const std::string alias_path = absl::StrFormat("[cg#%d]/%s", id_, name);
 
@@ -102,6 +101,15 @@ PosixError Cgroup::PollControlFileForChangeAfter(
 
   body();
 
+  // The loop below iterates quickly and results in too many save-restore
+  // cycles. This can prevent tasks from being scheduled and incurring the
+  // resource usage this function is often waiting for, resulting in timeouts.
+  const DisableSave ds;
+
+  std::cerr << absl::StreamFormat(
+                   "Waiting for control file '%s' to change from '%d'...",
+                   alias_path, initial_value)
+            << std::endl;
   while (true) {
     ASSIGN_OR_RETURN_ERRNO(const int64_t current_value,
                            ReadIntegerControlFile(name));
@@ -116,11 +124,6 @@ PosixError Cgroup::PollControlFileForChangeAfter(
       return PosixError(ETIME, absl::StrCat(alias_path, " didn't change in ",
                                             absl::FormatDuration(timeout)));
     }
-    std::cerr << absl::StreamFormat(
-                     "Waiting for control file '%s' to change from '%d'...",
-                     alias_path, initial_value)
-              << std::endl;
-    absl::SleepFor(poll_interval);
   }
 }
 

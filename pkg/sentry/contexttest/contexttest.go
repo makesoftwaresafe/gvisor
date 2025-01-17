@@ -24,7 +24,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/memutil"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
-	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
+	"gvisor.dev/gvisor/pkg/sentry/ktime"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/sentry/pgalloc"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -44,7 +44,9 @@ func Context(tb testing.TB) context.Context {
 		tb.Fatalf("error creating application memory file: %v", err)
 	}
 	memfile := os.NewFile(uintptr(memfd), memfileName)
-	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{})
+	mf, err := pgalloc.NewMemoryFile(memfile, pgalloc.MemoryFileOpts{
+		DisableMemoryAccounting: true,
+	})
 	if err != nil {
 		memfile.Close()
 		tb.Fatalf("error creating pgalloc.MemoryFile: %v", err)
@@ -60,7 +62,7 @@ func Context(tb testing.TB) context.Context {
 		mf:          mf,
 		platform:    p,
 		creds:       auth.NewAnonymousCredentials(),
-		otherValues: make(map[interface{}]interface{}),
+		otherValues: make(map[any]any),
 	}
 }
 
@@ -72,7 +74,7 @@ type TestContext struct {
 	mf          *pgalloc.MemoryFile
 	platform    platform.Platform
 	creds       *auth.Credentials
-	otherValues map[interface{}]interface{}
+	otherValues map[any]any
 }
 
 // globalUniqueID tracks incremental unique identifiers for tests.
@@ -90,7 +92,7 @@ func (*globalUniqueIDProvider) UniqueID() uint64 {
 // inotify cookies.
 var lastInotifyCookie atomicbitops.Uint32
 
-// hostClock implements ktime.Clock.
+// hostClock implements ktime.SampledClock.
 type hostClock struct {
 	ktime.WallRateClock
 	ktime.NoClockEvents
@@ -101,14 +103,24 @@ func (*hostClock) Now() ktime.Time {
 	return ktime.FromNanoseconds(time.Now().UnixNano())
 }
 
+// SupportsTimers implements ktime.Clock.Now.
+func (*hostClock) SupportsTimers() bool {
+	return true
+}
+
+// NewTimer implements ktime.Clock.NewTimer.
+func (c *hostClock) NewTimer(l ktime.Listener) ktime.Timer {
+	return ktime.NewSampledTimer(c, l)
+}
+
 // RegisterValue registers additional values with this test context. Useful for
 // providing values from external packages that contexttest can't depend on.
-func (t *TestContext) RegisterValue(key, value interface{}) {
+func (t *TestContext) RegisterValue(key, value any) {
 	t.otherValues[key] = value
 }
 
 // Value implements context.Context.
-func (t *TestContext) Value(key interface{}) interface{} {
+func (t *TestContext) Value(key any) any {
 	switch key {
 	case auth.CtxCredentials:
 		return t.creds
@@ -116,8 +128,6 @@ func (t *TestContext) Value(key interface{}) interface{} {
 		return t.l
 	case pgalloc.CtxMemoryFile:
 		return t.mf
-	case pgalloc.CtxMemoryFileProvider:
-		return t
 	case platform.CtxPlatform:
 		return t.platform
 	case uniqueid.CtxGlobalUniqueID:
@@ -134,11 +144,6 @@ func (t *TestContext) Value(key interface{}) interface{} {
 		}
 		return t.Context.Value(key)
 	}
-}
-
-// MemoryFile implements pgalloc.MemoryFileProvider.MemoryFile.
-func (t *TestContext) MemoryFile() *pgalloc.MemoryFile {
-	return t.mf
 }
 
 // RootContext returns a Context that may be used in tests that need root
@@ -158,7 +163,7 @@ type limitContext struct {
 }
 
 // Value implements context.Context.
-func (lc limitContext) Value(key interface{}) interface{} {
+func (lc limitContext) Value(key any) any {
 	switch key {
 	case limits.CtxLimits:
 		return lc.l

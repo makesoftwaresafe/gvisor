@@ -37,10 +37,10 @@ type processParams struct {
 func TestReassemblerProcess(t *testing.T) {
 	const proto = 99
 
-	v := func(size int) []byte {
-		payload := make([]byte, size)
+	v := func(size int) *buffer.View {
+		payload := buffer.NewViewSize(size)
 		for i := 1; i < size; i++ {
-			payload[i] = uint8(i) * 3
+			payload.WriteAt([]byte{uint8(i) * 3}, i)
 		}
 		return payload
 	}
@@ -220,7 +220,7 @@ func TestReassemblerProcess(t *testing.T) {
 				if a == nil || b == nil {
 					return a == b
 				}
-				return bytes.Equal(a.Data().AsRange().ToOwnedView(), b.Data().AsRange().ToOwnedView())
+				return bytes.Equal(a.Data().AsRange().ToSlice(), b.Data().AsRange().ToSlice())
 			}
 
 			if isDone {

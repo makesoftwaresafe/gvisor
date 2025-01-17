@@ -15,6 +15,8 @@ plugins:
   - jekyll-sitemap
 site_url: https://gvisor.dev
 feed:
+  title: "gVisor blog"
+  url: https://gvisor.dev
   path: blog/index.xml
 svg:
   optimize: true
@@ -25,6 +27,28 @@ defaults:
       layout: default
 analytics: "UA-150193582-1"
 authors:
+  almet:
+    name: Alexis Métaireau
+    email: alexis@notmyidea.org
+    url: https://notmyidea.org
+  apyrgio:
+    name: Alex Pyrgiotis
+    email: alex.p@freedom.press
+    url: https://freedom.press/people/alex-p
+  ayushranjan:
+    name: Ayush Ranjan
+    email: ayushranjan@google.com
+  bogomolov:
+    name: Konstantin Bogomolov
+    email: bogomolov@google.com
+  eperot:
+    name: Etienne Perot
+    email: eperot@google.com
+    url: https://perot.me
+  lucasmanning:
+    name: Lucas Manning
+    email: lucasmanning@google.com
+    url: https://twitter.com/lucassmanning
   jsprad:
     name: Jeremiah Spradlin
     email: jsprad@google.com

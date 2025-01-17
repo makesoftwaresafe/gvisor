@@ -64,7 +64,7 @@ func (fd *opathFD) Write(ctx context.Context, src usermem.IOSequence, opts Write
 }
 
 // Ioctl implements FileDescriptionImpl.Ioctl.
-func (fd *opathFD) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (fd *opathFD) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	return 0, linuxerr.EBADF
 }
 
@@ -136,4 +136,33 @@ func (fd *opathFD) StatFS(ctx context.Context) (linux.Statfs, error) {
 	statfs, err := fd.vfsfd.vd.mount.fs.impl.StatFSAt(ctx, rp)
 	rp.Release(ctx)
 	return statfs, err
+}
+
+func (vfs *VirtualFilesystem) openOPathFD(ctx context.Context, creds *auth.Credentials, pop *PathOperation, flags uint32) (*FileDescription, error) {
+	vd, err := vfs.GetDentryAt(ctx, creds, pop, &GetDentryOptions{})
+	if err != nil {
+		return nil, err
+	}
+	defer vd.DecRef(ctx)
+
+	if flags&linux.O_DIRECTORY != 0 {
+		stat, err := vfs.StatAt(ctx, creds, &PathOperation{
+			Root:  vd,
+			Start: vd,
+		}, &StatOptions{
+			Mask: linux.STATX_MODE,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if stat.Mode&linux.S_IFDIR == 0 {
+			return nil, linuxerr.ENOTDIR
+		}
+	}
+
+	fd := &opathFD{}
+	if err := fd.vfsfd.Init(fd, flags, vd.Mount(), vd.Dentry(), &FileDescriptionOptions{}); err != nil {
+		return nil, err
+	}
+	return &fd.vfsfd, err
 }

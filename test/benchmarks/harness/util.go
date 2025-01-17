@@ -17,7 +17,6 @@ package harness
 import (
 	"context"
 	"fmt"
-	"net"
 	"strings"
 	"testing"
 
@@ -29,16 +28,17 @@ import (
 
 //TODO(gvisor.dev/issue/3535): move to own package or move methods to harness struct.
 
-// WaitUntilServing grabs a container from `machine` and waits for a server at
-// IP:port.
-func WaitUntilServing(ctx context.Context, machine Machine, server net.IP, port int) error {
+// WaitUntilContainerServing grabs a container from `machine` and waits for a server on
+// the given container and port.
+func WaitUntilContainerServing(ctx context.Context, machine Machine, container *dockerutil.Container, port int) error {
 	var logger testutil.DefaultLogger = "util"
 	netcat := machine.GetNativeContainer(ctx, logger)
 	defer netcat.CleanUp(ctx)
 
-	cmd := fmt.Sprintf("while ! wget -q --spider http://%s:%d; do true; done", server, port)
+	cmd := fmt.Sprintf("while ! wget -q --spider http://%s:%d; do true; done", "server", port)
 	_, err := netcat.Run(ctx, dockerutil.RunOpts{
 		Image: "benchmarks/util",
+		Links: []string{container.MakeLink("server")},
 	}, "sh", "-c", cmd)
 	return err
 }
@@ -52,7 +52,7 @@ func DropCaches(machine Machine) error {
 }
 
 // DebugLog prints debug messages if the debug flag is set.
-func DebugLog(b *testing.B, msg string, args ...interface{}) {
+func DebugLog(b *testing.B, msg string, args ...any) {
 	b.Helper()
 	if *debug {
 		b.Logf(msg, args...)
@@ -69,13 +69,15 @@ const (
 	TmpFS FileSystemType = "tmpfs"
 	// RootFS indicates no mount should be created and the root mount should be used.
 	RootFS FileSystemType = "rootfs"
+	// FuseFS indicates a passthrough fuse server should be created.
+	FuseFS FileSystemType = "fusefs"
 )
 
 // MakeMount makes a mount and cleanup based on the requested type. Bind
 // and volume mounts are backed by a temp directory made with mktemp.
 // tmpfs mounts require no such backing and are just made.
-// rootfs mounts do not make a mount, but instead return a target direectory at root.
-// It is up to the caller to call Clean on the passed *cleanup.Cleanup
+// rootfs mounts do not make a mount, but instead return a target directory at
+// root. It is up to the caller to call Clean on the passed *cleanup.Cleanup.
 func MakeMount(machine Machine, fsType FileSystemType, cu *cleanup.Cleanup) ([]mount.Mount, string, error) {
 	mounts := make([]mount.Mount, 0, 1)
 	target := "/data"
@@ -106,6 +108,17 @@ func MakeMount(machine Machine, fsType FileSystemType, cu *cleanup.Cleanup) ([]m
 			Target: target,
 			Type:   mount.TypeTmpfs,
 		})
+		return mounts, target, nil
+	case FuseFS:
+		mounts = append(mounts,
+			mount.Mount{
+				Target: target,
+				Type:   mount.TypeTmpfs,
+			},
+			mount.Mount{
+				Target: "/fuse",
+				Type:   mount.TypeTmpfs,
+			})
 		return mounts, target, nil
 	default:
 		return mounts, "", fmt.Errorf("illegal mount type not supported: %v", fsType)

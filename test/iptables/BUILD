@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "iptables",
@@ -35,7 +38,18 @@ go_test(
         "manual",
     ],
     deps = [
+        "//pkg/log",
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
     ],
+)
+
+sh_test(
+    name = "nftables_test",
+    srcs = ["nftables_test.sh"],
+    tags = [
+        "local",
+        "manual",
+    ],
+    visibility = ["//:sandbox"],
 )

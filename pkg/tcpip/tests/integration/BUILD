@@ -1,12 +1,16 @@
 load("//tools:defs.bzl", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_test(
     name = "forward_test",
     size = "small",
     srcs = ["forward_test.go"],
     deps = [
+        "//pkg/buffer",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/header",
@@ -32,6 +36,7 @@ go_test(
         "//pkg/buffer",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
@@ -56,11 +61,14 @@ go_test(
     srcs = ["link_resolution_test.go"],
     deps = [
         "//pkg/buffer",
+        "//pkg/sync",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/faketime",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
+        "//pkg/tcpip/link/ethernet",
         "//pkg/tcpip/link/pipe",
         "//pkg/tcpip/network/arp",
         "//pkg/tcpip/network/ipv4",
@@ -109,6 +117,7 @@ go_test(
         "//pkg/buffer",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
+        "//pkg/tcpip/checksum",
         "//pkg/tcpip/header",
         "//pkg/tcpip/link/channel",
         "//pkg/tcpip/link/loopback",
@@ -119,6 +128,7 @@ go_test(
         "//pkg/tcpip/tests/utils",
         "//pkg/tcpip/testutil",
         "//pkg/tcpip/transport/icmp",
+        "//pkg/tcpip/transport/raw",
         "//pkg/tcpip/transport/udp",
         "//pkg/waiter",
         "@com_github_google_go_cmp//cmp:go_default_library",
@@ -175,7 +185,6 @@ go_test(
     srcs = ["multicast_forward_test.go"],
     deps = [
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/tcpip",
         "//pkg/tcpip/checker",
         "//pkg/tcpip/faketime",

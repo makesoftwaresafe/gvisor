@@ -90,7 +90,7 @@ func TestFUSECommunication(t *testing.T) {
 
 	for _, testCase := range testCases {
 		t.Run(testCase.Name, func(t *testing.T) {
-			conn, fd, err := newTestConnection(s, k, testCase.MaxActiveRequests)
+			conn, fd, err := newTestConnection(s, testCase.MaxActiveRequests)
 			if err != nil {
 				t.Fatalf("newTestConnection: %v", err)
 			}
@@ -139,8 +139,7 @@ func TestFUSECommunication(t *testing.T) {
 func TestReuseFd(t *testing.T) {
 	s := setup(t)
 	defer s.Destroy()
-	k := kernel.KernelFromContext(s.Ctx)
-	_, fd, err := newTestConnection(s, k, maxActiveRequestsDefault)
+	_, fd, err := newTestConnection(s, maxActiveRequestsDefault)
 	if err != nil {
 		t.Fatalf("newTestConnection: %v", err)
 	}
@@ -174,7 +173,7 @@ func CallTest(conn *connection, t *kernel.Task, r *Request, i uint32) (*Response
 		conn.fd.mu.Lock()
 	}
 
-	fut, err := conn.callFutureLocked(t, r) // No task given.
+	fut, err := conn.callFutureLocked(r) // No task given.
 	conn.fd.mu.Unlock()
 
 	if err != nil {
@@ -238,7 +237,7 @@ func fuseClientRun(t *testing.T, s *testutil.System, k *kernel.Kernel, conn *con
 		}
 	}()
 
-	tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 	clientTask, err := testutil.CreateTask(s.Ctx, fmt.Sprintf("fuse-client-%v", pid), tc, s.MntNs, s.Root, s.Root)
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +284,7 @@ func fuseServerRun(t *testing.T, s *testutil.System, k *kernel.Kernel, fd *vfs.F
 	}()
 
 	// Create the tasks that the server will be using.
-	tc := k.NewThreadGroup(nil, k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
+	tc := k.NewThreadGroup(k.RootPIDNamespace(), kernel.NewSignalHandlers(), linux.SIGCHLD, k.GlobalInit().Limits())
 
 	var readPayload primitive.Uint32
 	serverTask, err := testutil.CreateTask(s.Ctx, "fuse-server", tc, s.MntNs, s.Root, s.Root)
@@ -295,11 +294,10 @@ func fuseServerRun(t *testing.T, s *testutil.System, k *kernel.Kernel, fd *vfs.F
 
 	// Read the request.
 	for {
-		inHdrLen := uint32((*linux.FUSEHeaderIn)(nil).SizeBytes())
 		payloadLen := uint32(readPayload.SizeBytes())
 
-		// The raed buffer must meet some certain size criteria.
-		buffSize := inHdrLen + payloadLen
+		// The read buffer must meet some certain size criteria.
+		buffSize := linux.SizeOfFUSEHeaderIn + payloadLen
 		if buffSize < linux.FUSE_MIN_READ_BUFFER {
 			buffSize = linux.FUSE_MIN_READ_BUFFER
 		}
@@ -311,7 +309,7 @@ func fuseServerRun(t *testing.T, s *testutil.System, k *kernel.Kernel, fd *vfs.F
 			t.Fatalf("Read failed :%v", err)
 		}
 
-		// Server should shut down. No new requests are going to be made.
+		// The server should shut down. No new requests are going to be made.
 		if serverKilled {
 			break
 		}
@@ -329,17 +327,16 @@ func fuseServerRun(t *testing.T, s *testutil.System, k *kernel.Kernel, fd *vfs.F
 		}
 
 		// Write the response.
-		outHdrLen := uint32((*linux.FUSEHeaderOut)(nil).SizeBytes())
-		outBuf := make([]byte, outHdrLen+payloadLen)
+		outBuf := make([]byte, linux.SizeOfFUSEHeaderOut+payloadLen)
 		outHeader := linux.FUSEHeaderOut{
-			Len:    outHdrLen + payloadLen,
+			Len:    linux.SizeOfFUSEHeaderOut + payloadLen,
 			Error:  0,
 			Unique: readFUSEHeaderIn.Unique,
 		}
 
 		// Echo the payload back.
-		outHeader.MarshalUnsafe(outBuf[:outHdrLen])
-		readPayload.MarshalUnsafe(outBuf[outHdrLen:])
+		outHeader.MarshalUnsafe(outBuf[:linux.SizeOfFUSEHeaderOut])
+		readPayload.MarshalUnsafe(outBuf[linux.SizeOfFUSEHeaderOut:])
 		outIOseq := usermem.BytesIOSequence(outBuf)
 
 		_, err = fd.Write(s.Ctx, outIOseq, vfs.WriteOptions{})

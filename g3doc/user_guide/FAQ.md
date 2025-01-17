@@ -8,9 +8,8 @@ Today, gVisor requires Linux.
 
 ### What CPU architectures are supported? {#supported-cpus}
 
-gVisor currently supports [x86_64/AMD64](https://en.wikipedia.org/wiki/X86-64)
-compatible processors. Preliminary support is also available for
-[ARM64](https://en.wikipedia.org/wiki/ARM_architecture#AArch64).
+gVisor supports [x86_64/AMD64](https://en.wikipedia.org/wiki/X86-64) and
+[ARM64](https://en.wikipedia.org/wiki/ARM_architecture#AArch64) processors.
 
 ### Do I need to modify my Linux application to use gVisor? {#modify-app}
 
@@ -34,6 +33,10 @@ Yes. Please see the [Docker Quick Start][docker].
 
 Yes. Please see the [Kubernetes Quick Start][k8s].
 
+### How do I integrate gVisor in my existing production stack? {#productionize}
+
+See the [Production guide].
+
 ### What's the security model? {#security-model}
 
 See the [Security Model][security-model].
@@ -56,7 +59,7 @@ This is tracked in [bug #268](https://gvisor.dev/issue/268).
 
 You're using an old version of Docker. See [Docker Quick Start][docker].
 
-### I can’t see a file copied with: `docker cp` {#fs-cache}
+### I can't see a file copied with: `docker cp` {#fs-cache}
 
 For performance reasons, gVisor caches directory contents, and therefore it may
 not realize a new file was copied to a given directory. To invalidate the cache
@@ -143,10 +146,43 @@ This error may happen when using `gvisor-containerd-shim` with a `containerd`
 that does not contain the fix for [CVE-2020-15257]. The resolve the issue,
 update containerd to 1.3.9 or 1.4.3 (or newer versions respectively).
 
+### I'm getting an error like `SELinux is not supported: system_u:system_r:container_t:s0:...`
+
+This error may happen in systems where SELinux is enabled. You can check this is
+the case with the `sestatus` command:
+
+```
+$ sudo sestatus
+SELinux status:                 enabled
+[...]
+```
+
+Since gVisor does not support setting SELinux labels, you can disable SELinux
+specifically for the new container by passing the `--security-opt label=disable`
+argument during its creation.
+
+### I'm getting an error like `error remounting chroot in read-only: permission denied` {#selinux-nested}
+
+This error may happen when gVisor is running **within** a container, in a system
+with SELinux in **enforcing** mode. To ensure this is the case, check your
+system's audit logs (e.g., `journalctl`) for SELinux denials like the following:
+
+```
+AVC avc: denied { mounton  } for ... scontext=... tcontext=... permissive=0
+```
+
+To resolve this issue, label the **outer** container with the
+`container_engine_t` SELinux label, by passing the `--security-opt
+label=type:container_engine_t` argument during its creation.
+
+This SELinux label is reserved for running a container engine (here gVisor)
+within another container (e.g., Docker or Podman).
+
 [security-model]: /docs/architecture_guide/security/
 [host-net]: /docs/user_guide/networking/#network-passthrough
 [debugging]: /docs/user_guide/debugging/
 [filesystem]: /docs/user_guide/filesystem/
 [docker]: /docs/user_guide/quick_start/docker/
 [k8s]: /docs/user_guide/quick_start/kubernetes/
+[Production guide]: /docs/user_guide/production/
 [CVE-2020-15257]: https://github.com/containerd/containerd/security/advisories/GHSA-36xw-fx78-c5r4

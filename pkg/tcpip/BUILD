@@ -2,7 +2,10 @@ load("//tools:defs.bzl", "go_library", "go_test")
 load("//tools:deps.bzl", "deps_test")
 load("//tools/go_generics:defs.bzl", "go_template_instance")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_template_instance(
     name = "sock_err_list",
@@ -16,10 +19,24 @@ go_template_instance(
     },
 )
 
+go_template_instance(
+    name = "route_list",
+    out = "route_list.go",
+    package = "tcpip",
+    prefix = "Route",
+    template = "//pkg/ilist:generic_list",
+    types = {
+        "Element": "*Route",
+        "Linker": "*Route",
+    },
+)
+
 go_library(
     name = "tcpip",
     srcs = [
         "errors.go",
+        "errors_linux.go",
+        "route_list.go",
         "sock_err_list.go",
         "socketops.go",
         "stdclock.go",
@@ -31,8 +48,11 @@ go_library(
     visibility = ["//visibility:public"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/buffer",
+        "//pkg/rand",
         "//pkg/sync",
         "//pkg/waiter",
+        "@org_golang_x_sys//unix:go_default_library",
     ],
 )
 
@@ -47,6 +67,7 @@ deps_test(
     allowed = [
         # gVisor deps.
         "//pkg/atomicbitops",
+        "//pkg/bits",
         "//pkg/context",
         "//pkg/buffer",
         "//pkg/cpuid",
@@ -55,17 +76,21 @@ deps_test(
         "//pkg/ilist",
         "//pkg/linewriter",
         "//pkg/log",
+        "//pkg/pool",
         "//pkg/rand",
+        "//pkg/rawfile",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/sleep",
         "//pkg/state",
         "//pkg/state/wire",
         "//pkg/sync",
+        "//pkg/sync/locking",
         "//pkg/waiter",
+        "//pkg/xdp",
 
         # Other deps.
         "@com_github_google_btree//:go_default_library",
+        "@org_golang_x_sys//cpu:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",
         "@org_golang_x_time//rate:go_default_library",
     ],
@@ -96,9 +121,15 @@ deps_test(
 go_test(
     name = "tcpip_test",
     size = "small",
-    srcs = ["tcpip_test.go"],
+    srcs = [
+        "errors_test.go",
+        "tcpip_test.go",
+    ],
     library = ":tcpip",
-    deps = ["@com_github_google_go_cmp//cmp:go_default_library"],
+    deps = [
+        "@com_github_google_go_cmp//cmp:go_default_library",
+        "@org_golang_x_sys//unix:go_default_library",
+    ],
 )
 
 go_test(

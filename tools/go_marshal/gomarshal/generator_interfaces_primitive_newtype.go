@@ -86,7 +86,7 @@ func (g *interfaceGenerator) validatePrimitiveNewtype(t *ast.Ident) {
 	case "string":
 		g.abortAt(t.Pos(), "Type 'string' is dynamically-sized and cannot be marshalled, use a fixed size byte array '[...]byte' instead")
 	default:
-		debugfAt(g.f.Position(t.Pos()), fmt.Sprintf("Found derived type '%s', will attempt dispatch via marshal.Marshallable.\n", t.Name))
+		debugfAt(g.f.Position(t.Pos()), "%s", fmt.Sprintf("Found derived type '%s', will attempt dispatch via marshal.Marshallable.\n", t.Name))
 	}
 }
 
@@ -184,14 +184,21 @@ func (g *interfaceGenerator) emitMarshallableForPrimitiveNewtype(nt *ast.Ident) 
 	})
 	g.emit("}\n\n")
 
-	g.emit("// CopyIn implements marshal.Marshallable.CopyIn.\n")
-	g.emit("func (%s *%s) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {\n", g.r, g.typeName())
+	g.emit("// CopyInN implements marshal.Marshallable.CopyInN.\n")
+	g.emit("func (%s *%s) CopyInN(cc marshal.CopyContext, addr hostarch.Addr, limit int) (int, error) {\n", g.r, g.typeName())
 	g.inIndent(func() {
 		g.emitCastToByteSlice(g.r, "buf", fmt.Sprintf("%s.SizeBytes()", g.r))
 
-		g.emit("length, err := cc.CopyInBytes(addr, buf) // escapes: okay.\n")
+		g.emit("length, err := cc.CopyInBytes(addr, buf[:limit]) // escapes: okay.\n")
 		g.emitKeepAlive(g.r)
 		g.emit("return length, err\n")
+	})
+	g.emit("}\n\n")
+
+	g.emit("// CopyIn implements marshal.Marshallable.CopyIn.\n")
+	g.emit("func (%s *%s) CopyIn(cc marshal.CopyContext, addr hostarch.Addr) (int, error) {\n", g.r, g.typeName())
+	g.inIndent(func() {
+		g.emit("return %s.CopyInN(cc, addr, %s.SizeBytes())\n", g.r, g.r)
 	})
 	g.emit("}\n\n")
 

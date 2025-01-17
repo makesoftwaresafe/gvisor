@@ -1,6 +1,7 @@
 load("//tools:defs.bzl", "go_library")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//visibility:public"],
     licenses = ["notice"],
 )
@@ -13,8 +14,8 @@ go_library(
         "//pkg/abi/linux",
         "//pkg/context",
         "//pkg/lisafs",
+        "//pkg/rand",
         "//pkg/refs",
-        "//pkg/refsvfs2",
         "//pkg/unet",
         "@com_github_syndtr_gocapability//capability:go_default_library",
         "@org_golang_x_sys//unix:go_default_library",

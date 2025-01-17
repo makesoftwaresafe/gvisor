@@ -1,13 +1,11 @@
 """Go rules."""
 
 load("@bazel_gazelle//:def.bzl", _gazelle = "gazelle")
-load("@io_bazel_rules_go//go:def.bzl", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_embed_data = "go_embed_data", _go_library = "go_library", _go_path = "go_path", _go_test = "go_test")
+load("@io_bazel_rules_go//go:def.bzl", "GoLibrary", _go_binary = "go_binary", _go_context = "go_context", _go_library = "go_library", _go_path = "go_path", _go_test = "go_test")
 load("@io_bazel_rules_go//proto:def.bzl", _go_grpc_library = "go_grpc_library", _go_proto_library = "go_proto_library")
 load("//tools/bazeldefs:defs.bzl", "select_arch", "select_system")
 
 gazelle = _gazelle
-
-go_embed_data = _go_embed_data
 
 go_path = _go_path
 
@@ -17,13 +15,18 @@ def _go_proto_or_grpc_library(go_library_func, name, **kwargs):
         go_library_func(name = name, **kwargs)
         return
     deps = []
+    com_google_protobuf = "@com_google_protobuf//"
+    org_golang_google_protobuf = "@org_golang_google_protobuf//"
     for d in (kwargs.pop("deps", []) or []):
-        if d == "@com_google_protobuf//:timestamp_proto":
-            # Special case: this proto has its Go definitions in a different
-            # repository.
-            deps.append("@org_golang_google_protobuf//" +
-                        "types/known/timestamppb")
+        # Special cases: these protos have their Go definitions in a different
+        # repository.
+        if d == com_google_protobuf + ":timestamp_proto":
+            deps.append(org_golang_google_protobuf + "types/known/timestamppb")
             continue
+        if d == com_google_protobuf + ":any_proto":
+            deps.append(org_golang_google_protobuf + "types/known/anypb")
+            continue
+
         if "//" in d:
             repo, path = d.split("//", 1)
             deps.append(repo + "//" + path.replace("_proto", "_go_proto"))
@@ -43,7 +46,7 @@ def go_proto_library(name, **kwargs):
 def go_grpc_and_proto_libraries(name, **kwargs):
     _go_proto_or_grpc_library(_go_grpc_library, name, **kwargs)
 
-def go_binary(name, static = False, pure = False, x_defs = None, system_malloc = False, **kwargs):
+def go_binary(name, static = False, pure = False, x_defs = None, **kwargs):
     """Build a go binary.
 
     Args:
@@ -59,7 +62,11 @@ def go_binary(name, static = False, pure = False, x_defs = None, system_malloc =
         kwargs["pure"] = "on"
     gc_goopts = select({
         "//conditions:default": kwargs.pop("gc_goopts", []),
-        "//tools:debug": kwargs.pop("gc_goopts", []) + ["-all=-N -l"],
+        "//tools:debug": kwargs.pop("gc_goopts", []) + ["-N", "-l"],
+    })
+    kwargs["gotags"] = select({
+        "//conditions:default": kwargs.pop("gotags", []),
+        "//tools:debug": kwargs.pop("gotags", []) + ["debug"],
     })
     _go_binary(
         name = name,
@@ -72,24 +79,41 @@ def go_importpath(target):
     """Returns the importpath for the target."""
     return target[GoLibrary].importpath
 
-def go_library(name, arch_deps = [], **kwargs):
+def go_library(name, bazel_cgo = False, bazel_cdeps = [], bazel_clinkopts = [], bazel_copts = [], **kwargs):
+    """Wrapper for `go_library` rule.
+
+    Args:
+        name: name of the target.
+        bazel_cgo: if True, build with cgo.
+        cgo_cdeps: cgo deps to pass to `go_library`.
+        cgo_clinkopts: cgo linkopts to pass to `go_library`.
+        cgo_copts: cgo opts to pass to `go_library`.
+        **kwargs: rest of the arguments are passed to `go_library`.
+    """
     _go_library(
         name = name,
+        cgo = bazel_cgo,
+        cdeps = bazel_cdeps,
+        copts = bazel_copts,
+        clinkopts = bazel_clinkopts,
         importpath = "gvisor.dev/gvisor/" + native.package_name(),
         **kwargs
     )
 
-def go_test(name, pure = False, library = None, **kwargs):
+def go_test(name, static = False, pure = False, library = None, **kwargs):
     """Build a go test.
 
     Args:
         name: name of the output binary.
+        static: build a static binary.
         pure: should it be built without cgo.
         library: the library to embed.
         **kwargs: rest of the arguments to pass to _go_test.
     """
     if pure:
         kwargs["pure"] = "on"
+    if static:
+        kwargs["static"] = "on"
     if library:
         kwargs["embed"] = [library]
     _go_test(
@@ -140,8 +164,10 @@ def go_context(ctx, goos = None, goarch = None, std = False):
         goos = go_ctx.sdk.goos
     if goarch == None:
         goarch = go_ctx.sdk.goarch
+    env = go_ctx.env
+    env["CGO_ENABLED"] = "0"
     return struct(
-        env = go_ctx.env,
+        env = env,
         go = go_ctx.go,
         goarch = goarch,
         goos = goos,

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "proto_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "arch",
@@ -33,6 +36,7 @@ go_library(
         "//pkg/log",
         "//pkg/marshal",
         "//pkg/marshal/primitive",
+        "//pkg/rand",
         "//pkg/sentry/arch/fpu",
         "//pkg/sentry/limits",
         "//pkg/usermem",

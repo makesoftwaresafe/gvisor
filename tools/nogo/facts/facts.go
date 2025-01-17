@@ -38,7 +38,7 @@ type Serializer interface {
 // item is used for serialiation.
 type item struct {
 	Key   string
-	Value interface{}
+	Value any
 }
 
 // writeItems is an implementation of Serialize.
@@ -230,6 +230,13 @@ func (b *Bundle) Package(pkg *types.Package) (*Package, error) {
 		return facts, nil
 	}
 
+	if b.reader == nil {
+		// Nothing available.
+		//
+		// N.B. some bundles contain only cached packages.
+		return nil, nil
+	}
+
 	// Find based on the reader.
 	for _, f := range b.reader.File {
 		if f.Name != pkg.Path() {
@@ -253,124 +260,7 @@ func (b *Bundle) Package(pkg *types.Package) (*Package, error) {
 	}
 
 	// Nothing available.
-	return nil, nil
-}
-
-// Resolved is a human-readable fact format.
-type Resolved map[string]interface{}
-
-// addRecursively adds a entry to a map recursively.
-//
-// Precondition: len(names) > 0.
-func (r Resolved) addRecursively(names []string, value interface{}) {
-	start := r
-	for i := 0; i < len(names)-1; i++ {
-		m, ok := start[names[i]]
-		if !ok {
-			m = make(Resolved)
-			start[names[i]] = m
-		} else {
-			// This may have been used by a conflicting fact. This
-			// should be rare, but we ensure that the proper name
-			// itself is used in the scope instead of the fact.
-			if _, ok = m.(Resolved); !ok {
-				m = make(Resolved)
-				start[names[i]] = m
-			}
-		}
-		start = m.(Resolved)
-	}
-	if _, ok := start[names[len(names)-1]]; ok {
-		// Skip, already exists. See above.
-		return
-	}
-	start[names[len(names)-1]] = value
-}
-
-// addObject adds the object with the given name.
-func (r Resolved) addObject(names []string, obj types.Object, facts *Package, allFactNames map[reflect.Type]string) {
-	for _, fact := range facts.Objects[obj] {
-		v := reflect.ValueOf(fact)
-		typeName, ok := allFactNames[v.Type()]
-		if !ok {
-			continue
-		}
-		for v.Kind() == reflect.Ptr {
-			v = v.Elem()
-		}
-		r.addRecursively(append(names, typeName), v.Interface())
-	}
-}
-
-// walkObject resolves all objects recursively.
-//
-// Parent should be empty or end with a period.
-func (r Resolved) walkObject(parents []string, obj types.Object, facts *Package, allFactNames map[reflect.Type]string) {
-	switch x := obj.(type) {
-	case *types.TypeName:
-		s := append(parents, x.Name())
-		r.addObject(s, obj, facts, allFactNames)
-		// Skip if just an alias, or if not underlying type.
-		if x.IsAlias() || x.Type() == nil || x.Type().Underlying() == nil {
-			break
-		}
-		// Recurse to fields if this is a definition.
-		if structType, ok := x.Type().Underlying().(*types.Struct); ok {
-			for i := 0; i < structType.NumFields(); i++ {
-				r.walkObject(s, structType.Field(i), facts, allFactNames)
-			}
-		}
-	case *types.Func:
-		// Skip if no underlying type.
-		if x.Type() == nil {
-			break
-		}
-		// Recurse to all parameters.
-		sig := x.Type().(*types.Signature)
-		s := parents
-		if recv := sig.Recv(); recv != nil {
-			s = append(s, recv.Type().String())
-		}
-		s = append(s, x.Name())
-		r.addObject(s, obj, facts, allFactNames)
-		if params := sig.Params(); params != nil {
-			for i := 0; i < params.Len(); i++ {
-				r.walkObject(s, params.At(i), facts, allFactNames)
-			}
-		}
-		if results := sig.Results(); results != nil {
-			for i := 0; i < results.Len(); i++ {
-				r.walkObject(s, results.At(i), facts, allFactNames)
-			}
-		}
-	default:
-		r.addObject(append(parents, obj.Name()), obj, facts, allFactNames)
-	}
-}
-
-// walkScope recursively resolves a scope.
-func (r Resolved) walkScope(parents []string, scope *types.Scope, facts *Package, allFactNames map[reflect.Type]string) {
-	for _, name := range scope.Names() {
-		r.walkObject(parents, scope.Lookup(name), facts, allFactNames)
-	}
-}
-
-// Resolve resolves all object facts.
-func Resolve(pkg *types.Package, localFacts *Package, allFacts *Bundle, allFactNames map[reflect.Type]string) (Resolved, error) {
-	// Populate the tree. Allocating this slice up front prevents
-	// allocation during name resolution. We allow for up to 64 names
-	// without allocating a new backing array.
-	r := make(Resolved)
-	names := make([]string, 0, 64)
-	r.walkScope(names, pkg.Scope(), localFacts, allFactNames)
-	for _, importPkg := range pkg.Imports() {
-		importFacts, err := allFacts.Package(importPkg)
-		if err != nil {
-			return nil, err
-		}
-		r.walkScope(append(names, "import", importPkg.Name()), importPkg.Scope(), importFacts, allFactNames)
-	}
-	return r, nil
+	return nil, fmt.Errorf("no facts available for package %q", pkg.Path())
 }
 
 func init() {

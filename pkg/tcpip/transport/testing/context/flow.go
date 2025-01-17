@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"testing"
 
+	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/checker"
+	"gvisor.dev/gvisor/pkg/tcpip/checksum"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
@@ -34,46 +36,48 @@ const (
 
 	// TestPort is the port TestFlow uses with TestAddr.
 	TestPort = 4096
+)
 
-	// StackAddr is the IPv4 address assigned to the stack's NIC and is used by
-	// TestFlow as the local address.
-	StackAddr = "\x0a\x00\x00\x01"
-
-	// StackV4MappedAddr is the IPv4-mapped IPv6 StackAddr.
-	StackV4MappedAddr = v4MappedAddrPrefix + StackAddr
-
-	// TestAddr is the IPv4 address used by TestFlow as the remote address.
-	TestAddr = "\x0a\x00\x00\x02"
-
-	// TestV4MappedAddr is the IPv4-mapped IPv6 TestAddr.
-	TestV4MappedAddr = v4MappedAddrPrefix + TestAddr
-
-	// MulticastAddr is the IPv4 multicast address used by IPv4 multicast
-	// TestFlow.
-	MulticastAddr = "\xe8\x2b\xd3\xea"
-
-	// MulticastV4MappedAddr is the IPv4-mapped IPv6 MulticastAddr.
-	MulticastV4MappedAddr = v4MappedAddrPrefix + MulticastAddr
-
+var (
 	// BroadcastAddr is the IPv4 broadcast address.
 	BroadcastAddr = header.IPv4Broadcast
 
+	// StackAddr is the IPv4 address assigned to the stack's NIC and is used by
+	// TestFlow as the local address.
+	StackAddr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x01"))
+
+	// StackV4MappedAddr is the IPv4-mapped IPv6 StackAddr.
+	StackV4MappedAddr = tcpip.AddrFromSlice(append([]byte(v4MappedAddrPrefix), StackAddr.AsSlice()...))
+
+	// TestAddr is the IPv4 address used by TestFlow as the remote address.
+	TestAddr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x02"))
+
+	// TestV4MappedAddr is the IPv4-mapped IPv6 TestAddr.
+	TestV4MappedAddr = tcpip.AddrFromSlice(append([]byte(v4MappedAddrPrefix), TestAddr.AsSlice()...))
+
+	// MulticastAddr is the IPv4 multicast address used by IPv4 multicast
+	// TestFlow.
+	MulticastAddr = tcpip.AddrFromSlice([]byte("\xe8\x2b\xd3\xea"))
+
+	// MulticastV4MappedAddr is the IPv4-mapped IPv6 MulticastAddr.
+	MulticastV4MappedAddr = tcpip.AddrFromSlice(append([]byte(v4MappedAddrPrefix), MulticastAddr.AsSlice()...))
+
 	// BroadcastV4MappedAddr is the IPv4-mapped IPv6 BroadcastAddr.
-	BroadcastV4MappedAddr = v4MappedAddrPrefix + BroadcastAddr
+	BroadcastV4MappedAddr = tcpip.AddrFromSlice(append([]byte(v4MappedAddrPrefix), BroadcastAddr.AsSlice()...))
 
 	// V4MappedWildcardAddr is the IPv4-mapped IPv6 wildcard (any) address.
-	V4MappedWildcardAddr = v4MappedAddrPrefix + "\x00\x00\x00\x00"
+	V4MappedWildcardAddr = tcpip.AddrFromSlice([]byte(v4MappedAddrPrefix + "\x00\x00\x00\x00"))
 
 	// StackV6Addr is the IPv6 address assigned to the stack's NIC and is used by
 	// TestFlow as the local address.
-	StackV6Addr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
+	StackV6Addr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"))
 
 	// TestV6Addr is the IPv6 address used by TestFlow as the remote address.
-	TestV6Addr = "\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"
+	TestV6Addr = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02"))
 
 	// MulticastV6Addr is the IPv6 multicast address used by IPv6 multicast
 	// TestFlow.
-	MulticastV6Addr = "\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+	MulticastV6Addr = tcpip.AddrFromSlice([]byte("\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"))
 )
 
 // Header4Tuple stores the 4-tuple {src-IP, src-port, dst-IP, dst-port} used in
@@ -244,7 +248,7 @@ func (flow TestFlow) GetMulticastAddr() tcpip.Address {
 // version if it is applicable to the TestFlow.
 func (flow TestFlow) MapAddrIfApplicable(v4Addr tcpip.Address) tcpip.Address {
 	if flow.isMapped() {
-		return v4MappedAddrPrefix + v4Addr
+		return tcpip.AddrFromSlice(append([]byte(v4MappedAddrPrefix), v4Addr.AsSlice()...))
 	}
 	return v4Addr
 }
@@ -271,7 +275,7 @@ func (flow TestFlow) SockProto() tcpip.NetworkProtocolNumber {
 }
 
 // CheckerFn returns the correct network checker for the current TestFlow.
-func (flow TestFlow) CheckerFn() func(*testing.T, []byte, ...checker.NetworkChecker) {
+func (flow TestFlow) CheckerFn() func(*testing.T, *buffer.View, ...checker.NetworkChecker) {
 	if flow.IsV4() {
 		return checker.IPv4
 	}
@@ -371,7 +375,7 @@ func BuildV4UDPPacket(payload []byte, h Header4Tuple, tos, ttl uint8, badChecksu
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, h.Src.Addr, h.Dst.Addr, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	if badChecksum {
@@ -418,7 +422,7 @@ func BuildV6UDPPacket(payload []byte, h Header4Tuple, tclass, hoplimit uint8, ba
 	xsum := header.PseudoHeaderChecksum(udp.ProtocolNumber, h.Src.Addr, h.Dst.Addr, uint16(len(u)))
 
 	// Calculate the UDP checksum and set it.
-	xsum = header.Checksum(payload, xsum)
+	xsum = checksum.Checksum(payload, xsum)
 	u.SetChecksum(^u.CalculateChecksum(xsum))
 
 	if badChecksum {

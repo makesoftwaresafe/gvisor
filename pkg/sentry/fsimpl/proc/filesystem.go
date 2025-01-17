@@ -54,6 +54,15 @@ type filesystem struct {
 	devMinor uint32
 }
 
+func (fs *filesystem) StatFSAt(ctx context.Context, rp *vfs.ResolvingPath) (linux.Statfs, error) {
+	d, err := fs.GetDentryAt(ctx, rp, vfs.GetDentryOptions{})
+	if err != nil {
+		return linux.Statfs{}, err
+	}
+	d.DecRef(ctx)
+	return vfs.GenericStatFS(linux.PROC_SUPER_MAGIC), nil
+}
+
 // GetFilesystem implements vfs.FilesystemType.GetFilesystem.
 func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualFilesystem, creds *auth.Credentials, source string, opts vfs.GetFilesystemOptions) (*vfs.Filesystem, *vfs.Dentry, error) {
 	k := kernel.KernelFromContext(ctx)
@@ -86,13 +95,14 @@ func (ft FilesystemType) GetFilesystem(ctx context.Context, vfsObj *vfs.VirtualF
 	procfs.MaxCachedDentries = maxCachedDentries
 	procfs.VFSFilesystem().Init(vfsObj, &ft, procfs)
 
-	var fakeCgroupControllers map[string]string
-	if opts.InternalData != nil {
-		data := opts.InternalData.(*InternalData)
-		fakeCgroupControllers = data.Cgroups
+	var internalData *InternalData
+	if opts.InternalData == nil {
+		internalData = &InternalData{}
+	} else {
+		internalData = opts.InternalData.(*InternalData)
 	}
 
-	inode := procfs.newTasksInode(ctx, k, pidns, fakeCgroupControllers)
+	inode := procfs.newTasksInode(ctx, k, pidns, internalData)
 	var dentry kernfs.Dentry
 	dentry.InitRoot(&procfs.Filesystem, inode)
 	return procfs.VFSFilesystem(), dentry.VFSDentry(), nil
@@ -148,6 +158,7 @@ func (fs *filesystem) newStaticDir(ctx context.Context, creds *auth.Credentials,
 //
 // +stateify savable
 type InternalData struct {
+	ExtraInternalData
 	Cgroups map[string]string
 }
 

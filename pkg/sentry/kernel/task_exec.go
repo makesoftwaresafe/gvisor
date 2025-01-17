@@ -66,9 +66,8 @@ package kernel
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
-	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/sentry/seccheck"
 	pb "gvisor.dev/gvisor/pkg/sentry/seccheck/points/points_go_proto"
@@ -93,14 +92,17 @@ func (*execStop) Killable() bool { return true }
 //
 // Preconditions: The caller must be running Task.doSyscallInvoke on the task
 // goroutine.
-func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbridge.File, pathname string) (*SyscallControl, error) {
+func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable *vfs.FileDescription, pathname string) (*SyscallControl, error) {
+	cu := cleanup.Make(func() {
+		newImage.release(t)
+	})
+	defer cu.Clean()
 	// We can't clearly hold kernel package locks while stat'ing executable.
 	if seccheck.Global.Enabled(seccheck.PointExecve) {
 		mask, info := getExecveSeccheckInfo(t, argv, env, executable, pathname)
-		if err := seccheck.Global.SendToCheckers(func(c seccheck.Checker) error {
+		if err := seccheck.Global.SentToSinks(func(c seccheck.Sink) error {
 			return c.Execve(t, mask, info)
 		}); err != nil {
-			newImage.release()
 			return nil, err
 		}
 	}
@@ -113,7 +115,6 @@ func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbrid
 	if t.tg.exiting || t.tg.execing != nil {
 		// We lost to a racing group-exit, kill, or exec from another thread
 		// and should just exit.
-		newImage.release()
 		return nil, linuxerr.EINTR
 	}
 
@@ -135,6 +136,7 @@ func (t *Task) Execve(newImage *TaskImage, argv, env []string, executable fsbrid
 		t.beginInternalStopLocked((*execStop)(nil))
 	}
 
+	cu.Release()
 	return &SyscallControl{next: &runSyscallAfterExecStop{newImage}, ignoreReturn: true}, nil
 }
 
@@ -152,7 +154,7 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	t.tg.execing = nil
 	if t.killed() {
 		t.tg.pidns.owner.mu.Unlock()
-		r.image.release()
+		r.image.release(t)
 		return (*runInterrupt)(nil)
 	}
 	// We are the thread group leader now. Save our old thread ID for
@@ -168,12 +170,13 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	// we're about to change. Note that we have to stop and destroy timers
 	// without holding any mutexes to avoid circular lock ordering.
 	var its []*IntervalTimer
-	t.tg.signalHandlers.mu.Lock()
+	oldSignalHandlers := t.tg.signalHandlers
+	oldSignalHandlers.mu.Lock()
 	for _, it := range t.tg.timers {
 		its = append(its, it)
 	}
-	t.tg.timers = make(map[linux.TimerID]*IntervalTimer)
-	t.tg.signalHandlers.mu.Unlock()
+	clear(t.tg.timers)
+	oldSignalHandlers.mu.Unlock()
 	t.tg.pidns.owner.mu.Unlock()
 	for _, it := range its {
 		it.DestroyTimer()
@@ -194,8 +197,10 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	//	- "Disposition" only means sigaction::sa_handler/sa_sigaction; flags,
 	//		restorer (if present), and mask are always reset. (See Linux's
 	//		fs/exec.c:setup_new_exec => kernel/signal.c:flush_signal_handlers.)
-	t.tg.signalHandlers = t.tg.signalHandlers.CopyForExec()
+	oldSignalHandlers.mu.Lock() // to ensure ThreadGroup.signalLock()'s correctness
+	t.tg.setSignalHandlersLocked(oldSignalHandlers.copyForExecLocked())
 	t.endStopCond.L = &t.tg.signalHandlers.mu
+	oldSignalHandlers.mu.Unlock()
 	// "Any alternate signal stack is not preserved (sigaltstack(2))." - execve(2)
 	t.signalStack = linux.SignalStack{Flags: linux.SS_DISABLE}
 	// "The termination signal is reset to SIGCHLD (see clone(2))."
@@ -220,7 +225,7 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	oldFDTable.DecRef(t)
 
 	// Remove FDs with the CloseOnExec flag set.
-	t.fdTable.RemoveIf(t, func(_ *fs.File, _ *vfs.FileDescription, flags FDFlags) bool {
+	t.fdTable.RemoveIf(t, func(_ *vfs.FileDescription, flags FDFlags) bool {
 		return flags.CloseOnExec
 	})
 
@@ -246,7 +251,7 @@ func (r *runSyscallAfterExecStop) execute(t *Task) taskRunState {
 	// Don't hold t.mu while calling t.image.release(), that may
 	// attempt to acquire TaskImage.MemoryManager.mappingMu, a lock order
 	// violation.
-	oldImage.release()
+	oldImage.release(t)
 
 	t.unstopVforkParent()
 	t.p.FullStateChanged()
@@ -304,7 +309,7 @@ func (t *Task) promoteLocked() {
 	oldLeader.exitNotifyLocked(false)
 }
 
-func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
+func getExecveSeccheckInfo(t *Task, argv, env []string, executable *vfs.FileDescription, pathname string) (seccheck.FieldSet, *pb.ExecveInfo) {
 	fields := seccheck.Global.GetFieldSet(seccheck.PointExecve)
 	info := &pb.ExecveInfo{
 		Argv: argv,
@@ -312,25 +317,21 @@ func getExecveSeccheckInfo(t *Task, argv, env []string, executable fsbridge.File
 	}
 	if executable != nil {
 		info.BinaryPath = pathname
-		if vfs2bridgeFile, ok := executable.(*fsbridge.VFSFile); ok {
-			if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
-				statOpts := vfs.StatOptions{
-					Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+		if fields.Local.Contains(seccheck.FieldSentryExecveBinaryInfo) {
+			statOpts := vfs.StatOptions{
+				Mask: linux.STATX_TYPE | linux.STATX_MODE | linux.STATX_UID | linux.STATX_GID,
+			}
+			if stat, err := executable.Stat(t, statOpts); err == nil {
+				if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
+					info.BinaryMode = uint32(stat.Mode)
 				}
-				if stat, err := vfs2bridgeFile.FileDescription().Stat(t, statOpts); err == nil {
-					if stat.Mask&(linux.STATX_TYPE|linux.STATX_MODE) == (linux.STATX_TYPE | linux.STATX_MODE) {
-						info.BinaryMode = uint32(stat.Mode)
-					}
-					if stat.Mask&linux.STATX_UID != 0 {
-						info.BinaryUid = stat.UID
-					}
-					if stat.Mask&linux.STATX_GID != 0 {
-						info.BinaryGid = stat.GID
-					}
+				if stat.Mask&linux.STATX_UID != 0 {
+					info.BinaryUid = stat.UID
+				}
+				if stat.Mask&linux.STATX_GID != 0 {
+					info.BinaryGid = stat.GID
 				}
 			}
-			// TODO(b/202293325): Decide if we actually want to offer binary
-			// SHA256, which is very expensive.
 		}
 	}
 

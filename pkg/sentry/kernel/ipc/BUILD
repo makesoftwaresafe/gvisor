@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "ipc",
@@ -15,7 +18,7 @@ go_library(
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/log",
-        "//pkg/sentry/fs",
         "//pkg/sentry/kernel/auth",
+        "//pkg/sentry/vfs",
     ],
 )

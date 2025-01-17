@@ -40,15 +40,14 @@ func (*metadata) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*metadata) Usage() string {
-	return `metadata - list all trace points configuration information
-`
+	return "metadata - list all trace points configuration information\n"
 }
 
 // SetFlags implements subcommands.Command.
 func (*metadata) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (l *metadata) Execute(context.Context, *flag.FlagSet, ...interface{}) subcommands.ExitStatus {
+func (l *metadata) Execute(context.Context, *flag.FlagSet, ...any) subcommands.ExitStatus {
 	// Sort to keep related points together.
 	points := make([]seccheck.PointDesc, 0, len(seccheck.Points))
 	for _, pt := range seccheck.Points {
@@ -64,6 +63,11 @@ func (l *metadata) Execute(context.Context, *flag.FlagSet, ...interface{}) subco
 		ctxFields := fieldNames(pt.ContextFields)
 		fmt.Printf("Name: %s, optional fields: [%s], context fields: [%s]\n", pt.Name, strings.Join(optFields, "|"), strings.Join(ctxFields, "|"))
 	}
+	fmt.Printf("\nSINKS (%d)\n", len(seccheck.Sinks))
+	for _, sink := range seccheck.Sinks {
+		fmt.Printf("Name: %s\n", sink.Name)
+	}
+
 	return subcommands.ExitSuccess
 }
 

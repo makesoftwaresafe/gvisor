@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "gtest/gtest.h"
 #include "absl/strings/string_view.h"
 #include "test/util/file_descriptor.h"
 #include "test/util/posix_error.h"
@@ -30,7 +31,7 @@ namespace testing {
 
 // O_LARGEFILE as defined by Linux. glibc tries to be clever by setting it to 0
 // because "it isn't needed", even though Linux can return it via F_GETFL.
-#if defined(__x86_64__)
+#if defined(__x86_64__) || defined(__riscv)
 constexpr int kOLargeFile = 00100000;
 #elif defined(__aarch64__)
 constexpr int kOLargeFile = 00400000;
@@ -219,7 +220,7 @@ std::string JoinPathImpl(std::initializer_list<absl::string_view> paths);
 //
 // Usage:
 // std::string path = JoinPath("/foo", dirname, filename);
-// std::string path = JoinPath(FLAGS_test_srcdir, filename);
+// std::string path = JoinPath(::testing::SrcDir(), filename);
 //
 // 0, 1, 2-path specializations exist to optimize common cases.
 inline std::string JoinPath() { return std::string(); }

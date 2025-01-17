@@ -209,10 +209,10 @@ func entryTestSetup(c NUDConfigurations) (*neighborEntry, *testNUDDispatcher, *e
 
 		id: entryTestNICID,
 		stack: &Stack{
-			clock:           clock,
-			nudDisp:         &disp,
-			nudConfigs:      c,
-			randomGenerator: rand.New(rand.NewSource(time.Now().UnixNano())),
+			clock:       clock,
+			nudDisp:     &disp,
+			nudConfigs:  c,
+			insecureRNG: rand.New(rand.NewSource(time.Now().UnixNano())),
 		},
 		stats: makeNICStats(tcpip.NICStats{}.FillIn()),
 	}
@@ -296,7 +296,7 @@ func TestEntryUnknownToUnknownWhenConfirmationWithUnknownAddress(t *testing.T) {
 
 	// No events should have been dispatched.
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -352,13 +352,13 @@ func unknownToIncomplete(e *neighborEntry, nudDisp *testNUDDispatcher, linkRes *
 				Addr:      entryTestAddr1,
 				LinkAddr:  tcpip.LinkAddress(""),
 				State:     Incomplete,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -413,13 +413,13 @@ func unknownToStale(e *neighborEntry, nudDisp *testNUDDispatcher, linkRes *entry
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -483,12 +483,12 @@ func TestEntryIncompleteToIncompleteDoesNotChangeUpdatedAt(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  tcpip.LinkAddress(""),
 				State:     Unreachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -545,13 +545,13 @@ func incompleteToReachableWithFlags(e *neighborEntry, nudDisp *testNUDDispatcher
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -642,12 +642,12 @@ func TestEntryIncompleteToStaleWhenUnsolicitedConfirmation(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -676,12 +676,12 @@ func TestEntryIncompleteToStaleWhenProbe(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -755,12 +755,12 @@ func incompleteToUnreachable(c NUDConfigurations, e *neighborEntry, nudDisp *tes
 				Addr:      entryTestAddr1,
 				LinkAddr:  tcpip.LinkAddress(""),
 				State:     Unreachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+	diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 	nudDisp.mu.events = nil
 	nudDisp.mu.Unlock()
 	if diff != "" {
@@ -800,7 +800,7 @@ func TestEntryReachableToReachableClearsRouterWhenConfirmationWithoutRouter(t *t
 	if got, want := e.mu.isRouter, false; got != want {
 		t.Errorf("got e.mu.isRouter = %t, want = %t", got, want)
 	}
-	ipv6EP := e.cache.nic.networkEndpoints[header.IPv6ProtocolNumber].(*testIPv6Endpoint)
+	ipv6EP := e.cache.nic.getNetworkEndpoint(header.IPv6ProtocolNumber).(*testIPv6Endpoint)
 	if ipv6EP.invalidatedRtr != e.mu.neigh.Addr {
 		t.Errorf("got ipv6EP.invalidatedRtr = %s, want = %s", ipv6EP.invalidatedRtr, e.mu.neigh.Addr)
 	}
@@ -819,7 +819,7 @@ func TestEntryReachableToReachableClearsRouterWhenConfirmationWithoutRouter(t *t
 
 	// No events should have been dispatched.
 	nudDisp.mu.Lock()
-	diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events)
+	diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 	nudDisp.mu.Unlock()
 	if diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
@@ -860,7 +860,7 @@ func TestEntryReachableToReachableWhenProbeWithSameAddress(t *testing.T) {
 
 	// No events should have been dispatched.
 	nudDisp.mu.Lock()
-	diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events)
+	diff := cmp.Diff([]testEntryEventInfo(nil), nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 	nudDisp.mu.Unlock()
 	if diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
@@ -941,14 +941,14 @@ func reachableToStale(c NUDConfigurations, e *neighborEntry, nudDisp *testNUDDis
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -996,12 +996,12 @@ func TestEntryReachableToStaleWhenProbeWithDifferentAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1048,12 +1048,12 @@ func TestEntryReachableToStaleWhenConfirmationWithDifferentAddress(t *testing.T)
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1100,12 +1100,12 @@ func TestEntryReachableToStaleWhenConfirmationWithDifferentAddressAndOverride(t 
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1189,12 +1189,12 @@ func TestEntryStaleToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1241,12 +1241,12 @@ func TestEntryStaleToReachableWhenSolicitedConfirmationWithoutAddress(t *testing
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1282,12 +1282,12 @@ func TestEntryStaleToStaleWhenOverrideConfirmation(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1330,12 +1330,12 @@ func TestEntryStaleToStaleWhenProbeUpdateAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1389,12 +1389,12 @@ func staleToDelay(e *neighborEntry, nudDisp *testNUDDispatcher, linkRes *entryTe
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Delay,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+	diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 	nudDisp.mu.events = nil
 	nudDisp.mu.Unlock()
 	if diff != "" {
@@ -1415,12 +1415,12 @@ func TestEntryDelayToReachableWhenUpperLevelConfirmation(t *testing.T) {
 		t.Fatalf("staleToDelay(...) = %s", err)
 	}
 
-	e.mu.Lock()
-	e.handleUpperLevelConfirmationLocked()
+	e.handleUpperLevelConfirmation()
+	e.mu.RLock()
 	if e.mu.neigh.State != Reachable {
 		t.Errorf("got e.mu.neigh.State = %q, want = %q", e.mu.neigh.State, Reachable)
 	}
-	e.mu.Unlock()
+	e.mu.RUnlock()
 
 	// No probes should have been sent.
 	runImmediatelyScheduledJobs(clock)
@@ -1441,12 +1441,12 @@ func TestEntryDelayToReachableWhenUpperLevelConfirmation(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1496,12 +1496,12 @@ func TestEntryDelayToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1551,12 +1551,12 @@ func TestEntryDelayToReachableWhenSolicitedConfirmationWithoutAddress(t *testing
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1643,12 +1643,12 @@ func TestEntryDelayToStaleWhenProbeWithDifferentAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1695,12 +1695,12 @@ func TestEntryDelayToStaleWhenConfirmationWithDifferentAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1768,13 +1768,13 @@ func delayToProbe(c NUDConfigurations, e *neighborEntry, nudDisp *testNUDDispatc
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Probe,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -1825,12 +1825,12 @@ func TestEntryProbeToStaleWhenProbeWithDifferentAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1880,12 +1880,12 @@ func TestEntryProbeToStaleWhenConfirmationWithDifferentAddress(t *testing.T) {
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr2,
 				State:     Stale,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	if diff := cmp.Diff(wantEvents, nudDisp.mu.events); diff != "" {
+	if diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{})); diff != "" {
 		t.Errorf("nud dispatcher events mismatch (-want, +got):\n%s", diff)
 	}
 	nudDisp.mu.Unlock()
@@ -1957,6 +1957,47 @@ func TestEntryProbeToReachableWhenSolicitedOverrideConfirmation(t *testing.T) {
 	}
 }
 
+func TestGetRemoteLinkAddressFailsWhenResolutionRequired(t *testing.T) {
+	c := DefaultNUDConfigurations()
+	c.MinRandomFactor = 1
+	c.MaxRandomFactor = 1
+	e, nudDisp, linkRes, clock := entryTestSetup(c)
+
+	if _, ok := e.getRemoteLinkAddress(); ok {
+		t.Errorf("getRemoteLinkAddress() = _, true, want false")
+	}
+	if err := unknownToStale(e, nudDisp, linkRes, clock); err != nil {
+		t.Fatalf("unknownToStale(...) = %s", err)
+	}
+	if _, ok := e.getRemoteLinkAddress(); ok {
+		t.Errorf("getRemoteLinkAddress() = _, true, want false")
+	}
+	if err := staleToDelay(e, nudDisp, linkRes, clock); err != nil {
+		t.Fatalf("staleToDelay(...) = %s", err)
+	}
+	if _, ok := e.getRemoteLinkAddress(); !ok {
+		t.Errorf("getRemoteLinkAddress() = _, false, want true")
+	}
+	if err := delayToProbe(c, e, nudDisp, linkRes, clock); err != nil {
+		t.Fatalf("delayToProbe(...) = %s", err)
+	}
+	if _, ok := e.getRemoteLinkAddress(); !ok {
+		t.Errorf("getRemoteLinkAddress() = _, false, want true")
+	}
+	if err := probeToReachable(e, nudDisp, linkRes, clock); err != nil {
+		t.Fatalf("probeToReachable(...) = %s", err)
+	}
+	if _, ok := e.getRemoteLinkAddress(); !ok {
+		t.Errorf("getRemoteLinkAddress() = _, false, want true")
+	}
+	if err := reachableToStale(c, e, nudDisp, linkRes, clock); err != nil {
+		t.Fatalf("reachableToStale(...) = %s", err)
+	}
+	if _, ok := e.getRemoteLinkAddress(); ok {
+		t.Errorf("getRemoteLinkAddress() = _, true, want false")
+	}
+}
+
 func probeToReachableWithFlags(e *neighborEntry, nudDisp *testNUDDispatcher, linkRes *entryTestLinkResolver, clock *faketime.ManualClock, linkAddr tcpip.LinkAddress, flags ReachabilityConfirmationFlags) error {
 	if err := func() error {
 		e.mu.Lock()
@@ -2001,13 +2042,13 @@ func probeToReachableWithFlags(e *neighborEntry, nudDisp *testNUDDispatcher, lin
 				Addr:      entryTestAddr1,
 				LinkAddr:  linkAddr,
 				State:     Reachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {
@@ -2153,12 +2194,12 @@ func probeToUnreachable(c NUDConfigurations, e *neighborEntry, nudDisp *testNUDD
 				Addr:      entryTestAddr1,
 				LinkAddr:  entryTestLinkAddr1,
 				State:     Unreachable,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	nudDisp.mu.Lock()
-	diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+	diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 	nudDisp.mu.events = nil
 	nudDisp.mu.Unlock()
 	if diff != "" {
@@ -2225,13 +2266,13 @@ func unreachableToIncomplete(e *neighborEntry, nudDisp *testNUDDispatcher, linkR
 				Addr:      entryTestAddr1,
 				LinkAddr:  tcpip.LinkAddress(""),
 				State:     Incomplete,
-				UpdatedAt: clock.Now(),
+				UpdatedAt: clock.NowMonotonic(),
 			},
 		},
 	}
 	{
 		nudDisp.mu.Lock()
-		diff := cmp.Diff(wantEvents, nudDisp.mu.events)
+		diff := cmp.Diff(wantEvents, nudDisp.mu.events, cmp.AllowUnexported(tcpip.MonotonicTime{}))
 		nudDisp.mu.events = nil
 		nudDisp.mu.Unlock()
 		if diff != "" {

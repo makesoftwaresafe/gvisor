@@ -1,7 +1,10 @@
-load("//tools:defs.bzl", "more_shards", "most_shards")
 load("//test/runner:defs.bzl", "syscall_test")
+load("//tools:defs.bzl", "more_shards", "most_shards")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 # Please keep syscall tests ordered alphabetically by name.
 
@@ -10,16 +13,19 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:accept_bind_stream_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:accept_bind_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:access_test",
 )
@@ -49,6 +55,7 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     add_overlay = True,
     test = "//test/syscalls/linux:bind_test",
 )
@@ -58,33 +65,43 @@ syscall_test(
 )
 
 syscall_test(
+    one_sandbox = False,
     test = "//test/syscalls/linux:cgroup_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chdir_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chmod_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:chown_test",
     use_tmpfs = True,  # chown tests require gofer to be running as root.
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
+    # FIXME(b/323000153): Flaky with fuse + S/R.
+    save = False,
     test = "//test/syscalls/linux:chroot_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
+    # FIXME(b/323000153): Flaky with fuse + S/R.
+    save = False,
     test = "//test/syscalls/linux:pivot_root_test",
     use_tmpfs = True,
 )
@@ -107,22 +124,57 @@ syscall_test(
 )
 
 syscall_test(
-    add_uds_tree = True,
-    test = "//test/syscalls/linux:connect_external_test",
+    add_host_connector = True,
+    add_hostinet = True,
+    # TODO(b/318948806): lisafs.BoundSocketFD is leaked.
+    leak_check = False,
+    one_sandbox = False,
+    # Takes too long to run with S/R.
+    save = False,
+    test = "//test/syscalls/linux:bind_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_connector. use_tmpfs makes shared mode be skipped.
     use_tmpfs = True,
 )
 
 syscall_test(
+    add_host_uds = True,
+    add_hostinet = True,
+    # TODO(b/318948806): lisafs.BoundSocketFD is leaked.
+    leak_check = False,
+    one_sandbox = False,
+    # Takes too long to run with S/R.
+    save = False,
+    test = "//test/syscalls/linux:connect_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_uds. use_tmpfs makes shared mode be skipped.
+    use_tmpfs = True,
+)
+
+syscall_test(
+    add_host_fifo = True,
+    one_sandbox = False,
+    # Takes too long to run with S/R.
+    save = False,
+    test = "//test/syscalls/linux:pipe_external_test",
+    # Shared mode tests replace /tmp which hides the files created for
+    # add_host_fifo. use_tmpfs makes shared mode be skipped.
+    use_tmpfs = True,
+)
+
+syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:creat_test",
 )
 
 syscall_test(
-    fuse = "True",
+    allow_native = False,
     test = "//test/syscalls/linux:dev_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:dup_test",
 )
@@ -161,6 +213,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fallocate_test",
 )
@@ -170,6 +223,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fchdir_test",
 )
@@ -202,6 +256,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:fsync_test",
 )
@@ -210,6 +265,11 @@ syscall_test(
     size = "medium",
     shard_count = more_shards,
     test = "//test/syscalls/linux:futex_test",
+)
+
+syscall_test(
+    add_fusefs = True,
+    test = "//test/syscalls/linux:fuse_test",
 )
 
 syscall_test(
@@ -222,6 +282,7 @@ syscall_test(
 
 syscall_test(
     add_overlay = True,
+    shard_count = most_shards,
     test = "//test/syscalls/linux:getdents_test",
 )
 
@@ -247,6 +308,13 @@ syscall_test(
 )
 
 syscall_test(
+    iouring = True,
+    # Temporarily added due to intermittent ENOMEM failures. See b/216213621.
+    tags = ["notap"],
+    test = "//test/syscalls/linux:iouring_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:iptables_test",
 )
 
@@ -265,16 +333,24 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:keys_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:kill_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:link_test",
-    use_tmpfs = True,  # gofer needs CAP_DAC_READ_SEARCH to use AT_EMPTY_PATH with linkat(2)
+    # TODO(gvisor.dev/issue/6739): Remove use_tmpfs=True once gofer filesystem
+    # supports hard links correctly.
+    use_tmpfs = True,
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:lseek_test",
 )
@@ -300,11 +376,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:mkdir_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:mknod_test",
 )
@@ -319,6 +397,12 @@ syscall_test(
 )
 
 syscall_test(
+    timeout = "eternal",  # YES_I_REALLY_NEED_AN_ETERNAL_TEST
+    save = False,  # save tests incorrectly shorten timeout to "long"
+    test = "//test/syscalls/linux:mmap_eternal_test",
+)
+
+syscall_test(
     size = "medium",
     shard_count = more_shards,
     test = "//test/syscalls/linux:mmap_test",
@@ -326,6 +410,8 @@ syscall_test(
 
 syscall_test(
     add_overlay = True,
+    # TODO(b/323000153): Enable S/R only for the overlay variant.
+    save = False,
     test = "//test/syscalls/linux:mount_test",
 )
 
@@ -352,33 +438,40 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:network_namespace_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:open_create_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:open_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_dgram_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_raw_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:packet_socket_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:partial_bad_buffer_test",
 )
 
@@ -388,6 +481,7 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     # Takes too long under gotsan to run.
     tags = ["nogotsan"],
     test = "//test/syscalls/linux:ping_socket_test",
@@ -418,16 +512,19 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pread64_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:preadv_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:preadv2_test",
 )
@@ -438,15 +535,18 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    shard_count = most_shards,
     test = "//test/syscalls/linux:proc_test",
 )
 
 syscall_test(
     container = True,
+    one_sandbox = False,
     test = "//test/syscalls/linux:proc_isolated_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:proc_net_test",
 )
 
@@ -482,29 +582,35 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pwritev2_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:pwrite64_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:raw_socket_hdrincl_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:raw_socket_icmp_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:raw_socket_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:read_test",
 )
@@ -516,18 +622,21 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:readv_socket_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:readv_test",
 )
 
 syscall_test(
     size = "medium",
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:rename_test",
 )
@@ -570,6 +679,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sendfile_socket_test",
 )
@@ -585,6 +695,10 @@ syscall_test(
     # setgid tests require the gofer's user namespace to have multiple groups,
     # but bazel only provides one.
     use_tmpfs = True,
+)
+
+syscall_test(
+    test = "//test/syscalls/linux:setns_test",
 )
 
 syscall_test(
@@ -628,6 +742,8 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_abstract_test",
 )
@@ -656,25 +772,33 @@ syscall_test(
 syscall_test(
     size = "large",
     add_overlay = True,
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_filesystem_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_inet_loopback_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     container = True,
+    one_sandbox = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_inet_loopback_isolated_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     # Takes too long for TSAN. Creates a lot of TCP sockets.
     tags = ["nogotsan"],
@@ -682,11 +806,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_external_networking_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_generic_loopback_test",
 )
@@ -694,11 +820,15 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
+    shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_loopback_non_blocking_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_loopback_test",
 )
@@ -706,6 +836,8 @@ syscall_test(
 syscall_test(
     size = "medium",
     add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_tcp_udp_generic_loopback_test",
 )
@@ -718,22 +850,28 @@ syscall_test(
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_ip_udp_loopback_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv4_datagram_based_socket_unbound_loopback_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_loopback_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_loopback_test",
 )
 
@@ -747,24 +885,34 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
+    # FIXME(b/323000153): These tests fail with S/R, fix them and then enable.
+    save = False,
     test = "//test/syscalls/linux:socket_ipv4_udp_unbound_loopback_netlink_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ipv6_udp_unbound_loopback_netlink_test",
 )
 
 syscall_test(
+    # TODO(b/275742272): IP_TOS behaves strange on some new kernels, causing
+    # this to be very flaky on hostinet. Enable this once the strangeness is
+    # resolved..
+    # add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_ip_unbound_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_ipv6_unbound_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_ip_unbound_netlink_test",
 )
 
@@ -774,22 +922,27 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_route_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_netlink_uevent_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_blocking_local_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_blocking_ip_test",
 )
 
@@ -799,11 +952,13 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_non_stream_blocking_udp_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_blocking_local_test",
 )
 
@@ -814,26 +969,34 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_local_test",
 )
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_stream_nonblock_local_test",
 )
 
 syscall_test(
     size = "large",
+    add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = most_shards,
     test = "//test/syscalls/linux:socket_stress_test",
 )
 
 syscall_test(
+    add_hostinet = True,
     test = "//test/syscalls/linux:socket_test",
 )
 
 syscall_test(
     flaky = 1,  # NOTE(b/116636318): Large sendmsg may stall a long time.
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_unix_dgram_local_test",
 )
@@ -852,17 +1015,23 @@ syscall_test(
 
 syscall_test(
     flaky = 1,  # NOTE(b/116636318): Large sendmsg may stall a long time.
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = more_shards,
     test = "//test/syscalls/linux:socket_unix_seqpacket_local_test",
 )
 
 syscall_test(
     size = "medium",
+    shard_count = most_shards,
     test = "//test/syscalls/linux:socket_unix_stream_test",
 )
 
 syscall_test(
     size = "medium",
+    # TODO(b/323000153): Test fails with S/R enabled during restore of abstract
+    # sockets. Fix this and then enable S/R.
+    save = False,
     test = "//test/syscalls/linux:socket_unix_unbound_abstract_test",
 )
 
@@ -889,37 +1058,46 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:statfs_test",
     use_tmpfs = True,  # Test specifically relies on TEST_TMPDIR to be tmpfs.
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
+    # TODO(b/323000153): Enable S/R only for the overlay variant.
+    save = False,
     test = "//test/syscalls/linux:stat_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:stat_times_test",
 )
 
 syscall_test(
     add_overlay = True,
+    save = False,
     test = "//test/syscalls/linux:sticky_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:symlink_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sync_test",
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:sync_file_range_test",
 )
@@ -938,6 +1116,9 @@ syscall_test(
 
 syscall_test(
     size = "medium",
+    add_hostinet = True,
+    # Takes too long to run with S/R.
+    save = False,
     shard_count = more_shards,
     test = "//test/syscalls/linux:tcp_socket_test",
 )
@@ -964,11 +1145,16 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:truncate_test",
 )
 
 syscall_test(
+    # TODO(b/318948806): tun.tunEndpoint is leaked.
+    leak_check = False,
+    # TODO(b/110961832): /dev/net/tun does not support S/R.
+    save = False,
     test = "//test/syscalls/linux:tuntap_test",
 )
 
@@ -990,6 +1176,11 @@ syscall_test(
 )
 
 syscall_test(
+    add_hostinet = True,
+    test = "//test/syscalls/linux:udp_raw_socket_test",
+)
+
+syscall_test(
     test = "//test/syscalls/linux:uidgid_test",
 )
 
@@ -998,6 +1189,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:unlink_test",
 )
@@ -1034,6 +1226,7 @@ syscall_test(
 )
 
 syscall_test(
+    add_fusefs = True,
     add_overlay = True,
     test = "//test/syscalls/linux:write_test",
 )
@@ -1056,10 +1249,22 @@ syscall_test(
 )
 
 syscall_test(
+    test = "//test/syscalls/linux:process_vm_read_write_test",
+)
+
+syscall_test(
+    save = False,
     test = "//test/syscalls/linux:deleted_test",
 )
 
 syscall_test(
     size = "small",
+    # FIXME(b/323000153): These tests fail with S/R, fix them and then enable.
+    save = False,
     test = "//test/syscalls/linux:close_range_test",
+)
+
+syscall_test(
+    save = False,
+    test = "//test/syscalls/linux:socketopt_test",
 )

@@ -21,9 +21,12 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/mm"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+const iovecLength = 16
 
 // MAX_RW_COUNT is the maximum size in bytes of a single read or write.
 // Reads and writes that exceed this size may be silently truncated.
@@ -122,7 +125,7 @@ func (t *Task) CopyInVector(addr hostarch.Addr, maxElemSize, maxTotalSize int) (
 }
 
 // CopyOutIovecs converts src to an array of struct iovecs and copies it to the
-// memory mapped at addr.
+// memory mapped at addr for Task.
 //
 // Preconditions: Same as usermem.IO.CopyOut, plus:
 //   - The caller must be running on the task goroutine.
@@ -130,12 +133,11 @@ func (t *Task) CopyInVector(addr hostarch.Addr, maxElemSize, maxTotalSize int) (
 func (t *Task) CopyOutIovecs(addr hostarch.Addr, src hostarch.AddrRangeSeq) error {
 	switch t.Arch().Width() {
 	case 8:
-		const itemLen = 16
-		if _, ok := addr.AddLength(uint64(src.NumRanges()) * itemLen); !ok {
+		if _, ok := addr.AddLength(uint64(src.NumRanges()) * iovecLength); !ok {
 			return linuxerr.EFAULT
 		}
 
-		b := t.CopyScratchBuffer(itemLen)
+		b := t.CopyScratchBuffer(iovecLength)
 		for ; !src.IsEmpty(); src = src.Tail() {
 			ar := src.Head()
 			hostarch.ByteOrder.PutUint64(b[0:8], uint64(ar.Start))
@@ -143,7 +145,7 @@ func (t *Task) CopyOutIovecs(addr hostarch.Addr, src hostarch.AddrRangeSeq) erro
 			if _, err := t.CopyOutBytes(addr, b); err != nil {
 				return err
 			}
-			addr += itemLen
+			addr += iovecLength
 		}
 
 	default:
@@ -153,32 +155,69 @@ func (t *Task) CopyOutIovecs(addr hostarch.Addr, src hostarch.AddrRangeSeq) erro
 	return nil
 }
 
-// CopyInIovecs copies an array of numIovecs struct iovecs from the memory
+// CopyInIovecs copies in IoVecs for Task.
+//
+// Preconditions: Same as usermem.IO.CopyIn, plus:
+// * The caller must be running on the task goroutine.
+// * t's AddressSpace must be active.
+func (t *Task) CopyInIovecs(addr hostarch.Addr, numIovecs int) (hostarch.AddrRangeSeq, error) {
+	// Special case to avoid allocating allocating a single hostaddr.AddrRange.
+	if numIovecs == 1 {
+		return copyInIovec(t, t, addr)
+	}
+	iovecs, err := copyInIovecs(t, t, addr, numIovecs)
+	if err != nil {
+		return hostarch.AddrRangeSeq{}, err
+	}
+	return hostarch.AddrRangeSeqFromSlice(iovecs), nil
+}
+
+// CopyInIovecsAsSlice copies in IoVecs and returns them in a slice.
+//
+// Preconditions: Same as usermem.IO.CopyIn, plus:
+//   - The caller must be running on the task goroutine or hold t.mu.
+//   - t's AddressSpace must be active.
+func (t *Task) CopyInIovecsAsSlice(addr hostarch.Addr, numIovecs int) ([]hostarch.AddrRange, error) {
+	return copyInIovecs(t, t, addr, numIovecs)
+}
+
+func copyInIovec(ctx marshal.CopyContext, t *Task, addr hostarch.Addr) (hostarch.AddrRangeSeq, error) {
+	if err := checkArch(t); err != nil {
+		return hostarch.AddrRangeSeq{}, err
+	}
+	b := ctx.CopyScratchBuffer(iovecLength)
+	ar, err := makeIovec(ctx, t, addr, b)
+	if err != nil {
+		return hostarch.AddrRangeSeq{}, err
+	}
+	return hostarch.AddrRangeSeqOf(ar).TakeFirst(MAX_RW_COUNT), nil
+}
+
+// copyInIovecs copies an array of numIovecs struct iovecs from the memory
 // mapped at addr, converts them to hostarch.AddrRanges, and returns them as a
 // hostarch.AddrRangeSeq.
 //
-// CopyInIovecs shares the following properties with Linux's
+// copyInIovecs shares the following properties with Linux's
 // lib/iov_iter.c:import_iovec() => fs/read_write.c:rw_copy_check_uvector():
 //
-//   - If the length of any AddrRange would exceed the range of an ssize_t,
-//     CopyInIovecs returns EINVAL.
+// - If the length of any AddrRange would exceed the range of an ssize_t,
+// copyInIovecs returns EINVAL.
 //
-//   - If the length of any AddrRange would cause its end to overflow,
-//     CopyInIovecs returns EFAULT.
+// - If the length of any AddrRange would cause its end to overflow,
+// copyInIovecs returns EFAULT.
 //
-//   - If any AddrRange would include addresses outside the application address
-//     range, CopyInIovecs returns EFAULT.
+// - If any AddrRange would include addresses outside the application address
+// range, copyInIovecs returns EFAULT.
 //
 //   - The combined length of all AddrRanges is limited to MAX_RW_COUNT. If the
 //     combined length of all AddrRanges would otherwise exceed this amount, ranges
 //     beyond MAX_RW_COUNT are silently truncated.
-//
-// Preconditions: Same as usermem.IO.CopyIn, plus:
-//   - The caller must be running on the task goroutine.
-//   - t's AddressSpace must be active.
-func (t *Task) CopyInIovecs(addr hostarch.Addr, numIovecs int) (hostarch.AddrRangeSeq, error) {
+func copyInIovecs(ctx marshal.CopyContext, t *Task, addr hostarch.Addr, numIovecs int) ([]hostarch.AddrRange, error) {
+	if err := checkArch(t); err != nil {
+		return nil, err
+	}
 	if numIovecs == 0 {
-		return hostarch.AddrRangeSeq{}, nil
+		return nil, nil
 	}
 
 	var dst []hostarch.AddrRange
@@ -186,42 +225,20 @@ func (t *Task) CopyInIovecs(addr hostarch.Addr, numIovecs int) (hostarch.AddrRan
 		dst = make([]hostarch.AddrRange, 0, numIovecs)
 	}
 
-	switch t.Arch().Width() {
-	case 8:
-		const itemLen = 16
-		if _, ok := addr.AddLength(uint64(numIovecs) * itemLen); !ok {
-			return hostarch.AddrRangeSeq{}, linuxerr.EFAULT
-		}
-
-		b := t.CopyScratchBuffer(itemLen)
-		for i := 0; i < numIovecs; i++ {
-			if _, err := t.CopyInBytes(addr, b); err != nil {
-				return hostarch.AddrRangeSeq{}, err
-			}
-
-			base := hostarch.Addr(hostarch.ByteOrder.Uint64(b[0:8]))
-			length := hostarch.ByteOrder.Uint64(b[8:16])
-			if length > math.MaxInt64 {
-				return hostarch.AddrRangeSeq{}, linuxerr.EINVAL
-			}
-			ar, ok := t.MemoryManager().CheckIORange(base, int64(length))
-			if !ok {
-				return hostarch.AddrRangeSeq{}, linuxerr.EFAULT
-			}
-
-			if numIovecs == 1 {
-				// Special case to avoid allocating dst.
-				return hostarch.AddrRangeSeqOf(ar).TakeFirst(MAX_RW_COUNT), nil
-			}
-			dst = append(dst, ar)
-
-			addr += itemLen
-		}
-
-	default:
-		return hostarch.AddrRangeSeq{}, linuxerr.ENOSYS
+	if _, ok := addr.AddLength(uint64(numIovecs) * iovecLength); !ok {
+		return nil, linuxerr.EFAULT
 	}
 
+	b := ctx.CopyScratchBuffer(iovecLength)
+	for i := 0; i < numIovecs; i++ {
+		ar, err := makeIovec(ctx, t, addr, b)
+		if err != nil {
+			return []hostarch.AddrRange{}, err
+		}
+		dst = append(dst, ar)
+
+		addr += iovecLength
+	}
 	// Truncate to MAX_RW_COUNT.
 	var total uint64
 	for i := range dst {
@@ -233,7 +250,31 @@ func (t *Task) CopyInIovecs(addr hostarch.Addr, numIovecs int) (hostarch.AddrRan
 		total += dstlen
 	}
 
-	return hostarch.AddrRangeSeqFromSlice(dst), nil
+	return dst, nil
+}
+
+func checkArch(t *Task) error {
+	if t.Arch().Width() != 8 {
+		return linuxerr.ENOSYS
+	}
+	return nil
+}
+
+func makeIovec(ctx marshal.CopyContext, t *Task, addr hostarch.Addr, b []byte) (hostarch.AddrRange, error) {
+	if _, err := ctx.CopyInBytes(addr, b); err != nil {
+		return hostarch.AddrRange{}, err
+	}
+
+	base := hostarch.Addr(hostarch.ByteOrder.Uint64(b[0:8]))
+	length := hostarch.ByteOrder.Uint64(b[8:16])
+	if length > math.MaxInt64 {
+		return hostarch.AddrRange{}, linuxerr.EINVAL
+	}
+	ar, ok := t.MemoryManager().CheckIORange(base, int64(length))
+	if !ok {
+		return hostarch.AddrRange{}, linuxerr.EFAULT
+	}
+	return ar, nil
 }
 
 // SingleIOSequence returns a usermem.IOSequence representing [addr,
@@ -308,9 +349,10 @@ func (cc *taskCopyContext) CopyScratchBuffer(size int) []byte {
 }
 
 func (cc *taskCopyContext) getMemoryManager() (*mm.MemoryManager, error) {
-	cc.t.mu.Lock()
 	tmm := cc.t.MemoryManager()
-	cc.t.mu.Unlock()
+	if tmm == nil {
+		return nil, linuxerr.ESRCH
+	}
 	if !tmm.IncUsers() {
 		return nil, linuxerr.EFAULT
 	}
@@ -318,6 +360,10 @@ func (cc *taskCopyContext) getMemoryManager() (*mm.MemoryManager, error) {
 }
 
 // CopyInBytes implements marshal.CopyContext.CopyInBytes.
+//
+// Preconditions: Same as usermem.IO.CopyIn, plus:
+//   - The caller must be running on the task goroutine or hold the cc.t.mu
+//   - t's AddressSpace must be active.
 func (cc *taskCopyContext) CopyInBytes(addr hostarch.Addr, dst []byte) (int, error) {
 	tmm, err := cc.getMemoryManager()
 	if err != nil {
@@ -328,6 +374,10 @@ func (cc *taskCopyContext) CopyInBytes(addr hostarch.Addr, dst []byte) (int, err
 }
 
 // CopyOutBytes implements marshal.CopyContext.CopyOutBytes.
+//
+// Preconditions: Same as usermem.IO.CopyOut, plus:
+//   - The caller must be running on the task goroutine or hold the cc.t.mu
+//   - t's AddressSpace must be active.
 func (cc *taskCopyContext) CopyOutBytes(addr hostarch.Addr, src []byte) (int, error) {
 	tmm, err := cc.getMemoryManager()
 	if err != nil {

@@ -25,6 +25,7 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -40,7 +41,7 @@ var vcpuInit kvmVcpuInit
 
 // initArchState initializes architecture-specific state.
 func (m *machine) initArchState() error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(m.fd),
 		_KVM_ARM_PREFERRED_TARGET,
@@ -73,7 +74,7 @@ func (c *vCPU) initArchState() error {
 	regGet.addr = uint64(reflect.ValueOf(&dataGet).Pointer())
 
 	vcpuInit.features[0] |= (1 << _KVM_ARM_VCPU_PSCI_0_2)
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_ARM_VCPU_INIT,
@@ -82,7 +83,8 @@ func (c *vCPU) initArchState() error {
 	}
 
 	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS
+	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS |
+		_TCR_ASID16 | _TCR_IPS_40BITS | _TCR_TBI0
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -113,6 +115,34 @@ func (c *vCPU) initArchState() error {
 		return err
 	}
 
+	// cntkctl_el1
+	data = _CNTKCTL_EL1_DEFAULT
+	reg.id = _KVM_ARM64_REGS_CNTKCTL_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// cpacr_el1
+	data = 0
+	reg.id = _KVM_ARM64_REGS_CPACR_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// sctlr_el1
+	data = _SCTLR_EL1_DEFAULT
+	reg.id = _KVM_ARM64_REGS_SCTLR_EL1
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
+	// tpidr_el1
+	reg.id = _KVM_ARM64_REGS_TPIDR_EL1
+	data = uint64(reflect.ValueOf(&c.CPU).Pointer() | ring0.KernelStartAddress)
+	if err := c.setOneRegister(&reg); err != nil {
+		return err
+	}
+
 	// sp_el1
 	data = c.CPU.StackTop()
 	reg.id = _KVM_ARM64_REGS_SP_EL1
@@ -122,21 +152,14 @@ func (c *vCPU) initArchState() error {
 
 	// pc
 	reg.id = _KVM_ARM64_REGS_PC
-	data = uint64(reflect.ValueOf(ring0.Start).Pointer())
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
-	// r8
-	reg.id = _KVM_ARM64_REGS_R8
-	data = uint64(reflect.ValueOf(&c.CPU).Pointer())
+	data = uint64(ring0.AddrOfStart())
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
 
 	// vbar_el1
 	reg.id = _KVM_ARM64_REGS_VBAR_EL1
-	vectorLocation := reflect.ValueOf(ring0.Vectors).Pointer()
+	vectorLocation := ring0.AddrOfVectors()
 	data = uint64(ring0.KernelStartAddress | vectorLocation)
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -144,7 +167,8 @@ func (c *vCPU) initArchState() error {
 
 	// Use the address of the exception vector table as
 	// the MMIO address base.
-	arm64HypercallMMIOBase = vectorLocation
+	vectorLocationPhys, _, _ := translateToPhysical(vectorLocation)
+	arm64HypercallMMIOBase = vectorLocationPhys
 
 	// Initialize the PCID database.
 	if hasGuestPCID {
@@ -237,7 +261,7 @@ func (c *vCPU) loadSegments(tid uint64) {
 }
 
 func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_SET_ONE_REG,
@@ -248,7 +272,7 @@ func (c *vCPU) setOneRegister(reg *kvmOneReg) error {
 }
 
 func (c *vCPU) getOneRegister(reg *kvmOneReg) error {
-	if _, _, errno := unix.RawSyscall(
+	if errno := hostsyscall.RawSyscallErrno(
 		unix.SYS_IOCTL,
 		uintptr(c.fd),
 		_KVM_GET_ONE_REG,
@@ -332,9 +356,9 @@ func seccompMmapSyscall(context unsafe.Pointer) (uintptr, uintptr, unix.Errno) {
 	ctx := bluepillArchContext(context)
 
 	// MAP_DENYWRITE is deprecated and ignored by kernel. We use it only for seccomp filters.
-	addr, _, e := unix.RawSyscall6(uintptr(ctx.Regs[8]), uintptr(ctx.Regs[0]), uintptr(ctx.Regs[1]),
+	addr, e := hostsyscall.RawSyscall6(uintptr(ctx.Regs[8]), uintptr(ctx.Regs[0]), uintptr(ctx.Regs[1]),
 		uintptr(ctx.Regs[2]), uintptr(ctx.Regs[3])|unix.MAP_DENYWRITE, uintptr(ctx.Regs[4]), uintptr(ctx.Regs[5]))
 	ctx.Regs[0] = uint64(addr)
 
-	return addr, uintptr(ctx.Regs[1]), e
+	return addr, uintptr(ctx.Regs[1]), unix.Errno(e)
 }

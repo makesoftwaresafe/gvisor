@@ -149,11 +149,7 @@ func (b Block) TakeFirst64(n uint64) Block {
 
 // ToSlice returns a []byte equivalent to b.
 func (b Block) ToSlice() []byte {
-	return *(*[]byte)(unsafe.Pointer(&gohacks.SliceHeader{
-		Data: b.start,
-		Len:  b.length,
-		Cap:  b.length,
-	}))
+	return gohacks.Slice((*byte)(b.start), b.length)
 }
 
 // Addr returns b's start address as a uintptr. It returns uintptr instead of
@@ -225,12 +221,7 @@ func Zero(dst Block) (int, error) {
 	if !dst.needSafecopy {
 		bs := dst.ToSlice()
 		if !sync.RaceEnabled {
-			// If the race detector isn't enabled, the golang
-			// compiler replaces the next loop with memclr
-			// (https://github.com/golang/go/issues/5373).
-			for i := range bs {
-				bs[i] = 0
-			}
+			clear(bs)
 		} else {
 			bsLen := len(bs)
 			if bsLen == 0 {

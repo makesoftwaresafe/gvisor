@@ -60,6 +60,8 @@ var (
 )
 
 // FragmentID is the identifier for a fragment.
+//
+// +stateify savable
 type FragmentID struct {
 	// Source is the source address of the fragment.
 	Source tcpip.Address
@@ -78,8 +80,10 @@ type FragmentID struct {
 
 // Fragmentation is the main structure that other modules
 // of the stack should use to implement IP Fragmentation.
+//
+// +stateify savable
 type Fragmentation struct {
-	mu             sync.Mutex
+	mu             sync.Mutex `state:"nosave"`
 	highLimit      int
 	lowLimit       int
 	reassemblers   map[FragmentID]*reassembler
@@ -175,6 +179,10 @@ func (f *Fragmentation) Process(
 	}
 
 	f.mu.Lock()
+	if f.reassemblers == nil {
+		return nil, 0, false, fmt.Errorf("Release() called before fragmentation processing could finish")
+	}
+
 	r, ok := f.reassemblers[id]
 	if !ok {
 		r = newReassembler(id, f.clock)
@@ -312,8 +320,9 @@ func MakePacketFragmenter(pkt *stack.PacketBuffer, fragmentPayloadLen uint32, re
 	// TODO(gvisor.dev/issue/3912): Once Authentication or ESP Headers are
 	// supported for outbound packets, the fragmentable data should not include
 	// these headers.
-	fragmentableData := buffer.NewWithData(pkt.TransportHeader().View())
-	pktBuf := pkt.Data().AsBuffer()
+	var fragmentableData buffer.Buffer
+	fragmentableData.Append(pkt.TransportHeader().View())
+	pktBuf := pkt.Data().ToBuffer()
 	fragmentableData.Merge(&pktBuf)
 	fragmentCount := (uint32(fragmentableData.Size()) + fragmentPayloadLen - 1) / fragmentPayloadLen
 
@@ -344,7 +353,7 @@ func (pf *PacketFragmenter) BuildNextFragment() (*stack.PacketBuffer, int, int, 
 	})
 
 	// Copy data for the fragment.
-	copied := fragPkt.Data().ReadFromBuffer(&pf.data, pf.fragmentPayloadLen)
+	copied := fragPkt.Data().ReadFrom(&pf.data, pf.fragmentPayloadLen)
 
 	offset := pf.fragmentOffset
 	pf.fragmentOffset += copied
@@ -357,4 +366,9 @@ func (pf *PacketFragmenter) BuildNextFragment() (*stack.PacketBuffer, int, int, 
 // RemainingFragmentCount returns the number of fragments left to be built.
 func (pf *PacketFragmenter) RemainingFragmentCount() int {
 	return pf.fragmentCount - pf.currentFragment
+}
+
+// Release frees resources owned by the packet fragmenter.
+func (pf *PacketFragmenter) Release() {
+	pf.data.Release()
 }

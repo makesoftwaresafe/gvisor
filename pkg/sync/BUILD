@@ -1,6 +1,7 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//:sandbox"],
     licenses = ["notice"],
 )
@@ -11,6 +12,9 @@ go_library(
         "aliases.go",
         "checklocks_off_unsafe.go",
         "checklocks_on_unsafe.go",
+        "fence.go",
+        "fence_amd64.s",
+        "fence_arm64.s",
         "gate_unsafe.go",
         "goyield_go113_unsafe.go",
         "goyield_unsafe.go",
@@ -20,9 +24,16 @@ go_library(
         "race_amd64.s",
         "race_arm64.s",
         "race_unsafe.go",
+        "runtime.go",
         "runtime_amd64.go",
-        "runtime_amd64.s",
+        "runtime_constants.go",
+        "runtime_exectracer2.go",
+        "runtime_go121_unsafe.go",
+        "runtime_go124_unsafe.go",
+        "runtime_not_go121_unsafe.go",
         "runtime_other.go",
+        "runtime_spinning_amd64.s",
+        "runtime_spinning_other.s",
         "runtime_unsafe.go",
         "rwmutex_unsafe.go",
         "seqcount.go",
@@ -42,7 +53,6 @@ go_test(
     size = "small",
     srcs = [
         "gate_test.go",
-        "mutex_test.go",
         "rwmutex_test.go",
         "seqcount_test.go",
     ],

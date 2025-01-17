@@ -33,8 +33,11 @@ const reassembleTimeout = 1
 // buf is a helper to build a Buffer from different strings.
 func buf(size int, pieces ...string) buffer.Buffer {
 	buf := buffer.Buffer{}
+	c := buf.Clone()
+	defer c.Release()
 	for _, p := range pieces {
-		buf.Append([]byte(p))
+		v := buffer.NewViewWithData([]byte(p))
+		buf.Append(v)
 	}
 
 	return buf
@@ -110,7 +113,9 @@ func TestFragmentationProcess(t *testing.T) {
 			f := NewFragmentation(minBlockSize, 2048, 512, reassembleTimeout, &faketime.NullClock{}, nil)
 			firstFragmentProto := c.in[0].proto
 			for i, in := range c.in {
+				in := in
 				defer in.pkt.DecRef()
+				defer c.out[i].buf.Release()
 				resPkt, proto, done, err := f.Process(in.id, in.first, in.last, in.more, in.proto, in.pkt)
 				if resPkt != nil {
 					defer resPkt.DecRef()
@@ -124,7 +129,7 @@ func TestFragmentationProcess(t *testing.T) {
 						in.id, in.first, in.last, in.more, in.proto, done, c.out[i].done)
 				}
 				if c.out[i].done {
-					if diff := cmp.Diff(c.out[i].buf.Flatten(), resPkt.Data().AsRange().ToOwnedView()); diff != "" {
+					if diff := cmp.Diff(c.out[i].buf.Flatten(), resPkt.Data().AsRange().ToSlice()); diff != "" {
 						t.Errorf("got Process(%+v, %d, %d, %t, %d, %#v) result mismatch (-want, +got):\n%s",
 							in.id, in.first, in.last, in.more, in.proto, in.pkt, diff)
 					}
@@ -525,8 +530,11 @@ func TestPacketFragmenter(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			pkt := testutil.MakeRandPkt(test.transportHeaderLen, reserve, []int{test.payloadSize}, proto)
 			defer pkt.DecRef()
-			originalPayload := []byte(stack.PayloadSince(pkt.TransportHeader()))
+			payloadView := stack.PayloadSince(pkt.TransportHeader())
+			defer payloadView.Release()
+			originalPayload := payloadView.AsSlice()
 			var reassembledPayload buffer.Buffer
+			defer reassembledPayload.Release()
 			pf := MakePacketFragmenter(pkt, test.fragmentPayloadLen, reserve)
 			for i := 0; ; i++ {
 				fragPkt, offset, copied, more := pf.BuildNextFragment()
@@ -550,10 +558,10 @@ func TestPacketFragmenter(t *testing.T) {
 				if got := fragPkt.AvailableHeaderBytes(); got != reserve {
 					t.Errorf("(fragment #%d) got fragPkt.AvailableHeaderBytes() = %d, want = %d", i, got, reserve)
 				}
-				if got := len(fragPkt.TransportHeader().View()); got != 0 {
+				if got := len(fragPkt.TransportHeader().Slice()); got != 0 {
 					t.Errorf("(fragment #%d) got fragPkt.TransportHeader().View().Size() = %d, want = 0", i, got)
 				}
-				fragBuf := fragPkt.Data().AsBuffer()
+				fragBuf := fragPkt.Data().ToBuffer()
 				reassembledPayload.Merge(&fragBuf)
 				if !more {
 					if i != len(test.wantFragments)-1 {
@@ -574,7 +582,9 @@ type testTimeoutHandler struct {
 }
 
 func (h *testTimeoutHandler) OnReassemblyTimeout(pkt *stack.PacketBuffer) {
-	h.pkt = pkt
+	if pkt != nil {
+		h.pkt = pkt.Clone()
+	}
 }
 
 func TestTimeoutHandler(t *testing.T) {
@@ -665,6 +675,11 @@ func TestTimeoutHandler(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			handler := &testTimeoutHandler{pkt: nil}
+			defer func() {
+				if handler.pkt != nil {
+					handler.pkt.DecRef()
+				}
+			}()
 
 			f := NewFragmentation(minBlockSize, HighFragThreshold, LowFragThreshold, reassembleTimeout, &faketime.NullClock{}, handler)
 
@@ -682,11 +697,11 @@ func TestTimeoutHandler(t *testing.T) {
 			}
 			switch {
 			case handler.pkt != nil && test.wantPkt == nil:
-				t.Errorf("got handler.pkt = not nil (pkt.Data = %x), want = nil", handler.pkt.Data().AsRange().ToOwnedView())
+				t.Errorf("got handler.pkt = not nil (pkt.Data = %x), want = nil", handler.pkt.Data().AsRange().ToSlice())
 			case handler.pkt == nil && test.wantPkt != nil:
-				t.Errorf("got handler.pkt = nil, want = not nil (pkt.Data = %x)", test.wantPkt.Data().AsRange().ToOwnedView())
+				t.Errorf("got handler.pkt = nil, want = not nil (pkt.Data = %x)", test.wantPkt.Data().AsRange().ToSlice())
 			case handler.pkt != nil && test.wantPkt != nil:
-				if diff := cmp.Diff(test.wantPkt.Data().AsRange().ToOwnedView(), handler.pkt.Data().AsRange().ToOwnedView()); diff != "" {
+				if diff := cmp.Diff(test.wantPkt.Data().AsRange().ToSlice(), handler.pkt.Data().AsRange().ToSlice()); diff != "" {
 					t.Errorf("pkt.Data mismatch (-want, +got):\n%s", diff)
 				}
 			}

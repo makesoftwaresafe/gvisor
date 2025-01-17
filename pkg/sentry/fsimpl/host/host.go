@@ -32,7 +32,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsimpl/kernfs"
 	"gvisor.dev/gvisor/pkg/sentry/hostfd"
-	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/sentry/memmap"
 	unixsocket "gvisor.dev/gvisor/pkg/sentry/socket/unix"
@@ -94,22 +93,29 @@ func isEpollable(fd int) bool {
 //
 // +stateify savable
 type inode struct {
+	kernfs.CachedMappable
 	kernfs.InodeNoStatFS
+	kernfs.InodeAnonymous // inode is effectively anonymous because it represents a donated FD.
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
-	kernfs.CachedMappable
 	kernfs.InodeTemporary // This holds no meaning as this inode can't be Looked up and is always valid.
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
 	// When the reference count reaches zero, the host fd is closed.
 	inodeRefs
 
-	// hostFD contains the host fd that this file was originally created from,
-	// which must be available at time of restore.
+	// hostFD contains the host fd that this file was originally created from.
+	// Upon restore, it must be remapped using restoreKey and vfs.CtxRestoreFilesystemFDMap
+	// from the restore context.
 	//
 	// This field is initialized at creation time and is immutable.
-	hostFD int
+	hostFD int `state:"nosave"`
+
+	// restoreKey is used to identify the `hostFD` after a restore is performed.
+	restoreKey vfs.RestoreID
 
 	// ino is an inode number unique within this filesystem.
 	//
@@ -143,6 +149,12 @@ type inode struct {
 	// This field is initialized at creation time and is immutable.
 	savable bool
 
+	// readonly is true if operations that can potentially change the host file
+	// are blocked.
+	//
+	// This field is initialized at creation time and is immutable.
+	readonly bool
+
 	// Event queue for blocking operations.
 	queue waiter.Queue
 
@@ -159,7 +171,7 @@ type inode struct {
 	buf     []byte
 }
 
-func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fileType linux.FileMode, isTTY bool) (*inode, error) {
+func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, restoreKey vfs.RestoreID, fileType linux.FileMode, isTTY bool, readonly bool) (*inode, error) {
 	// Determine if hostFD is seekable.
 	_, err := unix.Seek(hostFD, 0, linux.SEEK_CUR)
 	seekable := !linuxerr.Equals(linuxerr.ESPIPE, err)
@@ -171,13 +183,15 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 	}
 
 	i := &inode{
-		hostFD:    hostFD,
-		ino:       fs.NextIno(),
-		ftype:     uint16(fileType),
-		epollable: isEpollable(hostFD),
-		seekable:  seekable,
-		isTTY:     isTTY,
-		savable:   savable,
+		hostFD:     hostFD,
+		ino:        fs.NextIno(),
+		ftype:      uint16(fileType),
+		epollable:  isEpollable(hostFD),
+		seekable:   seekable,
+		isTTY:      isTTY,
+		savable:    savable,
+		restoreKey: restoreKey,
+		readonly:   readonly,
 	}
 	i.InitRefs()
 	i.CachedMappable.Init(hostFD)
@@ -198,9 +212,13 @@ func newInode(ctx context.Context, fs *filesystem, hostFD int, savable bool, fil
 // NewFDOptions contains options to NewFD.
 type NewFDOptions struct {
 	// If Savable is true, the host file descriptor may be saved/restored by
-	// numeric value; the sandbox API requires a corresponding host FD with the
-	// same numeric value to be provided at time of restore.
+	// numeric value. RestoreKey is used to map the FD after restore.
 	Savable bool
+
+	// RestoreKey is only used when Savable==true. It uniquely identifies the
+	// host FD so that a mapping to the corresponding FD can be provided during
+	// restore.
+	RestoreKey vfs.RestoreID
 
 	// If IsTTY is true, the file descriptor is a TTY.
 	IsTTY bool
@@ -215,6 +233,10 @@ type NewFDOptions struct {
 	VirtualOwner bool
 	UID          auth.KUID
 	GID          auth.KGID
+
+	// If Readonly is true, we disallow operations that can potentially change
+	// the host file associated with the file descriptor.
+	Readonly bool
 }
 
 // NewFD returns a vfs.FileDescription representing the given host file
@@ -223,6 +245,23 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	fs, ok := mnt.Filesystem().Impl().(*filesystem)
 	if !ok {
 		return nil, fmt.Errorf("can't import host FDs into filesystems of type %T", mnt.Filesystem().Impl())
+	}
+
+	if opts.Readonly {
+		if opts.IsTTY {
+			// This is not a technical limitation, but access checks for TTYs
+			// have not been implemented yet.
+			return nil, fmt.Errorf("readonly file descriptor may currently not be a TTY")
+		}
+
+		flagsInt, err := unix.FcntlInt(uintptr(hostFD), unix.F_GETFL, 0)
+		if err != nil {
+			return nil, err
+		}
+		accessMode := uint32(flagsInt) & unix.O_ACCMODE
+		if accessMode != unix.O_RDONLY {
+			return nil, fmt.Errorf("readonly file descriptor may only be opened as O_RDONLY on the host")
+		}
 	}
 
 	// Retrieve metadata.
@@ -242,7 +281,7 @@ func NewFD(ctx context.Context, mnt *vfs.Mount, hostFD int, opts *NewFDOptions) 
 	}
 
 	fileType := linux.FileMode(stat.Mode).FileType()
-	i, err := newInode(ctx, fs, hostFD, opts.Savable, fileType, opts.IsTTY)
+	i, err := newInode(ctx, fs, hostFD, opts.Savable, opts.RestoreKey, fileType, opts.IsTTY, opts.Readonly)
 	if err != nil {
 		return nil, err
 	}
@@ -343,6 +382,16 @@ func (i *inode) Mode() linux.FileMode {
 		panic(fmt.Sprintf("failed to retrieve mode from host fd %d: %v", i.hostFD, err))
 	}
 	return linux.FileMode(s.Mode)
+}
+
+// Mode implements kernfs.Inode.UID
+func (i *inode) UID() auth.KUID {
+	return auth.KUID(i.virtualOwner.uid.Load())
+}
+
+// Mode implements kernfs.Inode.GID
+func (i *inode) GID() auth.KGID {
+	return auth.KGID(i.virtualOwner.gid.Load())
 }
 
 // Stat implements kernfs.Inode.Stat.
@@ -490,6 +539,10 @@ func (i *inode) stat(stat *unix.Stat_t) error {
 //
 // +checklocksignore
 func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
+	if i.readonly {
+		return linuxerr.EPERM
+	}
+
 	s := &opts.Stat
 
 	m := s.Mask
@@ -523,9 +576,8 @@ func (i *inode) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Cre
 			// We hold i.virtualOwner.mu.
 			i.virtualOwner.mode = atomicbitops.FromUint32(uint32(opts.Stat.Mode))
 		} else {
-			if err := unix.Fchmod(i.hostFD, uint32(s.Mode)); err != nil {
-				return err
-			}
+			log.Warningf("sentry seccomp filters don't allow making fchmod(2) syscall")
+			return unix.EPERM
 		}
 	}
 	if m&linux.STATX_SIZE != 0 {
@@ -613,18 +665,11 @@ func (i *inode) open(ctx context.Context, d *kernfs.Dentry, mnt *vfs.Mount, file
 			return nil, err
 		}
 		// Currently, we only allow Unix sockets to be imported.
-		return unixsocket.NewFileDescription(ep, ep.Type(), flags, mnt, d.VFSDentry(), &i.locks)
+		return unixsocket.NewFileDescription(ep, ep.Type(), flags, nil, mnt, d.VFSDentry(), &i.locks)
 
 	case unix.S_IFREG, unix.S_IFIFO, unix.S_IFCHR:
 		if i.isTTY {
-			fd := &TTYFileDescription{
-				fileDescription: fileDescription{inode: i},
-				termios:         linux.DefaultReplicaTermios,
-			}
-			if task := kernel.TaskFromContext(ctx); task != nil {
-				fd.fgProcessGroup = task.ThreadGroup().ProcessGroup()
-				fd.session = fd.fgProcessGroup.Session()
-			}
+			fd := NewTTYFileDescription(i)
 			fd.LockFD.Init(&i.locks)
 			vfsfd := &fd.vfsfd
 			if err := vfsfd.Init(fd, flags, mnt, d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
@@ -702,6 +747,9 @@ func (f *fileDescription) Release(context.Context) {
 
 // Allocate implements vfs.FileDescriptionImpl.Allocate.
 func (f *fileDescription) Allocate(ctx context.Context, mode, offset, length uint64) error {
+	if f.inode.readonly {
+		return linuxerr.EPERM
+	}
 	return unix.Fallocate(f.inode.hostFD, uint32(mode), int64(offset), int64(length))
 }
 
@@ -824,6 +872,9 @@ func (f *fileDescription) Write(ctx context.Context, src usermem.IOSequence, opt
 }
 
 func (f *fileDescription) writeToHostFD(ctx context.Context, src usermem.IOSequence, offset int64, flags uint32) (int64, error) {
+	if f.inode.readonly {
+		return 0, linuxerr.EPERM
+	}
 	hostFD := f.inode.hostFD
 	// TODO(gvisor.dev/issue/2601): Support select pwritev2 flags.
 	if flags != 0 {
@@ -908,6 +959,9 @@ func (f *fileDescription) Seek(_ context.Context, offset int64, whence int32) (i
 
 // Sync implements vfs.FileDescriptionImpl.Sync.
 func (f *fileDescription) Sync(ctx context.Context) error {
+	if f.inode.readonly {
+		return linuxerr.EPERM
+	}
 	// TODO(gvisor.dev/issue/1897): Currently, we always sync everything.
 	return unix.Fsync(f.inode.hostFD)
 }
@@ -957,7 +1011,7 @@ func (f *fileDescription) Epollable() bool {
 }
 
 // Ioctl queries the underlying FD for allowed ioctl commands.
-func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	switch cmd := args[1].Int(); cmd {
 	case linux.FIONREAD:
 		v, err := ioctlFionread(f.inode.hostFD)
@@ -971,5 +1025,5 @@ func (f *fileDescription) Ioctl(ctx context.Context, uio usermem.IO, args arch.S
 		return 0, err
 	}
 
-	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, args)
+	return f.FileDescriptionDefaultImpl.Ioctl(ctx, uio, sysno, args)
 }

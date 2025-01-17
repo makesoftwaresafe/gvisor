@@ -92,7 +92,7 @@ class MMapTest : public ::testing::Test {
       return -1;
     }
 
-    int ret = munmap(addr_, length_);
+    int ret = MunmapSafe(addr_, length_);
 
     addr_ = nullptr;
     length_ = 0;
@@ -298,9 +298,10 @@ TEST_F(MMapTest, MapDevZeroSegfaultAfterUnmap) {
     *reinterpret_cast<volatile int*>(addr_saved) = 0xFF;
   };
 
-  EXPECT_THAT(InForkedProcess(rest),
-              IsPosixErrorOkAndHolds(AnyOf(Eq(W_EXITCODE(0, SIGSEGV)),
-                                           Eq(W_EXITCODE(0, 128 + SIGSEGV)))));
+  int child_exit_status = ASSERT_NO_ERRNO_AND_VALUE(InForkedProcess(rest));
+  EXPECT_TRUE(WIFSIGNALED(child_exit_status) &&
+              WTERMSIG(child_exit_status) == SIGSEGV)
+      << "exit status: " << child_exit_status;
 }
 
 TEST_F(MMapTest, MapDevZeroUnaligned) {
@@ -579,6 +580,11 @@ const uint8_t machine_code[] = {
 const uint8_t machine_code[] = {
     0x40, 0x05, 0x80, 0x52,  // mov w0, #42
     0xc0, 0x03, 0x5f, 0xd6,  // ret
+};
+#elif defined(__riscv)
+const uint8_t machine_code[] = {
+    0x13, 0x05, 0xa0, 0x02,  // li a0,42
+    0x82, 0x80               // ret
 };
 #endif
 
@@ -1205,15 +1211,13 @@ TEST_F(MMapFileTest, WriteSharedTruncateUp) {
   std::string first(kPageSize / 2, 'A');
   memcpy(reinterpret_cast<void*>(addr), first.c_str(), first.size());
 
-  // Second half; this is not reflected in the file now (see
-  // WriteSharedBeyondEnd), but will be after the truncate.
+  // Extend the file to a full page.
+  EXPECT_THAT(ftruncate(fd_.get(), kPageSize), SyscallSucceeds());
+
+  // Second half; this will be reflected in the file now.
   std::string second(kPageSize / 2, 'B');
   memcpy(reinterpret_cast<void*>(addr + kPageSize / 2), second.c_str(),
          second.size());
-
-  // Extend the file to a full page. The second half of the page will be
-  // reflected in the file.
-  EXPECT_THAT(ftruncate(fd_.get(), kPageSize), SyscallSucceeds());
 
   // The file may not actually be updated until munmap is called.
   ASSERT_THAT(Unmap(), SyscallSucceeds());

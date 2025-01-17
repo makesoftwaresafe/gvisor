@@ -1,7 +1,10 @@
-load("//tools:defs.bzl", "go_library")
 load("//test/benchmarks:defs.bzl", "benchmark_test")
+load("//tools:defs.bzl", "go_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "network",
@@ -13,6 +16,7 @@ go_library(
         "//pkg/test/dockerutil",
         "//test/benchmarks/harness",
         "//test/benchmarks/tools",
+        "//test/metricsviz",
     ],
 )
 
@@ -22,12 +26,14 @@ benchmark_test(
         "iperf_test.go",
     ],
     library = ":network",
+    use_for_pgo = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
         "//pkg/test/testutil",
         "//test/benchmarks/harness",
         "//test/benchmarks/tools",
+        "//test/metricsviz",
     ],
 )
 
@@ -37,11 +43,13 @@ benchmark_test(
         "node_test.go",
     ],
     library = ":network",
+    use_for_pgo = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
         "//test/benchmarks/harness",
         "//test/benchmarks/tools",
+        "//test/metricsviz",
     ],
 )
 
@@ -51,11 +59,13 @@ benchmark_test(
         "ruby_test.go",
     ],
     library = ":network",
+    use_for_pgo = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
         "//test/benchmarks/harness",
         "//test/benchmarks/tools",
+        "//test/metricsviz",
     ],
 )
 
@@ -65,6 +75,7 @@ benchmark_test(
         "nginx_test.go",
     ],
     library = ":network",
+    use_for_pgo = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
@@ -79,6 +90,7 @@ benchmark_test(
         "httpd_test.go",
     ],
     library = ":network",
+    use_for_pgo = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",

@@ -134,7 +134,7 @@ func (p *testIPv6Protocol) NewEndpoint(nic NetworkInterface, _ TransportDispatch
 		nic:      nic,
 		protocol: p,
 	}
-	e.AddressableEndpointState.Init(e)
+	e.AddressableEndpointState.Init(e, AddressableEndpointStateOptions{HiddenWhileDisabled: false})
 	return e
 }
 
@@ -184,7 +184,7 @@ func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 	}
 
 	nic.DeliverNetworkPacket(0, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: buffer.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 
 	if got := nic.stats.local.DisabledRx.Packets.Value(); got != 1 {
@@ -204,12 +204,12 @@ func TestDisabledRxStatsWhenNICDisabled(t *testing.T) {
 func TestPacketWithUnknownNetworkProtocolNumber(t *testing.T) {
 	nic := nic{
 		stats:   makeNICStats(tcpip.NICStats{}.FillIn()),
-		enabled: atomicbitops.FromUint32(1),
+		enabled: atomicbitops.FromBool(true),
 	}
 	// IPv4 isn't recognized since we haven't initialized the NIC with an IPv4
 	// endpoint.
 	nic.DeliverNetworkPacket(header.IPv4ProtocolNumber, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: buffer.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 	var count uint64
 	if got, ok := nic.stats.local.UnknownL3ProtocolRcvdPacketCounts.Get(uint64(header.IPv4ProtocolNumber)); ok {
@@ -224,12 +224,12 @@ func TestPacketWithUnknownTransportProtocolNumber(t *testing.T) {
 	nic := nic{
 		stack:   &Stack{},
 		stats:   makeNICStats(tcpip.NICStats{}.FillIn()),
-		enabled: atomicbitops.FromUint32(1),
+		enabled: atomicbitops.FromBool(true),
 	}
 	// UDP isn't recognized since we haven't initialized the NIC with a UDP
 	// protocol.
 	nic.DeliverTransportPacket(header.UDPProtocolNumber, NewPacketBuffer(PacketBufferOptions{
-		Payload: buffer.NewWithData([]byte{1, 2, 3, 4}),
+		Payload: buffer.MakeWithData([]byte{1, 2, 3, 4}),
 	}))
 	var count uint64
 	if got, ok := nic.stats.local.UnknownL4ProtocolRcvdPacketCounts.Get(uint64(header.UDPProtocolNumber)); ok {

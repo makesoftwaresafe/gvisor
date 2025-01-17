@@ -54,9 +54,28 @@ func Emit(msg proto.Message) error {
 	return err
 }
 
+// LogEmit is a helper method that calls DefaultEmitter.Emit.
+// It also logs a warning message when an error occurs.
+func LogEmit(msg proto.Message) error {
+	_, err := DefaultEmitter.Emit(msg)
+	if err != nil {
+		log.Warningf("unable to emit event: %s", err)
+	}
+	return err
+}
+
 // AddEmitter is a helper method that calls DefaultEmitter.AddEmitter.
 func AddEmitter(e Emitter) {
 	DefaultEmitter.AddEmitter(e)
+}
+
+// HaveEmitters indicates if any emitters have been registered to the
+// default emitter.
+func HaveEmitters() bool {
+	DefaultEmitter.mu.Lock()
+	defer DefaultEmitter.mu.Unlock()
+
+	return len(DefaultEmitter.emitters) > 0
 }
 
 // multiEmitter is an Emitter that forwards messages to multiple Emitters.

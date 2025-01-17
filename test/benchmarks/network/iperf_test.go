@@ -15,16 +15,19 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
-func BenchmarkIperf(b *testing.B) {
+func BenchmarkIperfOneConnection(b *testing.B) {
 	clientMachine, err := harness.GetMachine()
 	if err != nil {
 		b.Fatalf("failed to get machine: %v", err)
@@ -67,10 +70,12 @@ func BenchmarkIperf(b *testing.B) {
 			// Set up the containers.
 			server := bm.serverFunc(ctx, b)
 			defer server.CleanUp(ctx)
+			defer metricsviz.FromNamedContainerLogs(ctx, b, server, "server")
 			client := bm.clientFunc(ctx, b)
 			defer client.CleanUp(ctx)
+			defer metricsviz.FromNamedContainerLogs(ctx, b, server, "client")
 
-			// iperf serves on port 5001 by default.
+			// iperf server listens on port 5001 by default.
 			port := 5001
 
 			// Start the server.
@@ -80,20 +85,8 @@ func BenchmarkIperf(b *testing.B) {
 			}, "iperf", "-s"); err != nil {
 				b.Fatalf("failed to start server with: %v", err)
 			}
-
-			ip, err := serverMachine.IPAddress()
-			if err != nil {
-				b.Fatalf("failed to find server ip: %v", err)
-			}
-
-			servingPort, err := server.FindPort(ctx, port)
-			if err != nil {
-				b.Fatalf("failed to find port %d: %v", port, err)
-			}
-
-			// Make sure the server is up and serving before we run.
-			if err := harness.WaitUntilServing(ctx, clientMachine, ip, servingPort); err != nil {
-				b.Fatalf("failed to wait for server: %v", err)
+			if out, err := server.WaitForOutput(ctx, fmt.Sprintf("Server listening on TCP port %d", port), 10*time.Second); err != nil {
+				b.Fatalf("failed to wait for iperf server: %v %s", err, out)
 			}
 
 			iperf := tools.Iperf{
@@ -104,7 +97,122 @@ func BenchmarkIperf(b *testing.B) {
 			b.ResetTimer()
 			out, err := client.Run(ctx, dockerutil.RunOpts{
 				Image: "benchmarks/iperf",
-			}, iperf.MakeCmd(ip, servingPort)...)
+				Links: []string{server.MakeLink("iperfsrv")},
+			}, iperf.MakeCmd("iperfsrv", port)...)
+			if err != nil {
+				b.Fatalf("failed to run client: %v", err)
+			}
+			b.StopTimer()
+			iperf.Report(b, out)
+			b.StartTimer()
+		})
+	}
+}
+
+func BenchmarkIperfManyConnections(b *testing.B) {
+	clientMachine, err := harness.GetMachine()
+	if err != nil {
+		b.Fatalf("failed to get machine: %v", err)
+	}
+	defer clientMachine.CleanUp()
+
+	serverMachine, err := harness.GetMachine()
+	if err != nil {
+		b.Fatalf("failed to get machine: %v", err)
+	}
+	defer serverMachine.CleanUp()
+	ctx := context.Background()
+	for _, bm := range []struct {
+		name       string
+		length     int
+		parallel   int
+		clientFunc func(context.Context, testutil.Logger) *dockerutil.Container
+		serverFunc func(context.Context, testutil.Logger) *dockerutil.Container
+	}{
+		// We are either measuring the server or the client. The other should be
+		// runc. e.g. Upload sees how fast the runtime under test uploads to a native
+		// server.
+		{
+			name:       "Upload",
+			parallel:   4,
+			clientFunc: clientMachine.GetContainer,
+			serverFunc: serverMachine.GetNativeContainer,
+		},
+		{
+			name:       "Download",
+			parallel:   4,
+			clientFunc: clientMachine.GetNativeContainer,
+			serverFunc: serverMachine.GetContainer,
+		},
+		{
+			name:       "Upload",
+			parallel:   16,
+			clientFunc: clientMachine.GetContainer,
+			serverFunc: serverMachine.GetNativeContainer,
+		},
+		{
+			name:       "Download",
+			parallel:   16,
+			clientFunc: clientMachine.GetNativeContainer,
+			serverFunc: serverMachine.GetContainer,
+		},
+		{
+			name:       "Upload",
+			parallel:   64,
+			clientFunc: clientMachine.GetContainer,
+			serverFunc: serverMachine.GetNativeContainer,
+		},
+		{
+			name:       "Download",
+			parallel:   64,
+			clientFunc: clientMachine.GetNativeContainer,
+			serverFunc: serverMachine.GetContainer,
+		},
+	} {
+		name, err := tools.ParametersToName(tools.Parameter{
+			Name:  "operation",
+			Value: bm.name,
+		}, tools.Parameter{
+			Name:  "parallel",
+			Value: fmt.Sprintf("%d", bm.parallel),
+		})
+		if err != nil {
+			b.Fatalf("Failed to parse parameters: %v", err)
+		}
+		b.Run(name, func(b *testing.B) {
+			// Set up the containers.
+			server := bm.serverFunc(ctx, b)
+			defer server.CleanUp(ctx)
+			defer metricsviz.FromNamedContainerLogs(ctx, b, server, "server")
+			client := bm.clientFunc(ctx, b)
+			defer client.CleanUp(ctx)
+			defer metricsviz.FromNamedContainerLogs(ctx, b, client, "client")
+
+			// iperf server listens on port 5001 by default.
+			port := 5001
+
+			// Start the server.
+			if err := server.Spawn(ctx, dockerutil.RunOpts{
+				Image: "benchmarks/iperf",
+				Ports: []int{port},
+			}, "iperf", "-s"); err != nil {
+				b.Fatalf("failed to start server with: %v", err)
+			}
+			if out, err := server.WaitForOutput(ctx, fmt.Sprintf("Server listening on TCP port %d", port), 10*time.Second); err != nil {
+				b.Fatalf("failed to wait for iperf server: %v %s", err, out)
+			}
+
+			iperf := tools.Iperf{
+				Num:      b.N, // KB for the client to send.
+				Parallel: bm.parallel,
+			}
+
+			// Run the client.
+			b.ResetTimer()
+			out, err := client.Run(ctx, dockerutil.RunOpts{
+				Image: "benchmarks/iperf",
+				Links: []string{server.MakeLink("iperfsrv")},
+			}, iperf.MakeCmd("iperfsrv", port)...)
 			if err != nil {
 				b.Fatalf("failed to run client: %v", err)
 			}

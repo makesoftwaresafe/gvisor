@@ -18,6 +18,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"slices"
 	"testing"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -57,7 +58,7 @@ func checkProcessCaps(pid int, wantCaps *specs.LinuxCapabilities) error {
 func checkCaps(which capability.CapType, curCaps capability.Capabilities, wantCaps *specs.LinuxCapabilities) error {
 	wantNames := getCaps(which, wantCaps)
 	for name, c := range capFromName {
-		want := specutils.ContainsStr(wantNames, name)
+		want := slices.Contains(wantNames, name)
 		got := curCaps.Get(which, c)
 		if want != got {
 			if want {
@@ -70,22 +71,28 @@ func checkCaps(which capability.CapType, curCaps capability.Capabilities, wantCa
 }
 
 func TestCapabilities(t *testing.T) {
+	t.Run("directfs", func(t *testing.T) { testCapabilities(t, true) })
+	t.Run("lisafs", func(t *testing.T) { testCapabilities(t, false) })
+}
+
+func testCapabilities(t *testing.T, directfs bool) {
 	stop := testutil.StartReaper()
 	defer stop()
 
 	spec := testutil.NewSpecWithArgs("/bin/sleep", "10000")
 	caps := []string{
 		"CAP_CHOWN",
-		"CAP_SYS_PTRACE", // ptrace is added due to the platform choice.
+		"CAP_SYS_ADMIN",
+		"CAP_NET_ADMIN",
 	}
 	spec.Process.Capabilities = &specs.LinuxCapabilities{
-		Permitted:   caps,
-		Bounding:    caps,
-		Effective:   caps,
-		Inheritable: caps,
+		Permitted: caps,
+		Bounding:  caps,
+		Effective: caps,
 	}
 
 	conf := testutil.TestConfig(t)
+	conf.DirectFS = directfs
 
 	// Use --network=host to make sandbox use spec's capabilities.
 	conf.Network = config.NetworkHost
@@ -111,8 +118,22 @@ func TestCapabilities(t *testing.T) {
 		t.Fatalf("error starting container: %v", err)
 	}
 
+	caps = []string{
+		"CAP_SYS_PTRACE", // ptrace is added due to the platform choice.
+		"CAP_NET_ADMIN",
+		"CAP_NET_BIND_SERVICE",
+	}
+	wantSandboxCaps := &specs.LinuxCapabilities{
+		Permitted: caps,
+		Bounding:  caps,
+		Effective: caps,
+	}
+	if directfs {
+		// With directfs, the sandbox has additional capabilities.
+		wantSandboxCaps = specutils.MergeCapabilities(wantSandboxCaps, directfsSandboxLinuxCaps)
+	}
 	// Check that sandbox and gofer have the proper capabilities.
-	if err := checkProcessCaps(c.Sandbox.Getpid(), spec.Process.Capabilities); err != nil {
+	if err := checkProcessCaps(c.Sandbox.Getpid(), wantSandboxCaps); err != nil {
 		t.Error(err)
 	}
 	if err := checkProcessCaps(c.GoferPid, goferCaps); err != nil {

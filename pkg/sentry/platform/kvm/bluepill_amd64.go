@@ -18,15 +18,13 @@
 package kvm
 
 import (
-	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/ring0"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 )
 
-var (
-	// The action for bluepillSignal is changed by sigaction().
-	bluepillSignal = unix.SIGSEGV
-)
+func bluepillArchVCPU(context *arch.SignalContext64) *vCPU {
+	return vCPUPtr(uintptr(context.Rax))
+}
 
 // bluepillArchEnter is called during bluepillEnter.
 //
@@ -59,6 +57,32 @@ func bluepillArchEnter(context *arch.SignalContext64) *vCPU {
 	regs.Es = uint64(ring0.Udata)
 	regs.Ss = uint64(ring0.Kdata)
 	return c
+}
+
+// hltSanityCheck verifies the current state to detect obvious corruption.
+//
+//go:nosplit
+func (c *vCPU) hltSanityCheck() {
+	vector := c.CPU.Vector()
+	switch ring0.Vector(vector) {
+	case ring0.PageFault:
+		if c.CPU.FaultAddr() < ring0.KernelStartAddress {
+			return
+		}
+	case ring0.DoubleFault:
+	case ring0.GeneralProtectionFault:
+	case ring0.InvalidOpcode:
+	case ring0.MachineCheck:
+	case ring0.VirtualizationException:
+	default:
+		return
+	}
+
+	printHex([]byte("Vector    = "), uint64(c.CPU.Vector()))
+	printHex([]byte("FaultAddr = "), uint64(c.CPU.FaultAddr()))
+	printHex([]byte("rip       = "), uint64(c.CPU.Registers().Rip))
+	printHex([]byte("rsp       = "), uint64(c.CPU.Registers().Rsp))
+	throw("fault")
 }
 
 // KernelSyscall handles kernel syscalls.
@@ -102,10 +126,11 @@ func (c *vCPU) KernelSyscall() {
 func (c *vCPU) KernelException(vector ring0.Vector) {
 	regs := c.Registers()
 	if vector == ring0.Vector(bounce) {
-		// These should not interrupt kernel execution; point the Rip
-		// to zero to ensure that we get a reasonable panic when we
-		// attempt to return and a full stack trace.
-		regs.Rip = 0
+		// This go-routine was saved in hr3 and resumed in gr0 with the
+		// userspace flags. Let's adjust flags and skip the interrupt.
+		regs.Eflags &^= uint64(ring0.KernelFlagsClear)
+		regs.Eflags |= ring0.KernelFlagsSet
+		return
 	}
 	// See above.
 	ring0.HaltAndWriteFSBase(regs) // escapes: no, reload host segment.
@@ -135,6 +160,7 @@ func bluepillArchExit(c *vCPU, context *arch.SignalContext64) {
 	context.Rip = regs.Rip
 	context.Eflags = regs.Eflags
 
+	c.FloatingPointState().PrepForHostSigframe()
 	// Set the context pointer to the saved floating point state. This is
 	// where the guest data has been serialized, the kernel will restore
 	// from this new pointer value.

@@ -30,7 +30,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/test/testutil"
 	"gvisor.dev/gvisor/pkg/unet"
-	"gvisor.dev/gvisor/pkg/urpc"
 )
 
 // socketPath creates a path inside bundleDir and ensures that the returned
@@ -282,9 +281,9 @@ func TestJobControlSignalExec(t *testing.T) {
 		// our PID counts get messed up.
 		Argv: []string{"/bin/bash", "--noprofile", "--norc"},
 		// Pass the pty replica as FD 0, 1, and 2.
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{ptyReplica, ptyReplica, ptyReplica},
-		},
+		FilePayload: control.NewFilePayload(map[int]*os.File{
+			0: ptyReplica, 1: ptyReplica, 2: ptyReplica,
+		}, nil),
 		StdioIsPty: true,
 	}
 
@@ -594,6 +593,16 @@ func TestMultiContainerTerminal(t *testing.T) {
 				}
 				if err := testutil.WaitUntilRead(ptyBuf, "foo-/-123", 5*time.Second); err != nil {
 					t.Fatalf("echo didn't execute: %v", err)
+				}
+
+				// Make sure we can open /dev/tty. We do this
+				// by asking `head` to to read 0 bytes, which
+				// causes it to simply open & close the file.
+				if _, err := tc.master.Write([]byte("head -n 0 /dev/tty; echo $?\n")); err != nil {
+					t.Fatalf("master.Write(): %v", err)
+				}
+				if err := testutil.WaitUntilRead(ptyBuf, "0", 5*time.Second); err != nil {
+					t.Fatalf("head didn't execute: %v", err)
 				}
 			}
 		})

@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "usermem",
@@ -13,6 +16,7 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/atomicbitops",
+        "//pkg/binary",
         "//pkg/context",
         "//pkg/errors/linuxerr",
         "//pkg/gohacks",

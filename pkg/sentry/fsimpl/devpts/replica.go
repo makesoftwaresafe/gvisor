@@ -35,8 +35,11 @@ type replicaInode struct {
 	implStatFS
 	kernfs.InodeAttrs
 	kernfs.InodeNoopRefCount
+	kernfs.InodeNotAnonymous
 	kernfs.InodeNotDirectory
 	kernfs.InodeNotSymlink
+	kernfs.InodeWatches
+	kernfs.InodeFSOwned
 
 	locks vfs.FileLocks
 
@@ -51,25 +54,11 @@ var _ kernfs.Inode = (*replicaInode)(nil)
 
 // Open implements kernfs.Inode.Open.
 func (ri *replicaInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	fd := &replicaFileDescription{
-		inode: ri,
-	}
-	fd.LockFD.Init(&ri.locks)
-	if err := fd.vfsfd.Init(fd, opts.Flags, rp.Mount(), d.VFSDentry(), &vfs.FileDescriptionOptions{}); err != nil {
-		return nil, err
-	}
-	if opts.Flags&linux.O_NOCTTY == 0 {
-		// Opening a replica sets the process' controlling TTY when
-		// possible. An error indicates it cannot be set, and is
-		// ignored silently.
-		_ = fd.inode.t.setControllingTTY(ctx, false /* steal */, false /* isMaster */, fd.vfsfd.IsReadable())
-	}
-	return &fd.vfsfd, nil
-
+	return ri.t.Open(ctx, rp.Mount(), d.VFSDentry(), opts)
 }
 
 // Valid implements kernfs.Inode.Valid.
-func (ri *replicaInode) Valid(context.Context) bool {
+func (ri *replicaInode) Valid(context.Context, *kernfs.Dentry, string) bool {
 	// Return valid if the replica still exists.
 	ri.root.mu.Lock()
 	defer ri.root.mu.Unlock()
@@ -109,7 +98,9 @@ type replicaFileDescription struct {
 var _ vfs.FileDescriptionImpl = (*replicaFileDescription)(nil)
 
 // Release implements fs.FileOperations.Release.
-func (rfd *replicaFileDescription) Release(ctx context.Context) {}
+func (rfd *replicaFileDescription) Release(ctx context.Context) {
+	rfd.inode.t.ld.replicaClose()
+}
 
 // EventRegister implements waiter.Waitable.EventRegister.
 func (rfd *replicaFileDescription) EventRegister(e *waiter.Entry) error {
@@ -143,7 +134,7 @@ func (rfd *replicaFileDescription) Write(ctx context.Context, src usermem.IOSequ
 }
 
 // Ioctl implements vfs.FileDescriptionImpl.Ioctl.
-func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, args arch.SyscallArguments) (uintptr, error) {
+func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, sysno uintptr, args arch.SyscallArguments) (uintptr, error) {
 	t := kernel.TaskFromContext(ctx)
 	if t == nil {
 		// ioctl(2) may only be called from a task goroutine.
@@ -159,7 +150,12 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, arg
 	case linux.TCSETS:
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TCSETSW:
-		// TODO(b/29356795): This should drain the output queue first.
+		// Note that this should drain the output queue first, but we
+		// don't implement that yet.
+		return rfd.inode.t.ld.setTermios(t, args)
+	case linux.TCSETSF:
+		// This should drain the output queue and clear the input queue
+		// first, but we don't implement that yet.
 		return rfd.inode.t.ld.setTermios(t, args)
 	case linux.TIOCGPTN:
 		nP := primitive.Uint32(rfd.inode.t.n)
@@ -173,18 +169,28 @@ func (rfd *replicaFileDescription) Ioctl(ctx context.Context, io usermem.IO, arg
 		// Make the given terminal the controlling terminal of the
 		// calling process.
 		steal := args[2].Int() == 1
-		return 0, rfd.inode.t.setControllingTTY(ctx, steal, false /* isMaster */, rfd.vfsfd.IsReadable())
+		return 0, t.ThreadGroup().SetControllingTTY(ctx, rfd.inode.t.replicaKTTY, steal, rfd.vfsfd.IsReadable())
 	case linux.TIOCNOTTY:
 		// Release this process's controlling terminal.
-		return 0, rfd.inode.t.releaseControllingTTY(ctx, false /* isMaster */)
+		return 0, t.ThreadGroup().ReleaseControllingTTY(rfd.inode.t.replicaKTTY)
 	case linux.TIOCGPGRP:
-		// Get the foreground process group.
-		return rfd.inode.t.foregroundProcessGroup(ctx, args, false /* isMaster */)
+		// Get the foreground process group id.
+		pgid, err := t.ThreadGroup().ForegroundProcessGroupID(rfd.inode.t.replicaKTTY)
+		if err != nil {
+			return 0, err
+		}
+		ret := primitive.Int32(pgid)
+		_, err = ret.CopyOut(t, args[2].Pointer())
+		return 0, err
 	case linux.TIOCSPGRP:
-		// Set the foreground process group.
-		return rfd.inode.t.setForegroundProcessGroup(ctx, args, false /* isMaster */)
+		// Set the foreground process group id.
+		var pgid primitive.Int32
+		if _, err := pgid.CopyIn(t, args[2].Pointer()); err != nil {
+			return 0, err
+		}
+		return 0, t.ThreadGroup().SetForegroundProcessGroupID(rfd.inode.t.replicaKTTY, kernel.ProcessGroupID(pgid))
 	default:
-		maybeEmitUnimplementedEvent(ctx, cmd)
+		maybeEmitUnimplementedEvent(ctx, sysno, cmd)
 		return 0, linuxerr.ENOTTY
 	}
 }

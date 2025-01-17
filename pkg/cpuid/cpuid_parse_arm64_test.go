@@ -17,6 +17,8 @@
 
 package cpuid
 
-func archSkipFeature(feature Feature, major, minor int) bool {
+import "gvisor.dev/gvisor/pkg/hostos"
+
+func archSkipFeature(feature Feature, version hostos.Version) bool {
 	return false
 }

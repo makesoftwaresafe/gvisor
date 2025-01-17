@@ -15,21 +15,22 @@
 package gofer
 
 import (
+	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 )
 
-func dentryTimestampFromP9(s, ns uint64) int64 {
-	return int64(s*1e9 + ns)
+func dentryTimestamp(t linux.StatxTimestamp) int64 {
+	return t.ToNsec()
 }
 
-func dentryTimestampFromLisa(t linux.StatxTimestamp) int64 {
-	return t.Sec*1e9 + int64(t.Nsec)
+func dentryTimestampFromUnix(t unix.Timespec) int64 {
+	return dentryTimestamp(linux.StatxTimestamp{Sec: t.Sec, Nsec: uint32(t.Nsec)})
 }
 
 // Preconditions: d.cachedMetadataAuthoritative() == true.
 func (d *dentry) touchAtime(mnt *vfs.Mount) {
-	if mnt.Flags.NoATime || mnt.ReadOnly() {
+	if opts := mnt.Options(); opts.Flags.NoATime || opts.ReadOnly {
 		return
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {
@@ -45,7 +46,7 @@ func (d *dentry) touchAtime(mnt *vfs.Mount) {
 
 // Preconditions: d.metadataMu is locked. d.cachedMetadataAuthoritative() == true.
 func (d *dentry) touchAtimeLocked(mnt *vfs.Mount) {
-	if mnt.Flags.NoATime || mnt.ReadOnly() {
+	if opts := mnt.Options(); opts.Flags.NoATime || opts.ReadOnly {
 		return
 	}
 	if err := mnt.CheckBeginWrite(); err != nil {

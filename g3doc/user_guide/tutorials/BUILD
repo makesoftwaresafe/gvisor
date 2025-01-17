@@ -1,6 +1,7 @@
 load("//website:defs.bzl", "doc")
 
 package(
+    default_applicable_licenses = ["//:license"],
     default_visibility = ["//website:__pkg__"],
     licenses = ["notice"],
 )
@@ -37,6 +38,15 @@ doc(
 )
 
 doc(
+    name = "falco",
+    src = "falco.md",
+    category = "User Guide",
+    permalink = "/docs/tutorials/falco/",
+    subcategory = "Tutorials",
+    weight = "35",
+)
+
+doc(
     name = "knative",
     src = "knative.md",
     category = "User Guide",
@@ -50,6 +60,24 @@ doc(
     src = "cni.md",
     category = "User Guide",
     permalink = "/docs/tutorials/cni/",
+    subcategory = "Tutorials",
+    weight = "50",
+)
+
+doc(
+    name = "docker_in_gvisor",
+    src = "docker-in-gvisor.md",
+    category = "User Guide",
+    permalink = "/docs/tutorials/docker-in-gvisor/",
+    subcategory = "Tutorials",
+    weight = "50",
+)
+
+doc(
+    name = "docker_in_gke_sandbox",
+    src = "docker-in-gke-sandbox.md",
+    category = "User Guide",
+    permalink = "/docs/tutorials/docker-in-gke-sandbox/",
     subcategory = "Tutorials",
     weight = "50",
 )

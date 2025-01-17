@@ -32,9 +32,12 @@ type syntheticDirectory struct {
 	InodeAlwaysValid
 	InodeAttrs
 	InodeNoStatFS
+	InodeNotAnonymous
 	InodeNotSymlink
+	InodeWatches
 	OrderedChildren
 	syntheticDirectoryRefs
+	InodeFSOwned
 
 	locks vfs.FileLocks
 }

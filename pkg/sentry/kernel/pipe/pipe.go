@@ -21,11 +21,9 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/atomicbitops"
-	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/errors/linuxerr"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/safemem"
-	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -181,63 +179,9 @@ func initPipe(pipe *Pipe, isNamed bool, sizeBytes int64) {
 	pipe.max = sizeBytes
 }
 
-// NewConnectedPipe initializes a pipe and returns a pair of objects
-// representing the read and write ends of the pipe.
-func NewConnectedPipe(ctx context.Context, sizeBytes int64) (*fs.File, *fs.File) {
-	p := NewPipe(false /* isNamed */, sizeBytes)
-
-	// Build an fs.Dirent for the pipe which will be shared by both
-	// returned files.
-	perms := fs.FilePermissions{
-		User: fs.PermMask{Read: true, Write: true},
-	}
-	iops := NewInodeOperations(ctx, perms, p)
-	ino := pipeDevice.NextIno()
-	sattr := fs.StableAttr{
-		Type:      fs.Pipe,
-		DeviceID:  pipeDevice.DeviceID(),
-		InodeID:   ino,
-		BlockSize: int64(atomicIOBytes),
-	}
-	ms := fs.NewPseudoMountSource(ctx)
-	d := fs.NewDirent(ctx, fs.NewInode(ctx, iops, ms, sattr), fmt.Sprintf("pipe:[%d]", ino))
-	// The p.Open calls below will each take a reference on the Dirent. We
-	// must drop the one we already have.
-	defer d.DecRef(ctx)
-	return p.Open(ctx, d, fs.FileFlags{Read: true}), p.Open(ctx, d, fs.FileFlags{Write: true})
-}
-
-// Open opens the pipe and returns a new file.
-//
-// Precondition: at least one of flags.Read or flags.Write must be set.
-func (p *Pipe) Open(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) *fs.File {
-	flags.NonSeekable = true
-	switch {
-	case flags.Read && flags.Write:
-		p.rOpen()
-		p.wOpen()
-		return fs.NewFile(ctx, d, flags, &ReaderWriter{
-			Pipe: p,
-		})
-	case flags.Read:
-		p.rOpen()
-		return fs.NewFile(ctx, d, flags, &Reader{
-			ReaderWriter: ReaderWriter{Pipe: p},
-		})
-	case flags.Write:
-		p.wOpen()
-		return fs.NewFile(ctx, d, flags, &Writer{
-			ReaderWriter: ReaderWriter{Pipe: p},
-		})
-	default:
-		// Precondition violated.
-		panic("invalid pipe flags")
-	}
-}
-
-// peekLocked passes the first count bytes in the pipe to f and returns its
-// result. If fewer than count bytes are available, the safemem.BlockSeq passed
-// to f will be less than count bytes in length.
+// peekLocked passes the first count bytes in the pipe, starting at offset off,
+// to f and returns its result. If fewer than count bytes are available, the
+// safemem.BlockSeq passed to f will be less than count bytes in length.
 //
 // peekLocked does not mutate the pipe; if the read consumes bytes from the
 // pipe, then the caller is responsible for calling p.consumeLocked() and
@@ -247,25 +191,30 @@ func (p *Pipe) Open(ctx context.Context, d *fs.Dirent, flags fs.FileFlags) *fs.F
 // Preconditions:
 //   - p.mu must be locked.
 //   - This pipe must have readers.
-func (p *Pipe) peekLocked(count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
+//   - off <= p.size.
+func (p *Pipe) peekLocked(off, count int64, f func(safemem.BlockSeq) (uint64, error)) (int64, error) {
 	// Don't block for a zero-length read even if the pipe is empty.
 	if count == 0 {
 		return 0, nil
 	}
 
 	// Limit the amount of data read to the amount of data in the pipe.
-	if count > p.size {
-		if p.size == 0 {
+	if rem := p.size - off; count > rem {
+		if rem == 0 {
 			if !p.HasWriters() {
 				return 0, io.EOF
 			}
 			return 0, linuxerr.ErrWouldBlock
 		}
-		count = p.size
+		count = rem
 	}
 
 	// Prepare the view of the data to be read.
-	bs := p.bufBlockSeq.DropFirst64(uint64(p.off)).TakeFirst64(uint64(count))
+	pipeOff := p.off + off
+	if max := int64(len(p.buf)); pipeOff >= max {
+		pipeOff -= max
+	}
+	bs := p.bufBlockSeq.DropFirst64(uint64(pipeOff)).TakeFirst64(uint64(count))
 
 	// Perform the read.
 	done, err := f(bs)
@@ -289,7 +238,7 @@ func (p *Pipe) consumeLocked(n int64) {
 // writeLocked passes a safemem.BlockSeq representing the first count bytes of
 // unused space in the pipe to f and returns the result. If fewer than count
 // bytes are free, the safemem.BlockSeq passed to f will be less than count
-// bytes in length. If the pipe is full or otherwise cannot accomodate a write
+// bytes in length. If the pipe is full or otherwise cannot accommodate a write
 // of any number of bytes up to count, writeLocked returns ErrWouldBlock
 // without calling f.
 //
@@ -492,13 +441,6 @@ func (p *Pipe) queued() int64 {
 
 func (p *Pipe) queuedLocked() int64 {
 	return p.size
-}
-
-// FifoSize implements fs.FifoSizer.FifoSize.
-func (p *Pipe) FifoSize(context.Context, *fs.File) (int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return p.max, nil
 }
 
 // SetFifoSize implements fs.FifoSizer.SetFifoSize.

@@ -1,11 +1,16 @@
-load("//tools:defs.bzl", "pkg_deb", "pkg_tar", "select_arch", "version")
+load("//tools:arch.bzl", "select_arch")
+load("//tools:defs.bzl", "pkg_deb", "pkg_tar", "version")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 pkg_tar(
     name = "debian-bin",
     srcs = [
         "//runsc",
+        "//runsc/cmd/metricserver:runsc-metric-server",
         "//shim:containerd-shim-runsc-v1",
     ],
     mode = "0755",

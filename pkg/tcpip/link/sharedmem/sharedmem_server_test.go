@@ -31,7 +31,6 @@ import (
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/refs"
-	"gvisor.dev/gvisor/pkg/refsvfs2"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -46,11 +45,9 @@ import (
 )
 
 const (
-	localLinkAddr     = "\xde\xad\xbe\xef\x56\x78"
-	remoteLinkAddr    = "\xde\xad\xbe\xef\x12\x34"
-	localIPv4Address  = tcpip.Address("\x0a\x00\x00\x01")
-	remoteIPv4Address = tcpip.Address("\x0a\x00\x00\x02")
-	serverPort        = 10001
+	localLinkAddr  = "\xde\xad\xbe\xef\x56\x78"
+	remoteLinkAddr = "\xde\xad\xbe\xef\x12\x34"
+	serverPort     = 10001
 
 	defaultMTU        = 65536
 	defaultBufferSize = 1500
@@ -58,6 +55,11 @@ const (
 	// qDisc options
 	numQueues = 1
 	queueLen  = 1000
+)
+
+var (
+	localIPv4Address  = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x01"))
+	remoteIPv4Address = tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x02"))
 )
 
 type stackOptions struct {
@@ -95,7 +97,7 @@ func newStackWithOptions(stackOpts stackOptions) (*stack.Stack, error) {
 	// Add Protocol Address.
 	protocolNum := ipv4.ProtocolNumber
 	routeTable := []tcpip.Route{{Destination: header.IPv4EmptySubnet, NIC: nicID}}
-	if len(stackOpts.addr) == 16 {
+	if stackOpts.addr.Len() == 16 {
 		routeTable = []tcpip.Route{{Destination: header.IPv6EmptySubnet, NIC: nicID}}
 		protocolNum = ipv6.ProtocolNumber
 	}
@@ -211,7 +213,7 @@ func makeRequest(serverAddr tcpip.FullAddress, clientStk *stack.Stack) (*http.Re
 	// Close idle "keep alive" connections. If any connections remain open after
 	// a test ends, DoLeakCheck() will erroneously detect leaked packets.
 	defer httpClient.CloseIdleConnections()
-	serverURL := fmt.Sprintf("http://[%s]:%d/", net.IP(serverAddr.Addr), serverAddr.Port)
+	serverURL := fmt.Sprintf("http://[%s]:%d/", net.IP(serverAddr.Addr.AsSlice()), serverAddr.Port)
 	response, err := httpClient.Get(serverURL)
 	return response, err
 }
@@ -338,7 +340,7 @@ func TestServerBulkTransfer(t *testing.T) {
 			}
 			response.Body.Close()
 			if got, want := int(n), payloadSize; got != want {
-				t.Fatalf("unexpected resposne size got: %d, want: %d", got, want)
+				t.Fatalf("unexpected response size got: %d, want: %d", got, want)
 			}
 			log.Infof("read %d bytes", n)
 		})
@@ -394,16 +396,72 @@ func TestClientBulkTransfer(t *testing.T) {
 			}
 			response.Body.Close()
 			if got, want := int(n), payloadSize; got != want {
-				t.Fatalf("unexpected resposne size got: %d, want: %d", got, want)
+				t.Fatalf("unexpected response size got: %d, want: %d", got, want)
 			}
 			log.Infof("read %d bytes", n)
 		})
 	}
 }
 
+func TestSetLinkAddress(t *testing.T) {
+	q, err := sharedmem.NewQueuePair(sharedmem.QueueOptions{})
+	if err != nil {
+		q.Close()
+		t.Fatalf("failed to create sharedmem queue: %s", err)
+	}
+	defer q.Close()
+	ep, err := sharedmem.NewServerEndpoint(sharedmem.Options{
+		MTU:         defaultMTU,
+		BufferSize:  defaultBufferSize,
+		LinkAddress: remoteLinkAddr,
+		TX:          q.TXQueueConfig(),
+		RX:          q.RXQueueConfig(),
+		PeerFD:      123,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sharedmem endpoint: %s", err)
+	}
+	addrs := []tcpip.LinkAddress{"abc", "def"}
+	for _, addr := range addrs {
+		ep.SetLinkAddress(addr)
+
+		if want, v := addr, ep.LinkAddress(); want != v {
+			t.Errorf("LinkAddress() = %v, want %v", v, want)
+		}
+	}
+}
+
+func TestMTU(t *testing.T) {
+	q, err := sharedmem.NewQueuePair(sharedmem.QueueOptions{})
+	if err != nil {
+		q.Close()
+		t.Fatalf("failed to create sharedmem queue: %s", err)
+	}
+	defer q.Close()
+	ep, err := sharedmem.NewServerEndpoint(sharedmem.Options{
+		MTU:         defaultMTU,
+		BufferSize:  defaultBufferSize,
+		LinkAddress: remoteLinkAddr,
+		TX:          q.TXQueueConfig(),
+		RX:          q.RXQueueConfig(),
+		PeerFD:      123,
+	})
+	if err != nil {
+		t.Fatalf("failed to create sharedmem endpoint: %s", err)
+	}
+	mtus := []uint32{1000, 2000}
+	for _, mtu := range mtus {
+		ep.SetMTU(mtu)
+
+		if want, v := mtu, ep.MTU(); want != v {
+			t.Errorf("MTU() = %v, want %v", v, want)
+		}
+	}
+}
+
 func TestMain(m *testing.M) {
 	refs.SetLeakMode(refs.LeaksPanic)
 	code := m.Run()
-	refsvfs2.DoLeakCheck()
+	refs.DoLeakCheck()
 	os.Exit(code)
 }

@@ -1,7 +1,10 @@
-load("//tools:defs.bzl", "bzl_library")
 load("//test/packetdrill:defs.bzl", "packetdrill_test")
+load("//tools:defs.bzl", "bzl_library")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 packetdrill_test(
     name = "packetdrill_sanity_test",

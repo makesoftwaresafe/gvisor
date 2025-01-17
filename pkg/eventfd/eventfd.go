@@ -21,7 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
-	"gvisor.dev/gvisor/pkg/tcpip/link/rawfile"
+	"gvisor.dev/gvisor/pkg/rawfile"
 )
 
 const sizeofUint64 = 8
@@ -78,8 +78,8 @@ func (ev Eventfd) Write(val uint64) error {
 		if err == unix.EINTR {
 			continue
 		}
-		if n != sizeofUint64 {
-			panic(fmt.Sprintf("short write to eventfd: got %d bytes, wanted %d", n, sizeofUint64))
+		if err != nil || n != sizeofUint64 {
+			panic(fmt.Sprintf("bad write to eventfd: got %d bytes, wanted %d with error %v", n, sizeofUint64, err))
 		}
 		return err
 	}
@@ -95,9 +95,9 @@ func (ev Eventfd) Wait() error {
 // and returns the value read.
 func (ev Eventfd) Read() (uint64, error) {
 	var tmp [sizeofUint64]byte
-	n, err := rawfile.BlockingReadUntranslated(ev.fd, tmp[:])
-	if err != 0 {
-		return 0, err
+	n, errno := rawfile.BlockingRead(ev.fd, tmp[:])
+	if errno != 0 {
+		return 0, errno
 	}
 	if n == 0 {
 		return 0, io.EOF

@@ -20,6 +20,7 @@ import (
 
 	"golang.org/x/sys/unix"
 	"gvisor.dev/gvisor/pkg/hostarch"
+	"gvisor.dev/gvisor/pkg/hostsyscall"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/ring0"
 )
@@ -60,13 +61,15 @@ func fillAddressSpace() (excludedRegions []region) {
 	pSize -= reservedMemory
 
 	// Add specifically excluded regions; see excludeVirtualRegion.
-	applyVirtualRegions(func(vr virtualRegion) {
+	if err := applyVirtualRegions(func(vr virtualRegion) {
 		if excludeVirtualRegion(vr) {
 			excludedRegions = append(excludedRegions, vr.region)
 			vSize -= vr.length
 			log.Infof("excluded: virtual [%x,%x)", vr.virtual, vr.virtual+vr.length)
 		}
-	})
+	}); err != nil {
+		panic(fmt.Sprintf("error parsing /proc/self/maps: %v", err))
+	}
 
 	// Do we need any more work?
 	if vSize < pSize {
@@ -91,7 +94,7 @@ func fillAddressSpace() (excludedRegions []region) {
 	required := uintptr(requiredAddr)
 	current := required // Attempted mmap size.
 	for filled := uintptr(0); filled < required && current > 0; {
-		addr, _, errno := unix.RawSyscall6(
+		addr, errno := hostsyscall.RawSyscall6(
 			unix.SYS_MMAP,
 			0, // Suggested address.
 			current,

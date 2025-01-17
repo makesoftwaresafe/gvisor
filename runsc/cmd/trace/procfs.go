@@ -43,15 +43,14 @@ func (*procfs) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*procfs) Usage() string {
-	return `procfs <sandbox id> - get procfs dump for a trace session
-`
+	return "procfs <sandbox id> - get procfs dump for a trace session\n"
 }
 
 // SetFlags implements subcommands.Command.
 func (*procfs) SetFlags(*flag.FlagSet) {}
 
 // Execute implements subcommands.Command.
-func (*procfs) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (*procfs) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError

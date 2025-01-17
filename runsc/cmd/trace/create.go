@@ -48,8 +48,7 @@ func (*create) Synopsis() string {
 
 // Usage implements subcommands.Command.
 func (*create) Usage() string {
-	return `create [flags] <sandbox id> - create a trace session
-`
+	return "create [flags] <sandbox id> - create a trace session\n"
 }
 
 // SetFlags implements subcommands.Command.
@@ -59,7 +58,7 @@ func (l *create) SetFlags(f *flag.FlagSet) {
 }
 
 // Execute implements subcommands.Command.
-func (l *create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}) subcommands.ExitStatus {
+func (l *create) Execute(_ context.Context, f *flag.FlagSet, args ...any) subcommands.ExitStatus {
 	if f.NArg() != 1 {
 		f.Usage()
 		return subcommands.ExitUsageError
@@ -90,6 +89,7 @@ func (l *create) Execute(_ context.Context, f *flag.FlagSet, args ...interface{}
 		util.Fatalf("creating session: %v", err)
 	}
 
+	fmt.Printf("Trace session %q created.\n", sessionConfig.Name)
 	return subcommands.ExitSuccess
 }
 

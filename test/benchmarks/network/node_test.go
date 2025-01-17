@@ -23,6 +23,7 @@ import (
 	"gvisor.dev/gvisor/pkg/test/dockerutil"
 	"gvisor.dev/gvisor/test/benchmarks/harness"
 	"gvisor.dev/gvisor/test/benchmarks/tools"
+	"gvisor.dev/gvisor/test/metricsviz"
 )
 
 // BenchmarkNode runs requests using 'hey' against a Node server run on
@@ -75,9 +76,10 @@ func runNode(b *testing.B, hey *tools.Hey) {
 	if err := redis.Spawn(ctx, dockerutil.RunOpts{
 		Image: "benchmarks/redis",
 	}); err != nil {
-		b.Fatalf("failed to spwan redis instance: %v", err)
+		b.Fatalf("failed to spawn redis instance: %v", err)
 	}
 	defer redis.CleanUp(ctx)
+	defer metricsviz.FromContainerLogs(ctx, b, redis)
 
 	if out, err := redis.WaitForOutput(ctx, "Ready to accept connections", 3*time.Second); err != nil {
 		b.Fatalf("failed to start redis server: %v %s", err, out)
@@ -102,26 +104,17 @@ func runNode(b *testing.B, hey *tools.Hey) {
 	}
 	defer nodeApp.CleanUp(ctx)
 
-	servingIP, err := serverMachine.IPAddress()
-	if err != nil {
-		b.Fatalf("failed to get ip from server: %v", err)
-	}
-
-	servingPort, err := nodeApp.FindPort(ctx, port)
-	if err != nil {
-		b.Fatalf("failed to port from node instance: %v", err)
-	}
-
 	// Wait until the Client sees the server as up.
-	harness.WaitUntilServing(ctx, clientMachine, servingIP, servingPort)
+	harness.WaitUntilContainerServing(ctx, clientMachine, nodeApp, port)
 
-	heyCmd := hey.MakeCmd(servingIP, servingPort)
+	heyCmd := hey.MakeCmd("node", port)
 
 	// the client should run on Native.
 	b.ResetTimer()
 	client := clientMachine.GetNativeContainer(ctx, b)
 	out, err := client.Run(ctx, dockerutil.RunOpts{
 		Image: "benchmarks/hey",
+		Links: []string{nodeApp.MakeLink("node")},
 	}, heyCmd...)
 	if err != nil {
 		b.Fatalf("hey container failed: %v logs: %s", err, out)

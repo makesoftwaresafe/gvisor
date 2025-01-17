@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build go1.1
-// +build go1.1
+//go:build !false
+// +build !false
 
 package memutil
 
@@ -23,8 +23,8 @@ import (
 
 // MapFile returns a memory mapping configured by the given options as per
 // mmap(2).
-func MapFile(addr, len, prot, flags, fd, offset uintptr) (uintptr, error) {
-	m, _, e := unix.RawSyscall6(unix.SYS_MMAP, addr, len, prot, flags, fd, offset)
+func MapFile(addr, size, prot, flags, fd, offset uintptr) (uintptr, error) {
+	m, _, e := unix.RawSyscall6(unix.SYS_MMAP, addr, size, prot, flags, fd, offset)
 	if e != 0 {
 		return 0, e
 	}

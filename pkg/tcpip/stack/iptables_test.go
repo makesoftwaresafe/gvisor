@@ -30,7 +30,7 @@ const (
 	dstPort    = 3
 
 	// The network protocol used for these tests doesn't matter as the tests are
-	// not targetting anything protocol specific.
+	// not targeting anything protocol specific.
 	ipv6     = true
 	netProto = header.IPv6ProtocolNumber
 )
@@ -82,7 +82,7 @@ func TestNATedConnectionReap(t *testing.T) {
 		Rules: []Rule{
 			// Prerouting
 			{
-				Target: &DNATTarget{NetworkProtocol: netProto, Addr: nattedAddr, Port: nattedPort},
+				Target: &DNATTarget{NetworkProtocol: netProto, Addr: nattedAddr, Port: nattedPort, ChangePort: true, ChangeAddress: true},
 			},
 			{
 				Target: &AcceptTarget{},
@@ -147,8 +147,10 @@ func TestNATedConnectionReap(t *testing.T) {
 	}
 	replyTID := invertedReplyTID.reply()
 
+	iptables.connections.mu.RLock()
 	originalBktID := iptables.connections.bucket(originalTID)
 	replyBktID := iptables.connections.bucket(replyTID)
+	iptables.connections.mu.RUnlock()
 
 	// This test depends on the original and reply tuples mapping to different
 	// buckets.
@@ -225,7 +227,7 @@ func TestNATedConnectionReap(t *testing.T) {
 		bkt.mu.RLock()
 		defer bkt.mu.RUnlock()
 		for tuple := bkt.tuples.Front(); tuple != nil; tuple = tuple.Next() {
-			if tuple.id() == tid {
+			if tuple.tupleID == tid {
 				t.Errorf("unexpectedly found tuple with ID = %#v; reply = %t", tid, reply)
 			}
 		}
@@ -235,7 +237,9 @@ func TestNATedConnectionReap(t *testing.T) {
 }
 
 // TestNATAlwaysPerformed tests that a connection will have a noop-NAT
-// performed on it when no rule matches its associated packet.
+// performed on it when no rule matches its associated packet. (Note that SNAT
+// is performed on all connections to ensure that ports used by locally
+// generated traffic do not clash with ports used by forwarded traffic.
 func TestNATAlwaysPerformed(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -298,7 +302,7 @@ func TestNATAlwaysPerformed(t *testing.T) {
 			iptables := DefaultTables(clock, rand.New(rand.NewSource(0 /* seed */)))
 
 			// Just to make sure the iptables is not short circuited.
-			iptables.ReplaceTable(NATID, iptables.GetTable(NATID, ipv6), ipv6)
+			iptables.ForceReplaceTable(NATID, iptables.GetTable(NATID, ipv6), ipv6)
 
 			pkt := v6PacketBuffer()
 
@@ -315,8 +319,8 @@ func TestNATAlwaysPerformed(t *testing.T) {
 			conn.mu.RLock()
 			srcManip := conn.sourceManip
 			conn.mu.RUnlock()
-			if srcManip != manipPerformedNoop {
-				t.Errorf("got destManip = %d, want = %d", destManip, manipPerformedNoop)
+			if srcManip != manipPerformed {
+				t.Errorf("got srcManip = %d, want = %d", srcManip, manipPerformed)
 			}
 		})
 	}
@@ -379,7 +383,7 @@ func TestNATConflict(t *testing.T) {
 
 					// Input
 					{
-						Target: &SNATTarget{NetworkProtocol: header.IPv6ProtocolNumber, Addr: nattedAddr, Port: nattedPort},
+						Target: &SNATTarget{NetworkProtocol: header.IPv6ProtocolNumber, Addr: nattedAddr, Port: nattedPort, ChangeAddress: true, ChangePort: true},
 					},
 					{
 						Target: &AcceptTarget{},
@@ -397,7 +401,7 @@ func TestNATConflict(t *testing.T) {
 
 					// Postrouting
 					{
-						Target: &SNATTarget{NetworkProtocol: header.IPv6ProtocolNumber, Addr: nattedAddr, Port: nattedPort},
+						Target: &SNATTarget{NetworkProtocol: header.IPv6ProtocolNumber, Addr: nattedAddr, Port: nattedPort, ChangeAddress: true, ChangePort: true},
 					},
 					{
 						Target: &AcceptTarget{},

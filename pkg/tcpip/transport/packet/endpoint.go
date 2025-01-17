@@ -63,7 +63,7 @@ type endpoint struct {
 
 	// The following fields are initialized at creation time and are
 	// immutable.
-	stack       *stack.Stack `state:"manual"`
+	stack       *stack.Stack
 	waiterQueue *waiter.Queue
 	cooked      bool
 	ops         tcpip.SocketOptions
@@ -94,7 +94,7 @@ type endpoint struct {
 }
 
 // NewEndpoint returns a new packet endpoint.
-func NewEndpoint(s *stack.Stack, cooked bool, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) (tcpip.Endpoint, tcpip.Error) {
+func NewEndpoint(s *stack.Stack, cooked bool, netProto tcpip.NetworkProtocolNumber, waiterQueue *waiter.Queue) tcpip.Endpoint {
 	ep := &endpoint{
 		stack:         s,
 		cooked:        cooked,
@@ -115,10 +115,9 @@ func NewEndpoint(s *stack.Stack, cooked bool, netProto tcpip.NetworkProtocolNumb
 		ep.ops.SetReceiveBufferSize(int64(rs.Default), false /* notify */)
 	}
 
-	if err := s.RegisterPacketEndpoint(0, netProto, ep); err != nil {
-		return nil, err
-	}
-	return ep, nil
+	s.RegisterPacketEndpoint(0, netProto, ep)
+
+	return ep
 }
 
 // Abort implements stack.TransportEndpoint.Abort.
@@ -219,7 +218,7 @@ func (ep *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tc
 
 	var remote tcpip.LinkAddress
 	if to := opts.To; to != nil {
-		remote = tcpip.LinkAddress(to.Addr)
+		remote = to.LinkAddr
 
 		if n := to.NIC; n != 0 {
 			nicID = n
@@ -234,21 +233,26 @@ func (ep *endpoint) Write(p tcpip.Payloader, opts tcpip.WriteOptions) (int64, tc
 		return 0, &tcpip.ErrInvalidOptionValue{}
 	}
 
-	// TODO(https://gvisor.dev/issue/6538): Avoid this allocation.
-	payloadBytes := make([]byte, p.Len())
-	if _, err := io.ReadFull(p, payloadBytes); err != nil {
+	// Prevents giant buffer allocations.
+	if p.Len() > header.DatagramMaximumSize {
+		return 0, &tcpip.ErrMessageTooLong{}
+	}
+
+	var payload buffer.Buffer
+	if _, err := payload.WriteFromReader(p, int64(p.Len())); err != nil {
 		return 0, &tcpip.ErrBadBuffer{}
 	}
+	payloadSz := payload.Size()
 
 	if err := func() tcpip.Error {
 		if ep.cooked {
-			return ep.stack.WritePacketToRemote(nicID, remote, proto, buffer.NewWithData(payloadBytes))
+			return ep.stack.WritePacketToRemote(nicID, remote, proto, payload)
 		}
-		return ep.stack.WriteRawPacket(nicID, proto, buffer.NewWithData(payloadBytes))
+		return ep.stack.WriteRawPacket(nicID, proto, payload)
 	}(); err != nil {
 		return 0, err
 	}
-	return int64(len(payloadBytes)), nil
+	return payloadSz, nil
 }
 
 // Disconnect implements tcpip.Endpoint.Disconnect. Packet sockets cannot be
@@ -258,7 +262,7 @@ func (*endpoint) Disconnect() tcpip.Error {
 }
 
 // Connect implements tcpip.Endpoint.Connect. Packet sockets cannot be
-// connected, and this function always returnes *tcpip.ErrNotSupported.
+// connected, and this function always returns *tcpip.ErrNotSupported.
 func (*endpoint) Connect(tcpip.FullAddress) tcpip.Error {
 	return &tcpip.ErrNotSupported{}
 }
@@ -444,17 +448,17 @@ func (ep *endpoint) HandlePacket(nicID tcpip.NICID, netProto tcpip.NetworkProtoc
 		receivedAt: ep.stack.Clock().Now(),
 	}
 
-	if len(pkt.LinkHeader().View()) != 0 {
-		hdr := header.Ethernet(pkt.LinkHeader().View())
-		rcvdPkt.senderAddr.Addr = tcpip.Address(hdr.SourceAddress())
+	if len(pkt.LinkHeader().Slice()) != 0 {
+		hdr := header.Ethernet(pkt.LinkHeader().Slice())
+		rcvdPkt.senderAddr.LinkAddr = hdr.SourceAddress()
 	}
 
 	// Raw packet endpoints include link-headers in received packets.
-	pktBuf := pkt.Buffer()
+	pktBuf := pkt.ToBuffer()
 	if ep.cooked {
 		// Cooked packet endpoints don't include the link-headers in received
 		// packets.
-		pktBuf.TrimFront(int64(len(pkt.LinkHeader().View()) + len(pkt.VirtioNetHeader().View())))
+		pktBuf.TrimFront(int64(len(pkt.LinkHeader().Slice()) + len(pkt.VirtioNetHeader().Slice())))
 	}
 	rcvdPkt.data = stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: pktBuf})
 

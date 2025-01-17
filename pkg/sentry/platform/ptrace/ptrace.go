@@ -45,10 +45,9 @@
 package ptrace
 
 import (
-	"os"
-
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	pkgcontext "gvisor.dev/gvisor/pkg/context"
+	"gvisor.dev/gvisor/pkg/fd"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
@@ -105,7 +104,7 @@ func (*PTrace) NewContext(ctx pkgcontext.Context) platform.Context {
 }
 
 // Switch runs the provided context in the given address space.
-func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac arch.Context, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
+func (c *context) Switch(ctx pkgcontext.Context, mm platform.MemoryManager, ac *arch.Context64, cpu int32) (*linux.SignalInfo, hostarch.AccessType, error) {
 	as := mm.AddressSpace()
 	s := as.(*subprocess)
 restart:
@@ -197,13 +196,17 @@ func (c *context) Release() {}
 func (c *context) FullStateChanged() {}
 
 // PullFullState implements platform.Context.PullFullState.
-func (c *context) PullFullState(as platform.AddressSpace, ac arch.Context) {}
+func (c *context) PullFullState(as platform.AddressSpace, ac *arch.Context64) error { return nil }
+
+// PrepareSleep implements platform.Context.platform.PrepareSleep.
+func (*context) PrepareSleep() {}
 
 // PTrace represents a collection of ptrace subprocesses.
 type PTrace struct {
 	platform.MMapMinAddr
 	platform.NoCPUPreemptionDetection
 	platform.UseHostGlobalMemoryBarrier
+	platform.DoesNotOwnPageTables
 }
 
 // New returns a new ptrace-based implementation of the platform interface.
@@ -251,28 +254,25 @@ func (*PTrace) MaxUserAddress() hostarch.Addr {
 }
 
 // NewAddressSpace returns a new subprocess.
-func (p *PTrace) NewAddressSpace(interface{}) (platform.AddressSpace, <-chan struct{}, error) {
+func (p *PTrace) NewAddressSpace(any) (platform.AddressSpace, <-chan struct{}, error) {
 	as, err := newSubprocess(globalPool.master.createStub)
 	return as, nil, err
 }
 
 type constructor struct{}
 
-func (*constructor) New(*os.File) (platform.Platform, error) {
+func (*constructor) New(*fd.FD) (platform.Platform, error) {
 	return New()
 }
 
-func (*constructor) OpenDevice(_ string) (*os.File, error) {
+func (*constructor) OpenDevice(_ string) (*fd.FD, error) {
 	return nil, nil
 }
 
 // Flags implements platform.Constructor.Flags().
 func (*constructor) Requirements() platform.Requirements {
-	// TODO(b/75837838): Also set a new PID namespace so that we limit
-	// access to other host processes.
 	return platform.Requirements{
 		RequiresCapSysPtrace: true,
-		RequiresCurrentPIDNS: true,
 	}
 }
 

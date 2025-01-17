@@ -75,8 +75,8 @@ func (f *fdReader) Read(p []byte) (int, error) {
 func cat(k *kernel.Kernel, path string, output *os.File) error {
 	ctx := k.SupervisorContext()
 	creds := auth.NewRootCredentials(k.RootUserNamespace())
-	mns := k.GlobalInit().Leader().MountNamespaceVFS2()
-	root := mns.Root()
+	mns := k.GlobalInit().Leader().MountNamespace()
+	root := mns.Root(ctx)
 	defer root.DecRef(ctx)
 
 	fd, err := k.VFS().OpenAt(ctx, creds, &vfs.PathOperation{

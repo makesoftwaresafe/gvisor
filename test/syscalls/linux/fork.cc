@@ -17,19 +17,25 @@
 #include <sched.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 
+#include "gmock/gmock.h"
 #include "gtest/gtest.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "test/util/capability_util.h"
+#include "test/util/linux_capability_util.h"
 #include "test/util/logging.h"
 #include "test/util/memory_util.h"
+#include "test/util/posix_error.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -362,7 +368,7 @@ TEST_F(ForkTest, SigAltStack) {
     MaybeSave();
 
     TEST_CHECK((oss.ss_flags & SS_DISABLE) == 0);
-    TEST_CHECK(oss.ss_size == SIGSTKSZ);
+    TEST_CHECK(oss.ss_size == (size_t)SIGSTKSZ);
     TEST_CHECK(oss.ss_sp == stack.ss_sp);
 
     Exit(0);
@@ -431,9 +437,33 @@ TEST(CloneTest, NewUserNamespacePermitsAllOtherNamespaces) {
       << "status = " << status;
 }
 
+TEST(CloneTest, NewUserMountNamespace) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+  Mapping child_stack = ASSERT_NO_ERRNO_AND_VALUE(
+      MmapAnon(kPageSize, PROT_READ | PROT_WRITE, MAP_PRIVATE));
+  int child_pid;
+  ASSERT_THAT(child_pid = clone(
+                  +[](void*) {
+                    TEST_CHECK_SUCCESS(mount(nullptr, "/", nullptr,
+                                             MS_REC | MS_PRIVATE, nullptr));
+                    return 0;
+                  },
+                  reinterpret_cast<void*>(child_stack.addr() + kPageSize),
+                  CLONE_NEWUSER | CLONE_NEWIPC | CLONE_NEWNET | CLONE_NEWUTS |
+                      SIGCHLD | CLONE_NEWNS,
+                  /* arg = */ nullptr),
+              SyscallSucceeds());
+  int status;
+  ASSERT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status = " << status;
+}
+
 // Clone with CLONE_SETTLS and a non-canonical TLS address is rejected.
 TEST(CloneTest, NonCanonicalTLS) {
-  constexpr uintptr_t kNonCanonical = 1ull << 48;
+  constexpr uintptr_t kNonCanonical = 1ull << 63;
 
   // We need a valid address for the stack pointer. We'll never actually execute
   // on this.
@@ -452,11 +482,84 @@ TEST(CloneTest, NonCanonicalTLS) {
   EXPECT_THAT(syscall(__NR_clone, SIGCHLD | CLONE_SETTLS, &stack, nullptr,
                       nullptr, kNonCanonical),
               SyscallFailsWithErrno(EPERM));
-#elif defined(__aarch64__)
+#elif defined(__aarch64__) || defined(__riscv)
   EXPECT_THAT(syscall(__NR_clone, SIGCHLD | CLONE_SETTLS, &stack, nullptr,
                       kNonCanonical, nullptr),
               SyscallFailsWithErrno(EPERM));
 #endif
+}
+
+#ifndef SYS_clone3
+#define SYS_clone3 435
+#endif  // SYS_clone3
+
+// struct clone_args is a Linux clone struct. Old versions of glibc do not
+// expose it. See include/uapi/linux/sched.h
+struct clone_args {
+  uint64_t flags;
+  uint64_t pidfd;
+  uint64_t child_tid;
+  uint64_t parent_tid;
+  uint64_t exit_signal;
+  uint64_t stack;
+  uint64_t stack_size;
+  uint64_t tls;
+  uint64_t set_tid;
+  uint64_t set_tid_size;
+  uint64_t cgroup;
+};
+
+int clone3(struct clone_args* ca, size_t size) {
+  return syscall(SYS_clone3, ca, size);
+}
+
+// Checks that clone fails for any unsupported flag.
+TEST(CloneTest, Clone3UnknownFlag) {
+  clone_args ca = {};
+  ca.flags = (1ULL << 63);
+  ca.exit_signal = SIGCHLD;
+  EXPECT_THAT(clone3(&ca, sizeof(ca)), SyscallFailsWithErrno(EINVAL));
+}
+
+// Clone3 works as Clone.
+TEST(CloneTest, Clone3AsClone) {
+  clone_args ca = {};
+  ca.exit_signal = SIGCHLD;
+
+  int child_pid;
+  EXPECT_THAT(child_pid = clone3(&ca, sizeof(ca)), SyscallSucceeds());
+
+  if (child_pid == 0) {
+    exit(0);
+  }
+
+  int status;
+  EXPECT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+// Clone3 works with basic Clone3 values for args like exit_signal & parent_tid.
+TEST(CloneTest, Clone3Basic) {
+  clone_args ca = {};
+
+  ca.flags = CLONE_PARENT_SETTID;
+  ca.exit_signal = SIGCHLD;
+
+  pid_t store_child_tid = 0;
+  ca.parent_tid = reinterpret_cast<uint64_t>(&store_child_tid);
+  int child_pid;
+  EXPECT_THAT(child_pid = clone3(&ca, sizeof(ca)), SyscallSucceeds());
+  EXPECT_EQ(store_child_tid, child_pid);
+
+  if (child_pid == 0) {
+    exit(0);
+  }
+
+  int status;
+  EXPECT_THAT(waitpid(child_pid, &status, 0),
+              SyscallSucceedsWithValue(child_pid));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 }  // namespace

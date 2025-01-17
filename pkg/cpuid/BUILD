@@ -1,6 +1,9 @@
 load("//tools:defs.bzl", "go_library", "go_test")
 
-package(licenses = ["notice"])
+package(
+    default_applicable_licenses = ["//:license"],
+    licenses = ["notice"],
+)
 
 go_library(
     name = "cpuid",
@@ -10,6 +13,8 @@ go_library(
         "cpuid_arm64.go",
         "features_amd64.go",
         "features_arm64.go",
+        "hwcap_amd64.go",
+        "hwcap_arm64.go",
         "native_amd64.go",
         "native_amd64.s",
         "native_arm64.go",
@@ -18,6 +23,7 @@ go_library(
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/log",
+        "//pkg/sync",
     ],
 )
 
@@ -29,6 +35,11 @@ go_test(
         "cpuid_test.go",
     ],
     library = ":cpuid",
+    # NOTE: It seems that bazel code generation does not properly parse tags
+    # when run via the architecture transition for nogo. This should be fixed
+    # at some point in the future, but for now we can simply skip nogo analysis
+    # on the test itself. It still applies to the core library.
+    nogo = False,
 )
 
 go_test(
@@ -40,6 +51,9 @@ go_test(
         "cpuid_parse_test.go",
     ],
     library = ":cpuid",
-    tags = ["manual"],
+    tags = [
+        "manual",
+        "not_run:arm",
+    ],
     deps = ["//pkg/hostos"],
 )

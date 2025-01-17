@@ -58,27 +58,27 @@ func NewCalibratedClock(c ClockID) *CalibratedClock {
 }
 
 // Debugf logs at debug level.
-func (c *CalibratedClock) Debugf(format string, v ...interface{}) {
+func (c *CalibratedClock) Debugf(format string, v ...any) {
 	if log.IsLogging(log.Debug) {
-		args := []interface{}{c.ref.clockID}
+		args := []any{c.ref.clockID}
 		args = append(args, v...)
 		log.Debugf("CalibratedClock(%v): "+format, args...)
 	}
 }
 
 // Infof logs at debug level.
-func (c *CalibratedClock) Infof(format string, v ...interface{}) {
+func (c *CalibratedClock) Infof(format string, v ...any) {
 	if log.IsLogging(log.Info) {
-		args := []interface{}{c.ref.clockID}
+		args := []any{c.ref.clockID}
 		args = append(args, v...)
 		log.Infof("CalibratedClock(%v): "+format, args...)
 	}
 }
 
 // Warningf logs at debug level.
-func (c *CalibratedClock) Warningf(format string, v ...interface{}) {
+func (c *CalibratedClock) Warningf(format string, v ...any) {
 	if log.IsLogging(log.Warning) {
-		args := []interface{}{c.ref.clockID}
+		args := []any{c.ref.clockID}
 		args = append(args, v...)
 		log.Warningf("CalibratedClock(%v): "+format, args...)
 	}
@@ -86,18 +86,18 @@ func (c *CalibratedClock) Warningf(format string, v ...interface{}) {
 
 // reset forces the clock to restart the calibration process, logging the
 // passed message.
-func (c *CalibratedClock) reset(str string, v ...interface{}) {
+func (c *CalibratedClock) reset(str string, v ...any) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.resetLocked(str, v...)
 }
 
 // resetLocked is equivalent to reset with c.mu already held for writing.
-func (c *CalibratedClock) resetLocked(str string, v ...interface{}) {
+func (c *CalibratedClock) resetLocked(str string, v ...any) {
 	c.Warningf(str+" Resetting clock; time may jump.", v...)
 	c.ready = false
 	c.ref.Reset()
-	metric.WeirdnessMetric.Increment("time_fallback")
+	metric.WeirdnessMetric.Increment(&metric.WeirdnessTypeTimeFallback)
 }
 
 // updateParams updates the timekeeping parameters based on the passed
@@ -126,16 +126,13 @@ func (c *CalibratedClock) updateParams(actual Parameters) {
 		c.resetLocked("Unable to update params: %v.", err)
 		return
 	}
-	logErrorAdjustment(c.ref.clockID, errorNS, c.params, newParams)
 
 	if errorNS.Magnitude() >= MaxClockError {
 		// We should never get such extreme error, something is very
 		// wrong. Reset everything and start again.
 		//
-		// N.B. logErrorAdjustment will have already logged the error
-		// at warning level.
-		//
 		// TODO(mpratt): We could allow Realtime clock jumps here.
+		log.Warningf("Clock(%v): error: %v ns, adjusted frequency from %v Hz to %v Hz", c.ref.clockID, errorNS, c.params.Frequency, newParams.Frequency)
 		c.resetLocked("Extreme clock error.")
 		return
 	}
