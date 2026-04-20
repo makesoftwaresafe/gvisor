@@ -10,11 +10,11 @@ network driver and the bridge network driver are supported.
 
 ### Supported Docker version mapping in GKE cluster
 
-           | GKE standard cluster | GKE autopilot cluster
----------- | -------------------- | ---------------------
-Docker v27 | 1.29.0 and later     | 1.33.2 and later
-Docker v28 | 1.35.3 and later     | 1.35.3 and later
-Docker v29 | not supported        | not supported
+Docker Version | GKE standard cluster | GKE autopilot cluster
+-------------- | -------------------- | ---------------------
+Docker v27     | 1.29.0 and later     | 1.33.2 and later
+Docker v28     | 1.35.3 and later     | 1.35.3 and later
+Docker v29     | not supported        | not supported
 
 ### GKE standard cluster
 
