@@ -62,19 +62,31 @@ spec:
     image: {registry_url}/docker-in-gvisor:latest
     securityContext:
       capabilities:
-        # NET_ADMIN and SYS_ADMIN are required.
-        add: [AUDIT_WRITE,CHOWN,DAC_OVERRIDE,FOWNER,FSETID,KILL,MKNOD,NET_BIND_SERVICE,NET_RAW,SETFCAP,SETGID,SETPCAP,SETUID,SYS_CHROOT,SYS_PTRACE,NET_ADMIN,SYS_ADMIN]
+        # NOTE: This setting does **not** grant any capabilities on the host.
+        # gVisor *always* runs with zero privileges and zero capabilities,
+        # regardless of this setting.
+        add: [
+          # Required for Docker daemon to work in the sandbox.
+          # This does *NOT* grant any host capabilities. See below.
+          NET_ADMIN,SYS_ADMIN,
+          # Default set of capabilities granted to any container:
+          AUDIT_WRITE,CHOWN,DAC_OVERRIDE,FOWNER,FSETID,KILL,MKNOD,NET_BIND_SERVICE,NET_RAW,SETFCAP,SETGID,SETPCAP,SETUID,SYS_CHROOT,SYS_PTRACE,
+        ]
     volumeMounts:
       - name: docker
+        # NOTE: This does *not* expose any host directory;
+        # this just mounts a tmpfs here.
         mountPath: /var/lib/docker
   volumes:
   - name: docker
-    emptyDir: {}
+    emptyDir: {}  # tmpfs
 ```
 
-> gVisor sandbox doesn't need any extra capabilities from the host to run docker
-> inside gVisor, the listed capabilities are granted by gVisor to the docker
-> daemon that is running inside sandbox.
+> **NOTE**: **gVisor *never* runs with capabilities** on the host Linux kernel,
+> even when the above `securityContext.capabilities` fields are specified. These
+> fields only control the capabilities *perceived* by the in-sandbox application
+> (in this case, the in-sandbox Docker daemon). This does not provide the
+> sandboxed application, nor the gVisor sandbox itself, any host privileges.
 
 This YAML file defines a Kubernetes Pod named docker-in-gvisor that will run a
 single container from the {registry_url}/docker-in-gvisor:latest image.

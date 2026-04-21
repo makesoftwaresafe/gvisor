@@ -75,12 +75,15 @@ as `audit_write`, `chown`, `dac_override`, `fowner`, `fsetid`, `kill`, `mknod`,
 start the sandbox with all capabilities:
 
 ```shell
+# NOTE: `--cap-add` does *NOT* grant any host capabilities. See below.
 $ docker run --runtime runsc -d --rm --cap-add all --name docker-in-gvisor docker-in-gvisor
 ```
 
-> gVisor sandbox doesn't need any extra capabilities from the host to run docker
-> inside gVisor, the listed capabilities are granted by gVisor to the docker
-> daemon that is running inside sandbox.
+> **NOTE**: **gVisor *never* runs with capabilities** on the host Linux kernel,
+> even when the above `--cap-add all` flag. This flag only controls the
+> capabilities *perceived* by the in-sandbox application (in this case, the
+> in-sandbox Docker daemon). This does not provide the sandboxed application,
+> nor the gVisor sandbox itself, any host privileges.
 
 Now, we can build and run Docker containers.
 
