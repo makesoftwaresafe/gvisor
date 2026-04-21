@@ -16,17 +16,17 @@
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 
-#include <vector>
-
 #include "gtest/gtest.h"
 #include "test/util/file_descriptor.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/mount_util.h"
 #include "test/util/temp_path.h"
 #include "test/util/test_util.h"
-#include "test/util/thread_util.h"
 
 namespace gvisor {
 namespace testing {
@@ -76,6 +76,62 @@ TEST(MknodTest, MknodAtFIFO) {
   ASSERT_THAT(stat(fifo.c_str(), &st), SyscallSucceeds());
   EXPECT_TRUE(S_ISFIFO(st.st_mode));
 }
+
+#ifndef __Fuchsia__  // Fuchsia doesn't support caps.
+// Test that mknod(S_IFCHR) requires CAP_MKNOD.
+TEST(MknodTest, CharacterDeviceRequiresCapMknod) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_MKNOD)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const auto mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), "tmpfs", 0, "", 0));
+  const std::string path = dir.path() + "/device";
+
+  // With CAP_MKNOD: should succeed.
+  ASSERT_THAT(mknod(path.c_str(), S_IFCHR | 0666, makedev(1, 3)),
+              SyscallSucceeds());
+  ASSERT_THAT(unlink(path.c_str()), SyscallSucceeds());
+
+  // Drop CAP_MKNOD: should fail with EPERM.
+  AutoCapability cap(CAP_MKNOD, false);
+  EXPECT_THAT(mknod(path.c_str(), S_IFCHR | 0666, makedev(1, 3)),
+              SyscallFailsWithErrno(EPERM));
+}
+#endif  // __Fuchsia__
+
+#ifndef __Fuchsia__  // Fuchsia doesn't support caps.
+// Test that mknod(S_IFBLK) requires CAP_MKNOD.
+TEST(MknodTest, BlockDeviceRequiresCapMknod) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_MKNOD)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
+
+  const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
+  const auto mount =
+      ASSERT_NO_ERRNO_AND_VALUE(Mount("", dir.path(), "tmpfs", 0, "", 0));
+  const std::string path = dir.path() + "/device";
+
+  // With CAP_MKNOD: should succeed.
+  ASSERT_THAT(mknod(path.c_str(), S_IFBLK | 0666, makedev(7, 0)),
+              SyscallSucceeds());
+  ASSERT_THAT(unlink(path.c_str()), SyscallSucceeds());
+
+  // Drop CAP_MKNOD: should fail with EPERM.
+  AutoCapability cap(CAP_MKNOD, false);
+  EXPECT_THAT(mknod(path.c_str(), S_IFBLK | 0666, makedev(7, 0)),
+              SyscallFailsWithErrno(EPERM));
+}
+#endif  // __Fuchsia__
+
+#ifndef __Fuchsia__  // Fuchsia doesn't support caps.
+// Test that mknod(S_IFIFO) does NOT require CAP_MKNOD.
+TEST(MknodTest, FifoDoesNotRequireCapMknod) {
+  const std::string path = NewTempAbsPath();
+  AutoCapability cap(CAP_MKNOD, false);
+  EXPECT_THAT(mknod(path.c_str(), S_IFIFO | 0666, 0), SyscallSucceeds());
+  EXPECT_THAT(unlink(path.c_str()), SyscallSucceeds());
+}
+#endif  // __Fuchsia__
 
 TEST(MknodTest, MknodOnExistingPathFails) {
   const TempPath file = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateFile());

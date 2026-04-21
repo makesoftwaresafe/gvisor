@@ -15,12 +15,17 @@
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#include <cerrno>
 
 #include "gtest/gtest.h"
 #include "absl/strings/str_split.h"
 #include "test/util/cleanup.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/posix_error.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -214,6 +219,51 @@ TEST_F(AffinityTest, SmallCpuMask) {
   CPU_ZERO_S(mask_size, mask);
   ASSERT_THAT(sched_getaffinity(0, mask_size, mask), SyscallSucceeds());
 }
+
+#ifndef __Fuchsia__  // Fuchsia doesn't support caps.
+// Test that sched_setaffinity on another task owned by a different UID
+// requires CAP_SYS_NICE.
+TEST_F(AffinityTest, SetAffinityOtherUidRequiresCapSysNice) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_NICE)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  int child_ready[2];
+  ASSERT_THAT(pipe(child_ready), SyscallSucceeds());
+
+  pid_t child = fork();
+  ASSERT_THAT(child, SyscallSucceeds());
+
+  if (child == 0) {
+    constexpr int kUnprivilegedUid = 12345;
+    close(child_ready[0]);
+    TEST_PCHECK(
+        setresuid(kUnprivilegedUid, kUnprivilegedUid, kUnprivilegedUid) == 0);
+
+    char ready = 'r';
+    write(child_ready[1], &ready, 1);
+    close(child_ready[1]);
+    _exit(0);
+  }
+
+  close(child_ready[1]);
+  char ready;
+  ASSERT_THAT(read(child_ready[0], &ready, 1), SyscallSucceedsWithValue(1));
+  close(child_ready[0]);
+
+  EXPECT_THAT(sched_setaffinity(child, sizeof(mask_), &mask_),
+              SyscallSucceeds());
+
+  AutoCapability cap(CAP_SYS_NICE, false);
+  EXPECT_THAT(sched_setaffinity(child, sizeof(mask_), &mask_),
+              SyscallFailsWithErrno(EPERM));
+
+  int status;
+  EXPECT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status = " << status;
+}
+#endif  // __Fuchsia__
 
 TEST_F(AffinityTest, LargeCpuMask) {
   // sched_setaffinity() is a no-op on platform/KVM

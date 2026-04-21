@@ -15,16 +15,19 @@
 #include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "absl/strings/numbers.h"
 #include "absl/strings/str_split.h"
-#include "test/util/capability_util.h"
 #include "test/util/fs_util.h"
+#include "test/util/linux_capability_util.h"
+#include "test/util/logging.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
 
@@ -188,6 +191,50 @@ TEST(SetpriorityTest, NiceSucceeds) {
   // nice(0) should not change priority
   EXPECT_EQ(priority_before, getpriority(PRIO_PROCESS, /*who=*/0));
 }
+
+#ifndef __Fuchsia__  // Fuchsia doesn't support caps.
+// Test that setpriority on another task owned by a different UID requires
+// CAP_SYS_NICE.
+TEST(SetpriorityTest, OtherUidRequiresCapSysNice) {
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_NICE)));
+  SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SETUID)));
+
+  int child_ready[2];
+  ASSERT_THAT(pipe(child_ready), SyscallSucceeds());
+
+  pid_t child = fork();
+  ASSERT_THAT(child, SyscallSucceeds());
+
+  if (child == 0) {
+    constexpr int kUnprivilegedUid = 12345;
+    close(child_ready[0]);
+    TEST_PCHECK(
+        setresuid(kUnprivilegedUid, kUnprivilegedUid, kUnprivilegedUid) == 0);
+
+    char ready = 'r';
+    write(child_ready[1], &ready, 1);
+    close(child_ready[1]);
+    _exit(0);
+  }
+
+  close(child_ready[1]);
+  char ready;
+  ASSERT_THAT(read(child_ready[0], &ready, 1), SyscallSucceedsWithValue(1));
+  close(child_ready[0]);
+
+  EXPECT_THAT(setpriority(PRIO_PROCESS, child, 0), SyscallSucceeds());
+
+  AutoCapability cap(CAP_SYS_NICE, false);
+  EXPECT_THAT(setpriority(PRIO_PROCESS, child, 0),
+              SyscallFailsWithErrno(EPERM));
+
+  int status;
+  EXPECT_THAT(RetryEINTR(waitpid)(child, &status, 0),
+              SyscallSucceedsWithValue(child));
+  EXPECT_TRUE(WIFEXITED(status) && WEXITSTATUS(status) == 0)
+      << "status = " << status;
+}
+#endif  // __Fuchsia__
 
 // Threads resulting from clone() maintain parent's priority
 // Changes to child priority do not affect parent's priority
