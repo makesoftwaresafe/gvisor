@@ -36,6 +36,7 @@
 #include "test/util/logging.h"
 #include "test/util/multiprocess_util.h"
 #include "test/util/posix_error.h"
+#include "test/util/save_util.h"
 #include "test/util/signal_util.h"
 #include "test/util/test_util.h"
 #include "test/util/thread_util.h"
@@ -905,6 +906,57 @@ TEST(WaitTest, TraceeWALL) {
                 ::testing::AnyOf(SyscallSucceedsWithValue(child),
                                  SyscallFailsWithErrno(ECHILD)));
   }
+}
+
+int subthread_func(void* arg) {
+  SleepSafe(absl::Milliseconds(1));
+  syscall(SYS_exit_group, *(int*)arg);
+  return 0;
+}
+
+// Historically, a non-consuming wait failed to regard the group exit status
+// in Linux, a behavior we imported into gVisor. This has, since
+// https://github.com/torvalds/linux/commit/907c311f37ba0, been fixed in Linux.
+TEST(WaitTest, NonConsumingWaitPrefersGroupExitStatus) {
+  const DisableSave ds;  // Too many syscalls.
+  if (!IsRunningOnGvisor()) {
+    KernelVersion version = ASSERT_NO_ERRNO_AND_VALUE(GetKernelVersion());
+    if (version.major < 5 || (version.major == 5 && version.minor < 16)) {
+      GTEST_SKIP() << "kernel too old";
+    }
+  }
+
+  char thread_stack[65536];
+  int group_status_cnt = 0;
+  int thread_status_cnt = 0;
+  constexpr int kThreadStatus = 42;
+  constexpr int kGroupStatus = 43;
+
+  for (int i = 0; i < 1024; i++) {
+    pid_t child = fork();
+    if (child == 0) {
+      pid_t tid =
+          clone(subthread_func, thread_stack + sizeof(thread_stack),
+                CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, (void*)&kGroupStatus);
+      TEST_PCHECK(tid > 0);
+      syscall(SYS_exit, kThreadStatus);
+      _exit(0);
+    }
+    ASSERT_THAT(child, SyscallSucceeds());
+
+    siginfo_t info;
+    if (Waitid(P_PID, child, &info, WEXITED | WNOWAIT) == 0) {
+      if (info.si_status == kThreadStatus)
+        thread_status_cnt++;
+      else if (info.si_status == kGroupStatus)
+        group_status_cnt++;
+    }
+    ASSERT_THAT(RetryEINTR(waitpid)(child, nullptr, 0),
+                SyscallSucceedsWithValue(child));
+  }
+
+  EXPECT_EQ(group_status_cnt, 1024);
+  EXPECT_EQ(thread_status_cnt, 0);
 }
 
 }  // namespace
