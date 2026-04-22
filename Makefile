@@ -357,6 +357,15 @@ cos-gpu-all-tests: gpu-images cos-gpu-smoke-tests $(RUNTIME_BIN)
 	@$(call sudo,test/gpu:sniffer_test,--runtime=$(RUNTIME) -test.v --cos-gpu $(ARGS))
 .PHONY: cos-gpu-all-tests
 
+# Images needed for TPU tests.
+tpu-images: load-tpu_vllm load-gpu_sglang_client
+.PHONY: tpu-images
+
+tpu-vllm-tests: tpu-images $(RUNTIME_BIN)
+	@$(call install_runtime,$(RUNTIME),--tpuproxy=true)
+	@$(call sudo,test/tpu:vllm_test,--runtime=$(RUNTIME) -test.v $(ARGS))
+.PHONY: tpu-vllm-tests
+
 cuda-tests: load-basic_alpine load-gpu_cuda-tests $(RUNTIME_BIN)
 	@$(call install_runtime,$(RUNTIME),--nvproxy=true --nvproxy-allowed-driver-capabilities=all)
 	@$(call sudo,test/gpu:cuda_test,--runtime=$(RUNTIME) -test.v $(ARGS))

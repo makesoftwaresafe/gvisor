@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -38,6 +39,7 @@ var (
 	url            = flag.String("url", "", "HTTP request URL.")
 	method         = flag.String("method", "GET", "HTTP request method (GET or POST).")
 	postDataBase64 = flag.String("post_base64", "", "HTTP request POST data in base64 format; ignored for GET requests.")
+	header         = flag.String("header", "", "HTTP request header in 'Key: Value' format (e.g., 'Content-Type: application/json').")
 	timeout        = flag.Duration("timeout", 0, "HTTP request timeout; 0 for no timeout.")
 )
 
@@ -92,6 +94,14 @@ func main() {
 			fatalf("cannot decode POST data: %v", postDataErr)
 		}
 		request, err = http.NewRequest("POST", *url, bytes.NewBuffer(postData))
+		if *header != "" {
+			parts := strings.SplitN(*header, ":", 2)
+			if len(parts) == 2 {
+				request.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			} else {
+				fatalf("malformed header %q", *header)
+			}
+		}
 	default:
 		err = fmt.Errorf("unknown method %q", *method)
 	}
