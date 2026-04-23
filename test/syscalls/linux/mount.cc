@@ -2273,7 +2273,6 @@ TEST(MountTest, MountNamespacePropagation) {
 
 TEST(MountTest, MountNamespaceSlavesNewUserNamespace) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(GetAbsoluteTestTmpdir())));
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
 
   const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
@@ -2330,7 +2329,6 @@ TEST(MountTest, MountNamespaceSlavesNewUserNamespace) {
 
 TEST(MountTest, LockedMountStopsNonRecBind) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(GetAbsoluteTestTmpdir())));
 
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
@@ -2360,7 +2358,6 @@ TEST(MountTest, LockedMountStopsNonRecBind) {
 // contents of overmounted filesystems from the more privileged mount namespace.
 TEST(MountTest, UmountPropagatedSubtreeFromPrivilegedNS) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(HaveCapability(CAP_SYS_ADMIN)));
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(GetAbsoluteTestTmpdir())));
 
   const TempPath dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
   const Cleanup dir_mount = ASSERT_NO_ERRNO_AND_VALUE(
@@ -2589,7 +2586,6 @@ TEST(MountTest, OverlayfsSgidBitIsCopiedUp) {
 TEST(MountTest, OverlayfsDirectoryRenameInUserNamespace) {
   SKIP_IF(!ASSERT_NO_ERRNO_AND_VALUE(CanCreateUserNamespace()));
   auto base_dir = ASSERT_NO_ERRNO_AND_VALUE(TempPath::CreateDir());
-  SKIP_IF(ASSERT_NO_ERRNO_AND_VALUE(IsOverlayfs(base_dir.path())));
 
   const std::function<void()> parent = [] {};
   const std::function<void()> child = [&base_dir] {
