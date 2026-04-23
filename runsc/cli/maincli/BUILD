@@ -7,7 +7,10 @@ package(
 
 go_library(
     name = "maincli",
-    srcs = ["maincli.go"],
+    srcs = [
+        "maincli.go",
+        "maincli_impl.go",
+    ],
     visibility = [
         "//:__pkg__",
         "//runsc:__pkg__",
