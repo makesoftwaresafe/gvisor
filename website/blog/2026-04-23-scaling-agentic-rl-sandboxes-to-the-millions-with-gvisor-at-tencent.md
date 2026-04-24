@@ -9,12 +9,12 @@ secure isolation environment becomes a necessity. We chose
 [gVisor](https://gvisor.dev) as the default sandbox for our Agentic-RL
 scenarios. Today, we run millions of gVisor sandboxes daily for Agentic-RL
 training in production, and that scale continues to grow. After more than
-**74,000** side-by-side comparisons between runsc and runc, combined with
-targeted fixes driven by real-world workloads, we have essentially closed the
-execution correctness gap with runc, fully meeting our production-grade business
-requirements. During this process, we successfully investigated and resolved
-gVisor compatibility issues that accounted for approximately **1.7%** of all
-test cases.
+**74,000** side-by-side comparisons between `runsc` (gVisor) and `runc`
+(unsandboxed/Linux), combined with targeted fixes driven by real-world
+workloads, we have essentially closed the execution correctness gap with `runc`,
+fully meeting our production-grade business requirements. During this process,
+we successfully investigated and resolved gVisor compatibility issues that
+accounted for approximately **1.7%** of all test cases.
 
 This post focuses on CPU-centric code execution and testing workloads. We will
 discuss gVisor compatibility verification and highlight representative issues,
@@ -58,7 +58,8 @@ large-scale verification against real workloads.
 Compatibility issues are rarely simple. Analyzing a typical SWE-related failure
 usually requires answering several questions at once:
 
-1.  Is this failure unique to runsc, or does it also fail under runc?
+1.  Is this failure unique to `runsc` (gVisor), or does it also fail under
+    `runc`?
 2.  If it only fails under gVisor, is it a semantic inconsistency in the Linux
     ABI, missing procfs / sysfs, file system behavioral differences, or a TOCTOU
     (Time-of-Check to Time-of-Use) race condition amplified by system call
@@ -77,7 +78,8 @@ To solve this, we brought AI coding agents into the verification pipeline to act
 as **compatibility analysts**. The process breaks down into four layers:
 
 -   **Baseline Comparison Layer**: Run the same set of test cases in parallel
-    under runc and runsc, collecting complete execution logs and exit statuses.
+    under `runc` and `runsc`, collecting complete execution logs and exit
+    statuses.
 -   **Difference Filtering Layer**: Filter out environmental noise and
     non-deterministic outputs unrelated to the runtime, preserving samples that
     only fail under gVisor.
@@ -112,7 +114,7 @@ In our workflow, every deeply analyzed case produces a structured document,
 typically containing:
 
 -   Failure symptoms and minimal reproduction method
--   runc/runsc comparison results
+-   `runc`/`runsc` comparison results
 -   Root cause classification: gVisor bug, missing feature, environmental
     difference, test case issue, or race condition amplification
 -   Linux kernel behavior comparison and source code evidence
@@ -136,93 +138,79 @@ we've run **74,379** side-by-side comparisons between `runc` and `runsc`.
 
 Please see the detailed data in the table below:
 
-Dataset                           | Total Cases | runc Accuracy | Pre-fix runsc Accuracy | Post-fix runsc Accuracy
---------------------------------- | ----------: | ------------: | ---------------------: | ----------------------:
-terminal-bench2                   | 89          | 100.00%       | 94.38%                 | 97.75%
-swe-public/Multi-SWE-bench        | 1,632       | 70.16%        | 72.49%                 | 73.16%
-swe-public/Multi-SWE-RL           | 7,046       | 27.73%        | 20.49%                 | 26.81%
-swe-public/SWE-bench_Multilingual | 300         | 93.00%        | 92.67%                 | 93.00%
-swe-public/SWE-bench_Not_Verified | 1,794       | 97.94%        | 97.94%                 | 97.94%
-swe-public/SWE-bench_Pro          | 731         | 90.15%        | 90.97%                 | 90.97%
-swe-public/SWE-bench_Verified     | 500         | 100.00%       | 99.60%                 | 100.00%
-swe-public/SWE-Gym                | 2,438       | 86.75%        | 88.27%                 | 88.27%
-swe-public/SWE-rebench            | 21,336      | 83.33%        | 83.33%                 | 83.77%
-swe-public/SWE-smith              | 38,513      | 99.37%        | 97.42%                 | 99.31%
-**Total**                         | **74,379**  | **86.78%**    | **85.18%**             | **86.91%**
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| Dataset | Total cases | Native `runc` accuracy | gVisor pre-fix `runsc` accuracy | gVisor post-fix `runsc` accuracy |
+| --- | ---: | ---: | ---: | ---: |
+| `terminal-bench2` | 89 | 100.00% | 94.38% | 97.75% |
+| `swe-public/Multi-SWE-bench` | 1,632 | 70.16% | 72.49% | 73.16% |
+| `swe-public/Multi-SWE-RL` | 7,046 | 27.73% | 20.49% | 26.81% |
+| `swe-public/SWE-bench_Multilingual` | 300 | 93.00% | 92.67% | 93.00% |
+| `swe-public/SWE-bench_Not_Verified` | 1,794 | 97.94% | 97.94% | 97.94% |
+| `swe-public/SWE-bench_Pro` | 731 | 90.15% | 90.97% | 90.97% |
+| `swe-public/SWE-bench_Verified` | 500 | 100.00% | 99.60% | 100.00% |
+| `swe-public/SWE-Gym` | 2,438 | 86.75% | 88.27% | 88.27% |
+| `swe-public/SWE-rebench` | 21,336 | 83.33% | 83.33% | 83.77% |
+| `swe-public/SWE-smith` | 38,513 | 99.37% | 97.42% | 99.31% |
+| **Total** | **74,379** | **86.78%** | **85.18%** | **86.91%** |
+
+<!-- mdformat on -->
 
 Three key takeaways emerge from this data:
 
--   **runsc and runc are now effectively on par.** Across 74,379 runs, the
-    correctness gap between runsc and runc is only about **0.13 percentage
-    points** (86.91% vs 86.78%). We also performed retries and cross-validation
-    on core datasets to rule out one-off flakiness. We have improved runsc's
-    overall pass rate by approximately **1.7 percentage points**. This
-    correctness gain largely stemmed from highly concentrated failures in a
-    small number of repositories—such as trio, cloud-custodian, asciidoctor, and
-    syncthing. Once a root cause was identified, a single fix could often
-    resolve hundreds of failing cases at once.
+-   **`runsc` (gVisor) and `runc` (Linux native) are now effectively on par.**
+    Across 74,379 runs, the correctness gap between `runsc` and `runc` is only
+    about **0.13 percentage points** (86.91% vs 86.78%). We also performed
+    retries and cross-validation on core datasets to rule out one-off flakiness.
+    We have improved `runsc`'s overall pass rate by approximately **1.7
+    percentage points**. This correctness gain largely stemmed from highly
+    concentrated failures in a small number of repositories—such as trio,
+    cloud-custodian, asciidoctor, and syncthing. Once a root cause was
+    identified, a single fix could often resolve hundreds of failing cases at
+    once.
 -   **Most "compatibility issues" should not be attributed to gVisor.** The
-    table clearly demonstrates that even under the native runc environment,
+    table clearly demonstrates that even under the native `runc` environment,
     there is an inherent failure rate of about 13% (with an average correctness
     of 86.91%). These failures largely stem from flaky test code, build
     environment deficiencies, or limitations within the underlying datasets.
-    Evaluating gVisor without a runc baseline could easily lead to
+    Evaluating gVisor without a `runc` baseline could easily lead to
     misattributing this 13% background failure rate as sandbox
     incompatibilities.
 -   **The overall pass rate for Multi-SWE-RL is relatively low (around ~27% for
     both runtimes).** This is because our internal evaluation framework and some
     case-execution methods are still being adapted, so it is not a standalone
-    compatibility problem in gVisor itself. The same bias affects both runc and
-    runsc, and therefore does not change the comparative conclusion.
+    compatibility problem in gVisor itself. The same bias affects both `runc`
+    and `runsc`, and therefore does not change the comparative conclusion.
 
 At the production scale we described earlier—**millions of gVisor sandboxes
 running every day**—this data answers the real question: how much correctness do
-we lose by replacing runc with runsc? The answer is: **almost none.**
+we lose by replacing `runc` with `runsc`? The answer is: **almost none.**
 
 ## Representative Cases: Six Types of Issues and Corresponding Fix Paths
 
-After filtering out cases where both runc and runsc failed simultaneously, we
-conducted in-depth reviews of the remaining cases that exhibited behavioral
+After filtering out cases where both `runc` and `runsc` failed simultaneously,
+we conducted in-depth reviews of the remaining cases that exhibited behavioral
 differences. Using these 100+ representative cases as a sample, their final
 root-cause attribution can roughly be divided into the following categories:
 
-| Root Cause Category  | Requires gVisor | Typical Examples             |
-:                      : Modification?   :                              :
-| -------------------- | --------------- | ---------------------------- |
-| **Genuine gVisor     | Yes             | `poll` incorrectly modifying |
-: bugs**               :                 : `events`, inconsistent       :
-:                      :                 : `execve` `errno` returns,    :
-:                      :                 : `O_TRUNC` missing            :
-:                      :                 : `IN_MODIFY` inotify events   :
-| **Missing syscalls   | Yes             | Unimplemented                |
-: and virtual FS       :                 : `copy_file_range` syscall,   :
-: entries**            :                 : missing                      :
-:                      :                 : `/proc/sys/fs/pipe-max-size` :
-:                      :                 : configuration file, and      :
-:                      :                 : absence of `/sys/dev/block`  :
-:                      :                 : directory                    :
-| **Clock and timer    | Partially       | CPU clock measurement        |
-: precision            :                 : precision, monotonic clock   :
-: differences**        :                 : start value differences,     :
-:                      :                 : sleep duration jitter        :
-| **Amplified race     | No              | Gradle `clean test` parallel |
-: conditions**         :                 : execution concurrency race,  :
-:                      :                 : CMake `copy_if_different`    :
-:                      :                 : TOCTOU race                  :
-| **Environmental or   | No              | External network access      |
-: config differences** :                 : restrictions, JDK version    :
-:                      :                 : mismatches, missing dynamic  :
-:                      :                 : library paths                :
-| **Test case issues** | No              | Test execution order         |
-:                      :                 : dependencies, underlying     :
-:                      :                 : dataset defects, inherently  :
-:                      :                 : flaky tests                  :
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| Root Cause Category | Requires gVisor Modification? | Typical Examples |
+| --- | --- | --- |
+| **Genuine gVisor bugs** | Yes | `poll` incorrectly modifying `events`, inconsistent `execve` `errno` returns, `O_TRUNC` missing `IN_MODIFY` inotify events |
+| **Missing syscalls and virtual FS entries** | Yes | Unimplemented `copy_file_range` syscall, missing `/proc/sys/fs/pipe-max-size` configuration file, and absence of `/sys/dev/block` directory |
+| **Clock and timer precision differences** | Partially | CPU clock measurement precision, monotonic clock start value differences, sleep duration jitter |
+| **Amplified race conditions** | No | Gradle `clean test` parallel execution concurrency race, CMake `copy_if_different` TOCTOU race |
+| **Environmental or config differences** | No | External network access restrictions, JDK version mismatches, missing dynamic library paths |
+| **Test case issues** | No | Test execution order dependencies, underlying dataset defects, inherently flaky tests |
+
+<!-- mdformat on -->
 
 This shows that aside from genuine bugs or missing Linux ABI implementations in
 gVisor, a significant portion of behavioral differences stems from
 timing-sensitive tests, amplified user-space race conditions, or environmental
 setup differences. This is especially crucial for Agentic-RL scenarios. Without
-runc baselines and root cause analysis, these failures could easily be
+`runc` baselines and root cause analysis, these failures could easily be
 misattributed as sandbox incompatibilities, leading to systematically
 pessimistic conclusions.
 
@@ -234,7 +222,7 @@ gaps, and user-space race conditions.
 
 The evaluation cluster's CPU utilization was unusually high. Investigation
 revealed that the tmux server in each Agent container was pegging a CPU core:
-under gVisor, CPU usage hovered at **96.6%**, while under runc it was
+under gVisor, CPU usage hovered at **96.6%**, while under `runc` it was
 practically **0%**.
 
 The root cause was poll write-back semantics. gVisor internally appended
@@ -251,8 +239,8 @@ beyond tmux—any program relying on the libevent poll backend benefits from thi
 
 In real-world workloads, it's not uncommon for a single test case to hit two
 independent gVisor compatibility issues at once. The syncthing__syncthing-7828
-test case in the Multi-SWE-RL dataset passes normally under runc, but
-consistently fails under runsc: 16 `TestCopyRange/*` subtests report `function
+test case in the Multi-SWE-RL dataset passes normally under `runc`, but
+consistently fails under `runsc`: 16 `TestCopyRange/*` subtests report `function
 not implemented`, and another `TestTruncateFileOnly` times out waiting for an
 inotify event.
 
@@ -271,15 +259,15 @@ The fix proceeded along two lines: implementing `copy_file_range` for both amd64
 (326) and arm64 (285), and issuing `IN_MODIFY` at the VFS layer for `O_TRUNC` on
 non-newly created files (skipping it for newly created files via the
 `FMODE_CREATED` flag, consistent with Linux). After the fix, this test case
-passed consistently under runsc just like under runc.
+passed consistently under `runsc` just like under `runc`.
 
 ### Case 3: Gradle clean test Concurrency Race—Root Cause in User Space, Not gVisor
 
 Not all issues that "only reproduce under gVisor" are actually gVisor bugs.
 
 A Thunderbird Android test running `./gradlew clean test --max-workers 8
---continue` under runsc frequently failed with `Unable to delete directory`.
-However, running it 7 times under runc yielded **5 failures** (71%). This
+--continue` under `runsc` frequently failed with `Unable to delete directory`.
+However, running it 7 times under `runc` yielded **5 failures** (71%). This
 pointed to a user-space TOCTOU race condition in Gradle's parallel build: one
 subproject was still writing to `build/`, while another subproject's clean task
 was already trying to delete it.
@@ -288,8 +276,8 @@ gVisor's higher system call overhead amplified the probability of triggering
 this race, but it did not introduce new semantic errors. Splitting the command
 into `./gradlew clean` and `./gradlew test ...` fixed it completely. **This is
 also a fundamental principle we follow in compatibility analysis: always use
-runc as a baseline first, then determine whether the issue should be attributed
-to the sandbox itself.**
+`runc` as a baseline first, then determine whether the issue should be
+attributed to the sandbox itself.**
 
 ### Case 4: Missing procfs / sysfs Causes Real Applications to Take Abnormal Paths
 
@@ -326,8 +314,8 @@ seen by the master and replica are reversed compared to Linux.
 Sometimes, a test failing under gVisor has nothing to do with the runtime
 environment at all.
 
-During evaluation, a Jekyll test case (`jekyll-7637`) failed under runsc but
-coincidentally passed under runc. After a deep dive, we found that this test
+During evaluation, a Jekyll test case (`jekyll-7637`) failed under `runsc` but
+coincidentally passed under `runc`. After a deep dive, we found that this test
 actually had a roughly 33% chance of failing in *any* environment.
 
 The root cause was rather dramatic: the test code itself had a bug where it
@@ -352,35 +340,27 @@ practical tips.
 
 ### Suggestions for Different Build Systems
 
-| Build System           | Common Risks             | Suggestions              |
-| ---------------------- | ------------------------ | ------------------------ |
-| **Gradle**             | clean test concurrency   | Split into clean and     |
-:                        : race                     : test steps               :
-| **Maven**              | Remote dependency        | Pre-populate local repo  |
-:                        : download timeout or 403  : cache, minimize online   :
-:                        :                          : downloads                :
-| **CMake**              | `copy_if_different` race | Lower parallelism, avoid |
-:                        : conditions               : over-reliance on         :
-:                        :                          : extremely short time     :
-:                        :                          : windows                  :
-| **sbt / Scala**        | Deep stack, slow         | Increase `-Xss`, give    |
-:                        : startup, test flakiness  : the first compilation a  :
-:                        :                          : more generous timeout    :
-| **pip / pytest**       | Differences in CPU count | Be aware of the          |
-:                        : vs cgroup quota          : relationship between     :
-:                        : perception               : `os.cpu_count()` and     :
-:                        :                          : actual quotas            :
-| **Cargo / npm / yarn** | Generally good           | Usually do not require   |
-:                        : compatibility            : special handling         :
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| Build System | Common Risks | Suggestions |
+| --- | --- | --- |
+| **Gradle** | clean test concurrency race | Split into clean and test steps |
+| **Maven** | Remote dependency download timeout or 403 | Pre-populate local repo cache, minimize online downloads |
+| **CMake** | `copy_if_different` race conditions | Lower parallelism, avoid over-reliance on extremely short time windows |
+| **sbt / Scala** | Deep stack, slow startup, test flakiness | Increase `-Xss`, give the first compilation a more generous timeout |
+| **pip / pytest** | Differences in CPU count vs cgroup quota perception | Be aware of the relationship between `os.cpu_count()` and actual quotas |
+| **Cargo / npm / yarn** | Generally good compatibility | Usually do not require special handling |
+
+<!-- mdformat on -->
 
 ### Debugging Procedure When Encountering Failures
 
 When a test fails, we recommend this debugging flow:
 
-1.  First reproduce the same command under runc to confirm if the failure is
+1.  First reproduce the same command under `runc` to confirm if the failure is
     specific to gVisor.
-2.  If runc also fails, prioritize investigating test case issues, environmental
-    differences, or race conditions.
+2.  If `runc` also fails, prioritize investigating test case issues,
+    environmental differences, or race conditions.
 3.  If it only fails under gVisor, check for obvious missing syscalls, procfs,
     or sysfs.
 4.  For issues with no obvious missing features, compare logs, strace, and
@@ -424,16 +404,20 @@ Through this method, we already have more than ten fixes merged into the gVisor
 mainline, covering multiple areas such as file systems, networking, proc/sysfs,
 PTY, and system call semantics. Some representative PRs are listed below:
 
-PR                                                    | Fix Content                                     | Typical Agentic-RL Scenario
------------------------------------------------------ | ----------------------------------------------- | ---------------------------
-[#12851](https://github.com/google/gvisor/pull/12851) | poll: Only write back `revents`                 | tmux, libevent poll backend
-[#12911](https://github.com/google/gvisor/pull/12911) | proc: Add `/proc/sys/fs/pipe-max-size`          | Python libraries like wurlitzer
-[#12915](https://github.com/google/gvisor/pull/12915) | pty: Implement `TCSBRK` / `TCFLSH`              | pyserial, interactive PTY programs
-[#12814](https://github.com/google/gvisor/pull/12814) | proc: Add `randomize_va_space`                  | Performance and security inspection tools
-[#12813](https://github.com/google/gvisor/pull/12813) | sysfs: Add `/sys/dev/block` and `/sys/dev/char` | lsblk, device-related tools
-[#12819](https://github.com/google/gvisor/pull/12819) | proc: Fill in `fdinfo` fields                   | lsof, fuser, diagnostic tools
-[#12786](https://github.com/google/gvisor/pull/12786) | devpts: Fix `ISIG` check                        | Interactive shells / terminal-based agents
-[#12853](https://github.com/google/gvisor/pull/12853) | vfs: `FICLONE*` returns `EOPNOTSUPP`            | file copying tools
+<!-- mdformat off(no multiline table support in Kramdown) -->
+
+| PR | Fix Content | Typical Agentic-RL Scenario |
+| --- | --- | --- |
+| [#12851](https://github.com/google/gvisor/pull/12851) | poll: Only write back `revents` | tmux, libevent poll backend |
+| [#12911](https://github.com/google/gvisor/pull/12911) | proc: Add `/proc/sys/fs/pipe-max-size` | Python libraries like wurlitzer |
+| [#12915](https://github.com/google/gvisor/pull/12915) | pty: Implement `TCSBRK` / `TCFLSH` | pyserial, interactive PTY programs |
+| [#12814](https://github.com/google/gvisor/pull/12814) | proc: Add `randomize_va_space` | Performance and security inspection tools |
+| [#12813](https://github.com/google/gvisor/pull/12813) | sysfs: Add `/sys/dev/block` and `/sys/dev/char` | lsblk, device-related tools |
+| [#12819](https://github.com/google/gvisor/pull/12819) | proc: Fill in `fdinfo` fields | lsof, fuser, diagnostic tools |
+| [#12786](https://github.com/google/gvisor/pull/12786) | devpts: Fix `ISIG` check | Interactive shells / terminal-based agents |
+| [#12853](https://github.com/google/gvisor/pull/12853) | vfs: `FICLONE*` returns `EOPNOTSUPP` | file copying tools |
+
+<!-- mdformat on -->
 
 In this sense, Agentic-RL is not just a new use case for gVisor; it has also
 pushed our compatibility engineering toward a more AI-driven workflow.
