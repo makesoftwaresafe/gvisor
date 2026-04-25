@@ -19,10 +19,12 @@ accounted for approximately **1.7%** of all test cases.
 This post focuses on CPU-centric code execution and testing workloads. We will
 discuss gVisor compatibility verification and highlight representative issues,
 skipping implementation details like GPU support, image distribution, or cluster
-scheduling. We aim to answer three questions: 1. Why choose gVisor? 2. Why
-doesn't manual compatibility verification scale? 3. How can AI agents analyze
-compatibility issues, what do typical failures look like, and what best
-practices have we established?
+scheduling. We aim to answer three questions:
+
+1.  Why choose gVisor?
+2.  Why doesn't manual compatibility verification scale?
+3.  How can AI agents analyze compatibility issues, what do typical failures
+    look like, and what best practices have we established?
 
 <!--/excerpt-->
 
@@ -36,17 +38,21 @@ dependency resolution, execution, test feedback, and iterative debugging. We
 don't just need "an environment that runs Docker," but rather a sandbox that
 strictly constrains the kernel attack surface while remaining lightweight and
 easy to deploy at scale. [gVisor](https://gvisor.dev) is a great fit for this
-scenario: - It implements an application-level kernel in user space,
-intercepting and re-implementing system calls, significantly reducing the attack
-surface where containers directly interact with the host kernel. Its isolation
-has been well-recognized by the industry. - It integrates naturally with
-existing Docker/Kubernetes infrastructure, avoiding the need for an entirely new
-guest kernel operation and maintenance system. - Compared to microVM
-solutions—which must run on bare-metal hosts—gVisor can run inside regular VMs,
-making it significantly cheaper while remaining more flexible with lower startup
-and resource costs. This makes it far better suited for large-scale deployments
-of sandbox containers. - It is also more friendly to GPU scenarios, facilitating
-integration with existing heterogeneous computing environments.
+scenario:
+
+-   It implements an application-level kernel in user space, intercepting and
+    re-implementing system calls, significantly reducing the attack surface
+    where containers directly interact with the host kernel. Its isolation has
+    been well-recognized by the industry.
+-   It integrates naturally with existing Docker/Kubernetes infrastructure,
+    avoiding the need for an entirely new guest kernel operation and maintenance
+    system.
+-   Compared to microVM solutions—which must run on bare-metal hosts—gVisor can
+    run inside regular VMs, making it significantly cheaper while remaining more
+    flexible with lower startup and resource costs. This makes it far better
+    suited for large-scale deployments of sandbox containers.
+-   It is also more friendly to GPU scenarios, facilitating integration with
+    existing heterogeneous computing environments.
 
 However, **re-implementing the Linux ABI means its compatibility must be
 rigorously validated.** In an Agentic-RL scenario where "any project can run and
@@ -218,27 +224,28 @@ These cases highlight the different types of compatibility issues we see in
 Agentic-RL: system call semantic deviations, Linux ABI gaps, VFS implementation
 gaps, and user-space race conditions.
 
-### Case 1: poll Behavior Inconsistency Causes tmux Busy-Loop
+### Case 1: `poll` Behavior Inconsistency Causes `tmux` Busy-Loop
 
 The evaluation cluster's CPU utilization was unusually high. Investigation
-revealed that the tmux server in each Agent container was pegging a CPU core:
+revealed that the `tmux` server in each Agent container was pegging a CPU core:
 under gVisor, CPU usage hovered at **96.6%**, while under `runc` it was
 practically **0%**.
 
-The root cause was poll write-back semantics. gVisor internally appended
+The root cause was `poll` write-back semantics. gVisor internally appended
 `POLLHUP|POLLERR` to `pollfd.events` and wrote the entire `pollfd` struct back
 to user space. Linux, however, only writes to `revents` and **never modifies the
 user's original `events`**. This discrepancy prevented libevent from properly
-removing closed file descriptors. Subsequent poll calls immediately returned
+removing closed file descriptors. Subsequent `poll` calls immediately returned
 `POLLNVAL`, triggering a busy-loop.
 
-After fixing this, the tmux CPU dropped from 96.6% to 0%. The impact goes far
-beyond tmux—any program relying on the libevent poll backend benefits from this.
+After fixing this, the `tmux` CPU dropped from 96.6% to 0%. The impact goes far
+beyond `tmux` — any program relying on the `libevent` `poll` backend benefits
+from this.
 
 ### Case 2: syncthing Test Case Exposes Two Independent Linux ABI Gaps (Unimplemented Syscalls or Virtual Files)
 
 In real-world workloads, it's not uncommon for a single test case to hit two
-independent gVisor compatibility issues at once. The syncthing__syncthing-7828
+independent gVisor compatibility issues at once. The `syncthing__syncthing-7828`
 test case in the Multi-SWE-RL dataset passes normally under `runc`, but
 consistently fails under `runsc`: 16 `TestCopyRange/*` subtests report `function
 not implemented`, and another `TestTruncateFileOnly` times out waiting for an
