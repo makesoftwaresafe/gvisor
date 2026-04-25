@@ -177,7 +177,7 @@ doc(
         "huichen",
     ],
     layout = "post",
-    permalink = "/blog/2025/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
+    permalink = "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 )
 
 docs(

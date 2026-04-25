@@ -59,6 +59,8 @@ var redirects = map[string]string{
 	"/docs/user_guide/docker":                "/docs/user_guide/quick_start/docker/",
 	"/blog/2020/09/22/platform-portability":  "/blog/2020/10/22/platform-portability/",
 	"/blog/2020/09/22/platform-portability/": "/blog/2020/10/22/platform-portability/",
+	"/blog/2025/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent":  "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
+	"/blog/2025/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/": "/blog/2026/04/23/scaling-agentic-rl-sandboxes-to-the-millions-with-gvisor-at-tencent/",
 
 	// Deprecated, but links continue to work.
 	"/cl": "https://gvisor-review.googlesource.com",
