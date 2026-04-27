@@ -1111,7 +1111,7 @@ cc_binary(
     srcs = ["inotify.cc"],
     linkstatic = 1,
     malloc = "//test/util:errno_safe_allocator",
-    deps = [
+    deps = select_gtest() + [
         "//test/util:epoll_util",
         "//test/util:file_descriptor",
         "//test/util:fs_util",
