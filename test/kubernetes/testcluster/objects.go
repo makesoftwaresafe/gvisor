@@ -179,11 +179,12 @@ type ContainerResourcesRequest struct {
 	CPUResources    string // CPUResources to request. Note: Will be overridden by flag above.
 	MemoryResources string // MemoryResources to request. Note: Will be overridden by flag above.
 	GPU             bool
+	TPU             bool
 }
 
 // String returns a string representation of the `ContainerResourcesRequest`.
 func (crr ContainerResourcesRequest) String() string {
-	return fmt.Sprintf("cpu=%q memory=%q gpu=%v", crr.CPUResources, crr.MemoryResources, crr.GPU)
+	return fmt.Sprintf("cpu=%q memory=%q gpu=%v tpu=%v", crr.CPUResources, crr.MemoryResources, crr.GPU, crr.TPU)
 }
 
 // SetContainerResources sets container resources.
@@ -205,6 +206,14 @@ func SetContainerResources(pod *v13.Pod, containerName string, requests Containe
 			return nil, fmt.Errorf("cannot determine number of accelerators that the pod should use, make sure to call ConfigurePodForRuntimeTestNodepool first")
 		}
 		resourceList[v13.ResourceName("nvidia.com/gpu")] = resource.MustParse(acceleratorCount)
+	}
+
+	if requests.TPU {
+		acceleratorCount, ok := pod.Spec.NodeSelector[NodepoolTPUNumAcceleratorKey]
+		if !ok {
+			return nil, fmt.Errorf("cannot determine number of accelerators that the pod should use, make sure to call ConfigurePodForRuntimeTestNodepool first")
+		}
+		resourceList[v13.ResourceName("google.com/tpu")] = resource.MustParse(acceleratorCount)
 	}
 
 	requirements := v13.ResourceRequirements{

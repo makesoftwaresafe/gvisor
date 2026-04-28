@@ -258,7 +258,7 @@ func (llm *VLLM) instrumentedRequest(ctx context.Context, method, endpoint, head
 // WaitUntilServing waits until vllm is serving.
 func (llm *VLLM) WaitUntilServing(ctx context.Context) error {
 	for ctx.Err() == nil {
-		out, err := llm.instrumentedRequest(ctx, "GET", "/health", "", nil)
+		out, err := llm.instrumentedRequest(ctx, "GET", "/health", "Content-Type: application/json", nil)
 		if err != nil {
 			time.Sleep(1 * time.Second)
 			continue

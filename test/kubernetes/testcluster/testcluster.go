@@ -30,6 +30,7 @@ import (
 	testpb "gvisor.dev/gvisor/test/kubernetes/test_range_config_go_proto"
 	appsv1 "k8s.io/api/apps/v1"
 	v13 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -101,6 +102,8 @@ const (
 	NodepoolTPUAcceleratorSelectorKey = "cloud.google.com/gke-tpu-accelerator"
 	// Name of the TPU topology key used in Pod.Spec.NodeSelector.
 	NodepoolTPUTopologySelectorKey = "cloud.google.com/gke-tpu-topology"
+	// NodepoolTPUNumAcceleratorKey is the key to mark the number of TPU accelerators in a nodepool.
+	NodepoolTPUNumAcceleratorKey = "cloud.google.com/gke-accelerator-count"
 )
 
 // Default machine types.
@@ -185,9 +188,9 @@ type NodePool struct {
 	// cpuArchitecture is the CPU architecture of nodes in the nodepool.
 	cpuArchitecture CPUArchitecture
 
-	// acceleratorType is the accelerator type present on nodes in the nodepool.
+	// tpuAcceleratorType is the TPU accelerator type present on nodes in the nodepool.
 	// Empty string if the nodes have no accelerators.
-	acceleratorType AcceleratorType
+	tpuAcceleratorType AcceleratorType
 
 	// numAccelerators is the number of accelerators present on nodes in the
 	// nodepool.
@@ -344,13 +347,13 @@ func (t *TestCluster) getNodePool(ctx context.Context, nodepoolType NodePoolType
 			if npArchitecture == "" {
 				continue
 			}
-			npAcceleratorType := AcceleratorType(node.Labels[NodepoolTPUAcceleratorSelectorKey])
-			if npAcceleratorType == "" {
+			npTPUAcceleratorType := AcceleratorType(node.Labels[NodepoolTPUAcceleratorSelectorKey])
+			if npTPUAcceleratorType == "" {
 				// Attempt to derive it from instance type if possible.
 				if instanceType, hasInstanceType := node.Labels[NodepoolInstanceTypeKey]; hasInstanceType {
 					for accelType, machineType := range TPUAcceleratorMachineTypeMap {
 						if machineType == instanceType {
-							npAcceleratorType = accelType
+							npTPUAcceleratorType = accelType
 							break
 						}
 					}
@@ -362,16 +365,26 @@ func (t *TestCluster) getNodePool(ctx context.Context, nodepoolType NodePoolType
 					return nil, fmt.Errorf("cannot parse accelerator count (%q) value %q as an integer: %w", NodepoolNumAcceleratorsKey, countStr, err)
 				}
 			}
+			if npNumAccelerators == 0 {
+				if countStr, hasCount := node.Labels[NodepoolTPUNumAcceleratorKey]; hasCount {
+					if npNumAccelerators, err = strconv.Atoi(countStr); err != nil {
+						return nil, fmt.Errorf("cannot parse accelerator count (%q) value %q as an integer: %w", NodepoolTPUNumAcceleratorKey, countStr, err)
+					}
+				}
+			}
 			npTPUTopology := node.Labels[NodepoolTPUTopologyKey]
+			if npTPUTopology == "" {
+				npTPUTopology = node.Labels[NodepoolTPUTopologySelectorKey]
+			}
 			existingNodepool, ok := nodepools[npType]
 			if !ok {
 				nodepools[npType] = &NodePool{
-					nodePooltype:    npType,
-					runtime:         npRuntime,
-					cpuArchitecture: npArchitecture,
-					acceleratorType: npAcceleratorType,
-					numAccelerators: npNumAccelerators,
-					tpuTopology:     npTPUTopology,
+					nodePooltype:       npType,
+					runtime:            npRuntime,
+					cpuArchitecture:    npArchitecture,
+					tpuAcceleratorType: npTPUAcceleratorType,
+					numAccelerators:    npNumAccelerators,
+					tpuTopology:        npTPUTopology,
 				}
 				continue
 			}
@@ -381,8 +394,8 @@ func (t *TestCluster) getNodePool(ctx context.Context, nodepoolType NodePoolType
 			if existingNodepool.cpuArchitecture != npArchitecture {
 				return nil, fmt.Errorf("nodes in nodepool %q have conflicting architectures: %v vs %v", npType, existingNodepool.cpuArchitecture, npArchitecture)
 			}
-			if existingNodepool.acceleratorType != npAcceleratorType {
-				return nil, fmt.Errorf("nodes in nodepool %q have conflicting accelerator types: %v vs %v", npType, existingNodepool.acceleratorType, npAcceleratorType)
+			if existingNodepool.tpuAcceleratorType != npTPUAcceleratorType {
+				return nil, fmt.Errorf("nodes in nodepool %q have conflicting accelerator types: %v vs %v", npType, existingNodepool.tpuAcceleratorType, npTPUAcceleratorType)
 			}
 			if existingNodepool.numAccelerators != npNumAccelerators {
 				return nil, fmt.Errorf("nodes in nodepool %q have conflicting accelerator counts: %v vs %v", npType, existingNodepool.numAccelerators, npNumAccelerators)
@@ -662,10 +675,14 @@ func (t *TestCluster) applyCommonPodConfigurations(ctx context.Context, np *Node
 	// This doesn't really constrain the pod further, but allows
 	// this number to be carried over when setting pod resources.
 	if np.numAccelerators > 0 {
-		podSpec.NodeSelector[NodepoolNumAcceleratorsKey] = strconv.Itoa(np.numAccelerators)
+		if np.tpuAcceleratorType == "" {
+			podSpec.NodeSelector[NodepoolNumAcceleratorsKey] = strconv.Itoa(np.numAccelerators)
+		} else {
+			podSpec.NodeSelector[NodepoolTPUNumAcceleratorKey] = strconv.Itoa(np.numAccelerators)
+		}
 	}
-	if np.acceleratorType != "" {
-		podSpec.NodeSelector[NodepoolTPUAcceleratorSelectorKey] = string(np.acceleratorType)
+	if np.tpuAcceleratorType != "" {
+		podSpec.NodeSelector[NodepoolTPUAcceleratorSelectorKey] = string(np.tpuAcceleratorType)
 	}
 	if np.tpuTopology != "" {
 		podSpec.NodeSelector[NodepoolTPUTopologySelectorKey] = np.tpuTopology
@@ -779,6 +796,73 @@ func (t *TestCluster) WaitForServiceReady(ctx context.Context, service *v13.Serv
 // GetIPFromService returns the IP on a service.
 func GetIPFromService(service *v13.Service) string {
 	return service.Spec.ClusterIP
+}
+
+// ExecRequestInClientPod performs an HTTP request against a service via a client pod and returns the pod logs.
+func (t *TestCluster) ExecRequestInClientPod(ctx context.Context, service *v13.Service, podNamespace string, clientImage string, clientPodName string, argvFn func(hostPort string) []string) ([]byte, error) {
+	if err := t.WaitForServiceReady(ctx, service); err != nil {
+		return nil, fmt.Errorf("failed to wait for service: %v", err)
+	}
+	ip := GetIPFromService(service)
+	if ip == "" {
+		return nil, fmt.Errorf("did not get valid ip from service: %v", service)
+	}
+
+	argv := argvFn(fmt.Sprintf("http://%s:%d", ip, service.Spec.Ports[0].Port))
+	clientPod := &v13.Pod{
+		TypeMeta: v1.TypeMeta{
+			Kind:       "Pod",
+			APIVersion: "v1",
+		},
+		ObjectMeta: v1.ObjectMeta{
+			Name:      clientPodName,
+			Namespace: podNamespace,
+		},
+		Spec: v13.PodSpec{
+			Containers: []v13.Container{
+				{
+					Name:    clientPodName,
+					Image:   clientImage,
+					Command: argv,
+					Resources: v13.ResourceRequirements{
+						Requests: v13.ResourceList{
+							v13.ResourceCPU: resource.MustParse("500m"),
+						},
+					},
+				},
+			},
+			RestartPolicy: v13.RestartPolicyNever,
+		},
+	}
+	clientPod, err := t.ConfigurePodForClientNodepool(ctx, clientPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to configure pod: %v", err)
+	}
+
+	t.DeletePod(ctx, clientPod)
+
+	clientPod, err = t.CreatePod(ctx, clientPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create client pod: %v", err)
+	}
+	defer t.DeletePod(ctx, clientPod)
+	if err := t.WaitForPodCompleted(ctx, clientPod); err != nil {
+		logs, logsErr := t.ReadPodLogs(ctx, clientPod)
+		logs = strings.TrimSpace(logs)
+		if logsErr != nil {
+			return nil, fmt.Errorf("failed HTTP request (%v) and to read logs from the pod: %w", err, logsErr)
+		}
+		if logs == "" {
+			return nil, fmt.Errorf("failed HTTP request: %w (pod logs are empty)", err)
+		}
+		return nil, fmt.Errorf("failed HTTP request: %w (pod logs: %v)", err, logs)
+	}
+
+	logs, err := t.ReadPodLogs(ctx, clientPod)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read logs from pod %q: %v", clientPod.GetName(), err)
+	}
+	return []byte(logs), nil
 }
 
 // CreatePersistentVolume creates a persistent volume.

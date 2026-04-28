@@ -20,21 +20,19 @@ import (
 	_ "embed"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"strings"
 	"testing"
 	"time"
-	"unicode"
 
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/test/gpu/triton"
 	k8s "gvisor.dev/gvisor/test/kubernetes"
 	"gvisor.dev/gvisor/test/kubernetes/benchmarks/profiling"
+	"gvisor.dev/gvisor/test/kubernetes/benchmarks/utils"
 	"gvisor.dev/gvisor/test/kubernetes/benchmetric"
 	"gvisor.dev/gvisor/test/kubernetes/k8sctx"
 	"gvisor.dev/gvisor/test/kubernetes/testcluster"
 	v13 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -48,118 +46,22 @@ type tritonPodServer struct {
 	service     *v13.Service
 }
 
-// readPodLogs reads logs from a pod.
-func readPodLogs(ctx context.Context, cluster *testcluster.TestCluster, pod *v13.Pod) (string, error) {
-	rdr, err := cluster.GetLogReader(ctx, pod, v13.PodLogOptions{})
-	if err != nil {
-		return "", fmt.Errorf("GetLogReader on cluster %q pod %q: %v", cluster.GetName(), pod.GetName(), err)
-	}
-	out, err := io.ReadAll(rdr)
-	if err != nil {
-		return "", fmt.Errorf("failed to read from pod %q: %v", pod.GetName(), err)
-	}
-	return string(out), nil
-}
-
 // InstrumentedRequest implements `triton.Server.InstrumentedRequest`.
 func (sps *tritonPodServer) InstrumentedRequest(ctx context.Context, argvFn func(hostPort string) []string) ([]byte, error) {
-	// Get server IP.
-	if err := sps.cluster.WaitForServiceReady(ctx, sps.service); err != nil {
-		return nil, fmt.Errorf("failed to wait for service: %v", err)
-	}
-	ip := testcluster.GetIPFromService(sps.service)
-	if ip == "" {
-		return nil, fmt.Errorf("did not get valid ip from service: %v", sps.service)
-	}
-
-	// Build client pod spec.
-	const clientPodName = "triton-client"
-	argv := argvFn(fmt.Sprintf("http://%s:%d", ip, sps.service.Spec.Ports[0].Port))
-	clientPod := &v13.Pod{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Pod",
-			APIVersion: "v1",
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      clientPodName,
-			Namespace: sps.pod.ObjectMeta.Namespace,
-		},
-		Spec: v13.PodSpec{
-			Containers: []v13.Container{
-				{
-					Name:    clientPodName,
-					Image:   sps.clientImage,
-					Command: argv,
-					Resources: v13.ResourceRequirements{
-						Requests: v13.ResourceList{
-							v13.ResourceCPU: resource.MustParse("500m"),
-						},
-					},
-				},
-			},
-			RestartPolicy: v13.RestartPolicyNever,
-		},
-	}
-	clientPod, err := sps.cluster.ConfigurePodForClientNodepool(ctx, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure pod: %v", err)
-	}
-
-	// Delete pod that may possibly exist from a previous iteration.
-	// Ignore errors since it most likely doesn't exist.
-	sps.cluster.DeletePod(ctx, clientPod)
-
-	// Start new client pod and wait for it.
-	clientPod, err = sps.cluster.CreatePod(ctx, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create client pod: %v", err)
-	}
-	defer sps.cluster.DeletePod(ctx, clientPod)
-	if err := sps.cluster.WaitForPodCompleted(ctx, clientPod); err != nil {
-		logs, logsErr := readPodLogs(ctx, sps.cluster, clientPod)
-		logs = strings.TrimSpace(logs)
-		if logsErr != nil {
-			return nil, fmt.Errorf("failed HTTP request (%v) and to read logs from the pod: %w", err, logsErr)
-		}
-		if logs == "" {
-			return nil, fmt.Errorf("failed HTTP request: %w (pod logs are empty)", err)
-		}
-		return nil, fmt.Errorf("failed HTTP request: %w (pod logs: %v)", err, logs)
-	}
-
-	// All good, get logs.
-	logs, err := readPodLogs(ctx, sps.cluster, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read logs from pod %q: %v", clientPod.GetName(), err)
-	}
-	return []byte(logs), nil
+	return sps.cluster.ExecRequestInClientPod(ctx, sps.service, sps.pod.ObjectMeta.Namespace, sps.clientImage, "triton-client", argvFn)
 }
 
 // Logs implements `triton.Server.Logs`.
 func (sps *tritonPodServer) Logs(ctx context.Context) (string, error) {
-	return readPodLogs(ctx, sps.cluster, sps.pod)
+	return sps.cluster.ReadPodLogs(ctx, sps.pod)
 }
 
 // atLeastNWords verifies that the response at least N words.
 // If not, it raises the temperature.
 func atLeastNWords(wantNWords int) func(prompt *triton.Prompt, response *triton.Response) (*triton.Prompt, error) {
 	return func(prompt *triton.Prompt, response *triton.Response) (*triton.Prompt, error) {
-		responseText := strings.TrimSpace(response.Text())
-		// print response
-		responseText = strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) {
-				return r
-			}
-			return ' '
-		}, responseText)
-		numWords := 0
-		for _, word := range strings.Split(responseText, " ") {
-			if len(word) >= 0 {
-				numWords++
-			}
-		}
-		if numWords < wantNWords {
-			return prompt.WithHotterModel(), fmt.Errorf("response %q is too short: had %d words, want at least %d", responseText, numWords, wantNWords)
+		if err := utils.CheckAtLeastNWords(response.Text(), wantNWords); err != nil {
+			return prompt.WithHotterModel(), err
 		}
 		return nil, nil
 	}

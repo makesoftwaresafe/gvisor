@@ -1,8 +1,8 @@
-// Copyright 2025 The gVisor Authors.
+// Copyright 2026 The gVisor Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
-// You maye may obtain a copy of the License at
+// You may obtain a copy of the License at
 //
 //     http://www.apache.org/licenses/LICENSE-2.0
 //
@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package sglang provides a benchmark for sglang on Kubernetes.
-package sglang
+// Package vllm provides a benchmark for vllm on Kubernetes.
+package vllm
 
 import (
 	"context"
@@ -25,61 +25,67 @@ import (
 	"time"
 
 	"gvisor.dev/gvisor/pkg/sync"
-	"gvisor.dev/gvisor/test/gpu/sglang"
 	k8s "gvisor.dev/gvisor/test/kubernetes"
 	"gvisor.dev/gvisor/test/kubernetes/benchmarks/profiling"
 	"gvisor.dev/gvisor/test/kubernetes/benchmarks/utils"
 	"gvisor.dev/gvisor/test/kubernetes/benchmetric"
 	"gvisor.dev/gvisor/test/kubernetes/k8sctx"
 	"gvisor.dev/gvisor/test/kubernetes/testcluster"
+	"gvisor.dev/gvisor/test/tpu/vllm"
 	v13 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
-// sglangPodServer implements `sglang.Server`.
-// It performs requests against the sglang server pod.
-type sglangPodServer struct {
+type vllmPodServer struct {
 	cluster     *testcluster.TestCluster
 	clientImage string
 	pod         *v13.Pod
 	service     *v13.Service
 }
 
-// InstrumentedRequest implements `sglang.Server.InstrumentedRequest`.
-func (sps *sglangPodServer) InstrumentedRequest(ctx context.Context, argvFn func(hostPort string) []string) ([]byte, error) {
-	return sps.cluster.ExecRequestInClientPod(ctx, sps.service, sps.pod.ObjectMeta.Namespace, sps.clientImage, "sglang-client", argvFn)
+func (vps *vllmPodServer) InstrumentedRequest(ctx context.Context, argvFn func(hostPort string) []string) ([]byte, error) {
+	return vps.cluster.ExecRequestInClientPod(ctx, vps.service, vps.pod.ObjectMeta.Namespace, vps.clientImage, "vllm-client", argvFn)
 }
 
-// Logs implements `sglang.Server.Logs`.
-func (sps *sglangPodServer) Logs(ctx context.Context) (string, error) {
-	return sps.cluster.ReadPodLogs(ctx, sps.pod)
+func (vps *vllmPodServer) Logs(ctx context.Context) (string, error) {
+	return vps.cluster.ReadPodLogs(ctx, vps.pod)
 }
 
-// atLeastNWords verifies that the response at least N words.
-// If not, it raises the temperature.
-func atLeastNWords(wantNWords int) func(prompt *sglang.Prompt, response *sglang.Response) (*sglang.Prompt, error) {
-	return func(prompt *sglang.Prompt, response *sglang.Response) (*sglang.Prompt, error) {
+func atLeastNWords(wantNWords int) func(prompt *vllm.Prompt, response *vllm.FullResponse) (*vllm.Prompt, error) {
+	return func(prompt *vllm.Prompt, response *vllm.FullResponse) (*vllm.Prompt, error) {
 		if err := utils.CheckAtLeastNWords(response.Text(), wantNWords); err != nil {
-			return prompt.WithHotterModel(), err
+			prompt.RaiseTemperature()
+			return prompt, err
 		}
 		return nil, nil
 	}
 }
 
-// wantSubstring verifies that the response contains the given substring.
-// If not, it raises the temperature.
-func wantSubstring(substring string) func(prompt *sglang.Prompt, response *sglang.Response) (*sglang.Prompt, error) {
-	return func(prompt *sglang.Prompt, response *sglang.Response) (*sglang.Prompt, error) {
+func wantSubstring(substring string) func(prompt *vllm.Prompt, response *vllm.FullResponse) (*vllm.Prompt, error) {
+	return func(prompt *vllm.Prompt, response *vllm.FullResponse) (*vllm.Prompt, error) {
 		if !strings.Contains(strings.ToLower(response.Text()), strings.ToLower(substring)) {
-			return prompt.WithHotterModel(), fmt.Errorf("response %q does not contain substring %q", response.Text(), substring)
+			prompt.RaiseTemperature()
+			return prompt, fmt.Errorf("response %q does not contain substring %q", response.Text(), substring)
 		}
 		return nil, nil
 	}
 }
 
-// BenchmarkSGLang runs sglang benchmarks for a single cluster.
-func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.KubernetesContext, cluster *testcluster.TestCluster) {
+type tbLogger struct {
+	tb testing.TB
+}
+
+func (l *tbLogger) Logf(format string, args ...any) {
+	l.tb.Logf(format, args...)
+}
+
+func (l *tbLogger) Name() string {
+	return l.tb.Name()
+}
+
+// BenchmarkVLLM runs vllm benchmarks for a single cluster.
+func BenchmarkVLLM(ctx context.Context, t *testing.T, k8sCtx k8sctx.KubernetesContext, cluster *testcluster.TestCluster) {
 	benchmarkNS := cluster.Namespace(testcluster.NamespaceBenchmark)
 	if err := benchmarkNS.Reset(ctx); err != nil {
 		t.Fatalf("cannot reset namespace: %v", err)
@@ -87,7 +93,7 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 	defer benchmarkNS.Cleanup(ctx)
 	reqWaitCtx, reqWaitCancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer reqWaitCancel()
-	if err := benchmarkNS.WaitForResources(reqWaitCtx, testcluster.ContainerResourcesRequest{GPU: true}); err != nil {
+	if err := benchmarkNS.WaitForResources(reqWaitCtx, testcluster.ContainerResourcesRequest{TPU: true}); err != nil {
 		t.Fatalf("failed to wait for resources: %v", err)
 	}
 	endProfiling, err := profiling.MaybeSetup(ctx, t, k8sCtx, cluster, benchmarkNS)
@@ -100,7 +106,6 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 		t.Logf("[%v] "+format, append([]any{time.Now().Format(time.TimeOnly)}, values...)...)
 	}
 
-	// Make sure we're running on the right architecture.
 	testCPUArch, err := cluster.RuntimeTestNodepoolArchitecture(ctx)
 	if err != nil {
 		t.Fatalf("Failed to get runtime test nodepool architecture: %v", err)
@@ -110,64 +115,57 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 		t.Fatalf("Unsupported CPU architecture: %v", testCPUArch)
 	}
 
-	// Run pod and service.
-	serverImage, err := k8sCtx.ResolveImage(ctx, sglangBenchImage)
+	serverImage, err := k8sCtx.ResolveImage(ctx, vllmBenchImage)
 	if err != nil {
 		t.Fatalf("Failed to resolve image: %v", err)
 	}
-	sglangPod, err := cluster.ConfigurePodForRuntimeTestNodepool(ctx, newSGLangServerPod(benchmarkNS, serverImage))
+	vllmPod, err := cluster.ConfigurePodForRuntimeTestNodepool(ctx, newVLLMServerPod(benchmarkNS, serverImage))
 	if err != nil {
 		t.Fatalf("Failed to configure pod for runtime nodepool: %v", err)
 	}
-	sglangPod, err = testcluster.SetContainerResources(sglangPod, "", testcluster.ContainerResourcesRequest{GPU: true})
+	vllmPod, err = testcluster.SetContainerResources(vllmPod, "", testcluster.ContainerResourcesRequest{TPU: true})
 	if err != nil {
 		t.Fatalf("Failed to set container resources: %v", err)
 	}
-	sglangPod, err = cluster.CreatePod(ctx, sglangPod)
+
+	vllmPod, err = cluster.CreatePod(ctx, vllmPod)
 	if err != nil {
-		t.Fatalf("Failed to create sglang pod: %v", err)
+		t.Fatalf("Failed to create vllm pod: %v", err)
 	}
-	defer cluster.DeletePod(ctx, sglangPod)
-	logWithTime(t, "Waiting for sglang server pod to start, this may take a long time (tens of minutes) if this is the first time the image is being downloaded onto the node.")
+	defer cluster.DeletePod(ctx, vllmPod)
+	logWithTime(t, "Waiting for vllm server pod to start, this may take a long time (tens of minutes) if this is the first time the image is being downloaded onto the node.")
 	startCtx, startCtxCancel := context.WithTimeout(ctx, 90*time.Minute)
-	if err := cluster.WaitForPodRunning(startCtx, sglangPod); err != nil {
-		t.Fatalf("Failed to wait for sglang server pod: %v", err)
+	if err := cluster.WaitForPodRunning(startCtx, vllmPod); err != nil {
+		t.Fatalf("Failed to wait for vllm server pod: %v", err)
 	}
 	startCtxCancel()
-	logWithTime(t, "sglang server pod started on Kubernetes but not yet initialized.")
-	sglangService := newSGLangService(benchmarkNS)
-	sglangService, err = cluster.CreateService(ctx, sglangService)
+	logWithTime(t, "vllm server pod started on Kubernetes but not yet initialized.")
+	vllmService := newVLLMService(benchmarkNS)
+	vllmService, err = cluster.CreateService(ctx, vllmService)
 	if err != nil {
 		t.Fatalf("Failed to create service: %v", err)
 	}
-	defer cluster.DeleteService(ctx, sglangService)
-	sglangClientImage, err := k8sCtx.ResolveImage(ctx, sglangBenchClientImage)
+	defer cluster.DeleteService(ctx, vllmService)
+	vllmClientImage, err := k8sCtx.ResolveImage(ctx, vllmBenchClientImage)
 	if err != nil {
 		t.Fatalf("Failed to resolve image: %v", err)
 	}
-	sglangServer := &sglangPodServer{
+	vllmServer := &vllmPodServer{
 		cluster:     cluster,
-		clientImage: sglangClientImage,
-		service:     sglangService,
-		pod:         sglangPod,
+		clientImage: vllmClientImage,
+		service:     vllmService,
+		pod:         vllmPod,
 	}
-	llm, err := sglang.New(ctx, sglangServer, t)
+	llm, err := vllm.New(ctx, vllmServer, &tbLogger{t})
 	if err != nil {
-		t.Fatalf("Failed to create sglang client against server pod: %v", err)
+		t.Fatalf("Failed to create vllm client against server pod: %v", err)
 	}
-	logWithTime(t, "sglang server ready.")
+	logWithTime(t, "vllm server ready.")
 
-	// Define test cases.
 	type testCase struct {
-		// Name of the test.
-		name string
-		// Query for the sglang server.
-		query string
-		// If set, run this function over the response to verify it.
-		// The LLM is prompted repeatedly until this function returns a non-nil error.
-		// This function may also return a non-nil prompt if it needs to modify the prompt
-		// for the next attempt. This is useful to raise the model temperature.
-		verifyResponse func(*sglang.Prompt, *sglang.Response) (*sglang.Prompt, error)
+		name           string
+		query          string
+		verifyResponse func(*vllm.Prompt, *vllm.FullResponse) (*vllm.Prompt, error)
 	}
 	testCases := []testCase{
 		{
@@ -262,7 +260,7 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 				verifyFn = test.verifyResponse
 			}
 			numAttempts := 0
-			verifyFnCount := func(prompt *sglang.Prompt, resp *sglang.Response) (*sglang.Prompt, error) {
+			verifyFnCount := func(prompt *vllm.Prompt, resp *vllm.FullResponse) (*vllm.Prompt, error) {
 				numAttempts++
 				return verifyFn(prompt, resp)
 			}
@@ -270,7 +268,7 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 			testCtx, testCancel := context.WithTimeout(ctx, testTimeout)
 			defer testCancel()
 
-			prompt := sglang.ZeroTemperaturePrompt(test.query)
+			prompt := vllm.ZeroTemperaturePrompt(test.query)
 			resp, err := llm.PromptUntil(testCtx, prompt, verifyFnCount)
 			if err != nil {
 				t.Fatalf("cannot prompt: %v", err)
@@ -278,7 +276,7 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 			if !resp.Done() {
 				t.Fatalf("warm response did not finish: %v", resp)
 			}
-			logWithTime(t, "Prompting with query:\n%s\n\nResponse:\n%s\n(end of response)", prompt.CleanQuery(), resp.Text())
+			logWithTime(t, "Prompting with query:\n%s\n\nResponse:\n%s\n(end of response)", prompt.Text, resp.Text())
 			respHash := fnv.New32()
 			respHash.Write([]byte(resp.Text()))
 			recorder, err := benchmetric.GetRecorder(ctx)
@@ -287,7 +285,7 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 			}
 			err = recorder.Record(
 				ctx,
-				fmt.Sprintf("SGLang/%s", test.name),
+				fmt.Sprintf("vLLM/%s", test.name),
 				benchmetric.BenchmarkDuration(time.Duration(resp.E2ELatency()*float64(time.Second))),
 				benchmetric.SpecificDuration(resp.TimeToFirstToken(), "tok-first"),
 				benchmetric.SpecificDuration(resp.TimeToLastToken(), "tok-last"),
@@ -302,9 +300,6 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 		})
 	}
 
-	// Hack to force the test to wait until all sub-tests finish.
-	// This is necessary to make sure the sglang server does not get
-	// deleted from the `defer` statements before the subtests above finish.
 	var wg sync.WaitGroup
 	wg.Add(1)
 	t.Run("", func(t *testing.T) {
@@ -314,36 +309,35 @@ func BenchmarkSGLang(ctx context.Context, t *testing.T, k8sCtx k8sctx.Kubernetes
 }
 
 const (
-	sglangServerLabelKey   = "app.kubernetes.io/name"
-	sglangServerLabelValue = "sglang-server"
-	sglangPort             = 30000
-	sglangPodName          = "sglang-server"
-	sglangServiceName      = "sglang-service"
-	sglangBenchImage       = k8s.ImageRepoPrefix + "gpu/sglang_x86_64:latest"
-	sglangBenchClientImage = k8s.ImageRepoPrefix + "gpu/sglang/client_x86_64:latest"
+	vllmServerLabelKey   = "app.kubernetes.io/name"
+	vllmServerLabelValue = "vllm-server"
+	vllmPort             = 8000
+	vllmPodName          = "vllm-server"
+	vllmServiceName      = "vllm-service"
+	vllmBenchImage       = k8s.ImageRepoPrefix + "tpu/vllm_x86_64:latest"
+	vllmBenchClientImage = k8s.ImageRepoPrefix + "gpu/sglang/client_x86_64:latest"
 )
 
-// newSGLangServerPod returns the pod spec for an sglang server.
-func newSGLangServerPod(namespace *testcluster.Namespace, image string) *v13.Pod {
+func newVLLMServerPod(namespace *testcluster.Namespace, image string) *v13.Pod {
 	return &v13.Pod{
 		TypeMeta: v1.TypeMeta{
 			Kind:       "Pod",
 			APIVersion: "v1",
 		},
 		ObjectMeta: v1.ObjectMeta{
-			Name:      sglangPodName,
+			Name:      vllmPodName,
 			Namespace: namespace.Namespace,
-			Labels:    map[string]string{sglangServerLabelKey: sglangServerLabelValue},
+			Labels:    map[string]string{vllmServerLabelKey: vllmServerLabelValue},
 		},
 		Spec: v13.PodSpec{
 			Containers: []v13.Container{
 				{
-					Name:  sglangPodName,
+					Name:  vllmPodName,
 					Image: image,
 					Ports: []v13.ContainerPort{
 						{
-							Name:          sglangServiceName,
-							ContainerPort: sglangPort,
+							Name:          vllmServiceName,
+							ContainerPort: vllmPort,
 						},
 					},
 				},
@@ -353,16 +347,15 @@ func newSGLangServerPod(namespace *testcluster.Namespace, image string) *v13.Pod
 	}
 }
 
-// newSGLangService returns a service definition for the sglang server pod.
-func newSGLangService(namespace *testcluster.Namespace) *v13.Service {
-	return namespace.GetService(sglangServiceName, v13.ServiceSpec{
-		Selector: map[string]string{sglangServerLabelKey: sglangServerLabelValue},
+func newVLLMService(namespace *testcluster.Namespace) *v13.Service {
+	return namespace.GetService(vllmServiceName, v13.ServiceSpec{
+		Selector: map[string]string{vllmServerLabelKey: vllmServerLabelValue},
 		Ports: []v13.ServicePort{
 			{
-				Name:       sglangServiceName,
+				Name:       vllmServiceName,
 				Protocol:   v13.ProtocolTCP,
-				Port:       sglangPort,
-				TargetPort: intstr.FromString(sglangServiceName),
+				Port:       vllmPort,
+				TargetPort: intstr.FromString(vllmServiceName),
 			},
 		},
 	})

@@ -19,22 +19,20 @@ import (
 	_ "embed"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"math/rand"
 	"strings"
 	"testing"
 	"time"
-	"unicode"
 
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/test/gpu/ollama"
 	k8s "gvisor.dev/gvisor/test/kubernetes"
 	"gvisor.dev/gvisor/test/kubernetes/benchmarks/profiling"
+	"gvisor.dev/gvisor/test/kubernetes/benchmarks/utils"
 	"gvisor.dev/gvisor/test/kubernetes/benchmetric"
 	"gvisor.dev/gvisor/test/kubernetes/k8sctx"
 	"gvisor.dev/gvisor/test/kubernetes/testcluster"
 	v13 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -101,117 +99,22 @@ type ollamaPodServer struct {
 	service     *v13.Service
 }
 
-// readPodLogs reads logs from a pod.
-func readPodLogs(ctx context.Context, cluster *testcluster.TestCluster, pod *v13.Pod) (string, error) {
-	rdr, err := cluster.GetLogReader(ctx, pod, v13.PodLogOptions{})
-	if err != nil {
-		return "", fmt.Errorf("GetLogReader on cluster %q pod %q: %v", cluster.GetName(), pod.GetName(), err)
-	}
-	out, err := io.ReadAll(rdr)
-	if err != nil {
-		return "", fmt.Errorf("failed to read from pod %q: %v", pod.GetName(), err)
-	}
-	return string(out), nil
-}
-
 // InstrumentedRequest implements `ollama.Server.InstrumentedRequest`.
 func (ops *ollamaPodServer) InstrumentedRequest(ctx context.Context, argvFn func(hostPort string) []string) ([]byte, error) {
-	// Get server IP.
-	if err := ops.cluster.WaitForServiceReady(ctx, ops.service); err != nil {
-		return nil, fmt.Errorf("failed to wait for service: %v", err)
-	}
-	ip := testcluster.GetIPFromService(ops.service)
-	if ip == "" {
-		return nil, fmt.Errorf("did not get valid ip from service: %v", ops.service)
-	}
-
-	// Build client pod spec.
-	const clientPodName = "ollama-client"
-	argv := argvFn(fmt.Sprintf("http://%s:%d", ip, ops.service.Spec.Ports[0].Port))
-	clientPod := &v13.Pod{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Pod",
-			APIVersion: "v1",
-		},
-		ObjectMeta: v1.ObjectMeta{
-			Name:      clientPodName,
-			Namespace: ops.pod.ObjectMeta.Namespace,
-		},
-		Spec: v13.PodSpec{
-			Containers: []v13.Container{
-				{
-					Name:    clientPodName,
-					Image:   ops.clientImage,
-					Command: argv,
-					Resources: v13.ResourceRequirements{
-						Requests: v13.ResourceList{
-							v13.ResourceCPU: resource.MustParse("500m"),
-						},
-					},
-				},
-			},
-			RestartPolicy: v13.RestartPolicyNever,
-		},
-	}
-	clientPod, err := ops.cluster.ConfigurePodForClientNodepool(ctx, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure pod: %v", err)
-	}
-
-	// Delete pod that may possibly exist from a previous iteration.
-	// Ignore errors since it most likely doesn't exist.
-	ops.cluster.DeletePod(ctx, clientPod)
-
-	// Start new client pod and wait for it.
-	clientPod, err = ops.cluster.CreatePod(ctx, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create client pod: %v", err)
-	}
-	defer ops.cluster.DeletePod(ctx, clientPod)
-	if err := ops.cluster.WaitForPodCompleted(ctx, clientPod); err != nil {
-		logs, logsErr := readPodLogs(ctx, ops.cluster, clientPod)
-		logs = strings.TrimSpace(logs)
-		if logsErr != nil {
-			return nil, fmt.Errorf("failed HTTP request (%v) and to read logs from the pod: %w", err, logsErr)
-		}
-		if logs == "" {
-			return nil, fmt.Errorf("failed HTTP request: %w (pod logs are empty)", err)
-		}
-		return nil, fmt.Errorf("failed HTTP request: %w (pod logs: %v)", err, logs)
-	}
-
-	// All good, get logs.
-	logs, err := readPodLogs(ctx, ops.cluster, clientPod)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read logs from pod %q: %v", clientPod.GetName(), err)
-	}
-	return []byte(logs), nil
+	return ops.cluster.ExecRequestInClientPod(ctx, ops.service, ops.pod.ObjectMeta.Namespace, ops.clientImage, "ollama-client", argvFn)
 }
 
 // Logs implements `ollama.Server.Logs`.
 func (ops *ollamaPodServer) Logs(ctx context.Context) (string, error) {
-	return readPodLogs(ctx, ops.cluster, ops.pod)
+	return ops.cluster.ReadPodLogs(ctx, ops.pod)
 }
 
 // atLeastNWords verifies that the response at least N words.
 // If not, it raises the temperature.
 func atLeastNWords(wantNWords int) func(prompt *ollama.Prompt, response *ollama.Response) (*ollama.Prompt, error) {
 	return func(prompt *ollama.Prompt, response *ollama.Response) (*ollama.Prompt, error) {
-		responseText := strings.TrimSpace(response.Text())
-		responseText = strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) {
-				return r
-			}
-			return ' '
-		}, responseText)
-		numWords := 0
-		for _, word := range strings.Split(responseText, " ") {
-			if len(word) >= 0 {
-				numWords++
-			}
-		}
-		if numWords < wantNWords {
-			return prompt.WithHotterModel(), fmt.Errorf("response %q is too short: had %d words, want at least %d", responseText, numWords, wantNWords)
+		if err := utils.CheckAtLeastNWords(response.Text(), wantNWords); err != nil {
+			return prompt.WithHotterModel(), err
 		}
 		return nil, nil
 	}
