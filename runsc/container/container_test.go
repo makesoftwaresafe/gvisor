@@ -459,6 +459,42 @@ func sleepSpecConf(t *testing.T) (*specs.Spec, *config.Config) {
 	return testutil.NewSpecWithArgs("sleep", "1000"), testutil.TestConfig(t)
 }
 
+func TestGetNetworkConfig(t *testing.T) {
+	for name, conf := range configs(t, false /* noOverlay */) {
+		t.Run(name, func(t *testing.T) {
+			spec, _ := sleepSpecConf(t)
+			_, bundleDir, cleanup, err := testutil.SetupContainer(spec, conf)
+			if err != nil {
+				t.Fatalf("error setting up container: %v", err)
+			}
+			defer cleanup()
+
+			args := Args{
+				ID:        testutil.RandomContainerID(),
+				Spec:      spec,
+				BundleDir: bundleDir,
+			}
+			c, err := New(conf, args)
+			if err != nil {
+				t.Fatalf("error creating container: %v", err)
+			}
+			defer c.Destroy()
+
+			if err := c.Start(conf); err != nil {
+				t.Fatalf("error starting container: %v", err)
+			}
+
+			networkArgs, err := c.GetNetworkConfig()
+			if err != nil {
+				t.Fatalf("error calling GetNetworkConfig: %v", err)
+			}
+			if len(networkArgs.LoopbackLinks) == 0 {
+				t.Error("network config loopback links is empty, want not empty")
+			}
+		})
+	}
+}
+
 // TestLifecycle tests the basic Create/Start/Signal/Destroy container lifecycle.
 // It verifies after each step that the container can be loaded from disk, and
 // has the correct status.

@@ -17,11 +17,13 @@ package boot
 import (
 	"fmt"
 	"math/rand"
+	"net"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/moby/sys/capability"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"golang.org/x/sys/unix"
@@ -622,4 +624,51 @@ func TestMain(m *testing.M) {
 	cpuid.Initialize()
 	seccheck.Initialize()
 	os.Exit(m.Run())
+}
+
+func TestNetworkConfig(t *testing.T) {
+	l, cleanup, err := createLoader(testConfig(), testSpec())
+	if err != nil {
+		t.Fatalf("error creating loader: %v", err)
+	}
+	defer l.Destroy()
+	defer cleanup()
+
+	// We aren't going to wait on this application, so the control server
+	// needs to be shut down manually.
+	defer l.ctrl.srv.Stop(time.Hour)
+
+	go func() {
+		l.WaitForStartSignal()
+		l.ctrl.manager.startResultChan <- nil
+	}()
+
+	args := &CreateLinksAndRoutesArgs{
+		LoopbackLinks: []LoopbackLink{
+			{
+				Name: "lo",
+				Addresses: []IPWithPrefix{
+					{Address: net.IP("\x7f\x00\x00\x01"), PrefixLen: 8},
+				},
+				Routes: []Route{
+					{
+						Destination: net.IPNet{
+							IP:   net.IP{127, 0, 0, 0},
+							Mask: net.IPMask{255, 0, 0, 0},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := l.ctrl.manager.CreateLinksAndRoutes(args, nil); err != nil {
+		t.Errorf("error calling SetNetworkConfig: %v", err)
+	}
+	var networkArgs CreateLinksAndRoutesArgs
+	if err := l.ctrl.manager.GetNetworkConfig(nil, &networkArgs); err != nil {
+		t.Errorf("error calling NetworkConfig: %v", err)
+	}
+	if diff := cmp.Diff(networkArgs.LoopbackLinks, args.LoopbackLinks); diff != "" {
+		t.Errorf("Network config content mismatch (-want +got):\n%s", diff)
+	}
 }
