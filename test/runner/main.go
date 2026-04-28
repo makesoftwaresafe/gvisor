@@ -232,7 +232,7 @@ func runTestCaseNative(testBin string, tc *gtest.TestCase, args []string, t *tes
 	}
 }
 
-func deleteIfEmptyFile(dir string) (bool, error) {
+func deleteIfEmptyCheckpointDir(dir string) (bool, error) {
 	fName := filepath.Join(dir, checkpointFile)
 	fi, err := os.Stat(fName)
 	if err != nil {
@@ -245,12 +245,10 @@ func deleteIfEmptyFile(dir string) (bool, error) {
 	return true, nil
 }
 
-func printAll(dirs []string) {
-	for _, dir := range dirs {
-		f := filepath.Join(dir, checkpointFile)
-		printOne(dir, f, false, ".txt")
-		printOne(dir, f, true, ".html")
-	}
+func printCheckpointDir(dir string) {
+	f := filepath.Join(dir, checkpointFile)
+	printOne(dir, f, false, ".txt")
+	printOne(dir, f, true, ".html")
 }
 
 func printOne(dir string, file string, html bool, postfix string) {
@@ -291,22 +289,15 @@ func printOne(dir string, file string, html bool, postfix string) {
 	cu.Release()
 }
 
-func removeAll(dirs []string) {
-	for _, dir := range dirs {
-		os.RemoveAll(dir)
-	}
-}
-
-func prepareSave(args []string, undeclaredOutputsDir string, dirs []string, index int) ([]string, []string, error) {
+func prepareSave(args []string, undeclaredOutputsDir string, index int) ([]string, string, error) {
 	// Create the state file directory.
 	dir, err := os.MkdirTemp(undeclaredOutputsDir, fmt.Sprintf("state.%v.", index))
 	if err != nil {
-		return args, dirs, fmt.Errorf("failed to create state file directory: %v", err)
+		return args, "", fmt.Errorf("failed to create state file directory: %v", err)
 	}
 	// Pass the directory path of the state file to the sandbox.
 	args = append(args, "-TESTONLY-autosave-image-path", dir)
-	dirs = append(dirs, dir)
-	return args, dirs, nil
+	return args, dir, nil
 }
 
 func deleteSandbox(args []string, id string) error {
@@ -422,8 +413,8 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 	runscLogDir := ""
 	runscCoverageDir := ""
 	undeclaredOutputsDir := ""
-	dirs := []string{}
-	saveArgs := []string{}
+	var currentSaveDir string
+	var saveArgs []string
 	var ok bool
 	undeclaredOutputsDir, ok = unix.Getenv("TEST_UNDECLARED_OUTPUTS_DIR")
 	if ok {
@@ -459,7 +450,7 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 				args = append(args, "--save-restore-netstack=true")
 			}
 			saveArgs = args
-			args, dirs, err = prepareSave(args, undeclaredOutputsDir, dirs, 0)
+			args, currentSaveDir, err = prepareSave(args, undeclaredOutputsDir, 0)
 			if err != nil {
 				return fmt.Errorf("prepareSave error: %v", err)
 			}
@@ -609,33 +600,33 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			if signalled.Load() {
 				return fmt.Errorf("timeout")
 			}
+			currentRestoreDir := currentSaveDir
 			// Check if the latest state file is valid. If the file
 			// is empty, delete it and exit the loop.
-			isEmpty, err := deleteIfEmptyFile(dirs[i-1])
+			isEmpty, err := deleteIfEmptyCheckpointDir(currentRestoreDir)
 			if err != nil {
 				return err
 			}
 			if isEmpty {
-				dirs = dirs[:i-1]
 				break
 			}
 
 			// Delete the existing sandbox.
 			if err := deleteSandbox(saveArgs, id); err != nil {
-				printAll(dirs)
-				removeAll(dirs)
+				printCheckpointDir(currentRestoreDir)
+				os.RemoveAll(currentRestoreDir)
 				return fmt.Errorf("deleteSandbox error %v", err)
 			}
 
 			// Restore into new sandbox.
 			restoreArgs := saveArgs
-			restoreArgs, dirs, err = prepareSave(restoreArgs, undeclaredOutputsDir, dirs, i)
+			restoreArgs, currentSaveDir, err = prepareSave(restoreArgs, undeclaredOutputsDir, i)
 			if err != nil {
-				printAll(dirs)
-				removeAll(dirs)
+				printCheckpointDir(currentRestoreDir)
+				os.RemoveAll(currentRestoreDir)
 				return fmt.Errorf("prepareSave error: %v", err)
 			}
-			restoreArgs = append(restoreArgs, "restore", "--image-path", dirs[i-1], "--bundle", bundleDir, id)
+			restoreArgs = append(restoreArgs, "restore", "--image-path", currentRestoreDir, "--bundle", bundleDir, id)
 			log.Infof("Executing: %v", append([]string{specutils.ExePath}, restoreArgs...))
 			restoreCmd := exec.Command(specutils.ExePath, restoreArgs...)
 			restoreCmd.SysProcAttr = sysProcAttr
@@ -647,21 +638,25 @@ func runRunsc(tc *gtest.TestCase, spec *specs.Spec) error {
 			restoreCmd.Stdout = os.Stdout
 			restoreCmd.Stderr = os.Stderr
 			if err := restoreCmd.Run(); err != nil {
-				printAll(dirs)
-				removeAll(dirs)
+				printCheckpointDir(currentRestoreDir)
+				os.RemoveAll(currentRestoreDir)
+				os.RemoveAll(currentSaveDir)
 				return fmt.Errorf("after restore error: %v", err)
 			}
+			// After the restore is successful, we can delete the checkpoint we restored from.
+			os.RemoveAll(currentRestoreDir)
 		}
-		// Do not output state files when the test succeeds.
-		removeAll(dirs)
 	} else if *saveResume {
 		err = cmd.Run()
-		if err != nil {
-			printAll(dirs)
-			removeAll(dirs)
-			return fmt.Errorf("run error: %v", err)
+		if currentSaveDir != "" {
+			// As of writing, save/resume tests don't actually write anything to
+			// currentSaveDir, so unconditionally delete it. It is still needed to
+			// enable autosave.
+			os.RemoveAll(currentSaveDir)
 		}
-		removeAll(dirs)
+		if err != nil {
+			return fmt.Errorf("save resume error: %v", err)
+		}
 	} else {
 		err = cmd.Run()
 		if *waitForPid != 0 {
