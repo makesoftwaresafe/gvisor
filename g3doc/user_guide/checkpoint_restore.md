@@ -64,9 +64,12 @@ restore` commands.
 
 By providing the `--compression` flag to `runsc checkpoint`, users can specify
 the compression level of the generated snapshot files. Supported values are
-`none` and `flate-best-speed` (default). Note that `--compression=none` consumes
-less CPU and is faster. Furthermore, several other optimizations described below
-require `--compression=none`.
+`none` (default) and `flate-best-speed`.
+
+Note that `--compression=none` consumes less CPU and is faster. The generated
+snapshot contains multiple files. As a result, it allows the kernel and memory
+restores to proceed in parallel. Furthermore, several other optimizations
+described below require `--compression=none`.
 
 ### Exclude Committed Zero Pages
 
