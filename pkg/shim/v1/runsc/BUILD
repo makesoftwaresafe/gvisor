@@ -1,8 +1,18 @@
-load("//tools:defs.bzl", "go_library", "go_test")
+load("//tools:defs.bzl", "go_library", "go_test", "proto_library")
 
 package(
     default_applicable_licenses = ["//:license"],
     licenses = ["notice"],
+)
+
+proto_library(
+    name = "hibernate",
+    srcs = ["hibernate.proto"],
+    has_services = True,
+    visibility = [
+        "//cloud/kubernetes/node/snapshot:__subpackages__",
+        "//pkg/shim:__subpackages__",
+    ],
 )
 
 go_library(
@@ -12,6 +22,8 @@ go_library(
         "container.go",
         "debug.go",
         "epoll.go",
+        "hibernate.go",
+        "hibernate_impl.go",
         "oom_v2.go",
         "options.go",
         "service.go",
@@ -20,6 +32,7 @@ go_library(
     ],
     visibility = ["//pkg/shim:__subpackages__"],
     deps = [
+        ":hibernate_go_proto",
         "//pkg/cleanup",
         "//pkg/shim/v1/extension",
         "//pkg/shim/v1/proc",
@@ -50,6 +63,7 @@ go_library(
         "@com_github_containerd_fifo//:go_default_library",
         "@com_github_containerd_go_runc//:go_default_library",
         "@com_github_containerd_log//:go_default_library",
+        "@com_github_containerd_ttrpc//:go_default_library",
         "@com_github_containerd_typeurl//:go_default_library",
         "@com_github_gogo_protobuf//types:go_default_library",
         "@com_github_opencontainers_runtime_spec//specs-go:go_default_library",

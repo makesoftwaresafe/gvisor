@@ -146,6 +146,7 @@ use_repo(
     "com_github_containerd_fifo",
     "com_github_containerd_go_runc",
     "com_github_containerd_log",
+    "com_github_containerd_ttrpc",
     "com_github_containerd_typeurl",
     "com_github_coreos_go_systemd_v22",
     "com_github_creack_pty",
