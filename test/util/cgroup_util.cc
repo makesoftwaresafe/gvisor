@@ -85,6 +85,11 @@ PosixErrorOr<absl::flat_hash_set<pid_t>> Cgroup::Tasks() const {
   return ParsePIDList(buf);
 }
 
+PosixErrorOr<absl::flat_hash_set<pid_t>> Cgroup::Threads() const {
+  ASSIGN_OR_RETURN_ERRNO(std::string buf, ReadControlFile("cgroup.threads"));
+  return ParsePIDList(buf);
+}
+
 PosixError Cgroup::PollControlFileForChange(absl::string_view name,
                                             absl::Duration timeout) const {
   return PollControlFileForChangeAfter(name, timeout, []() {});
@@ -185,6 +190,22 @@ PosixErrorOr<Cgroup> Mounter::MountCgroupfs(std::string mopts) {
   const std::string mountpath = mountpoint.path();
   std::cerr << absl::StreamFormat(
                    "Mount(\"none\", \"%s\", \"cgroup\", 0, \"%s\", 0) => OK",
+                   mountpath, mopts)
+            << std::endl;
+  Cgroup cg = Cgroup::RootCgroup(mountpath);
+  mountpoints_[cg.id()] = std::move(mountpoint);
+  mounts_[cg.id()] = std::move(mount);
+  return cg;
+}
+
+PosixErrorOr<Cgroup> Mounter::MountCgroup2fs(std::string mopts) {
+  ASSIGN_OR_RETURN_ERRNO(TempPath mountpoint,
+                         TempPath::CreateDirIn(root_.path()));
+  ASSIGN_OR_RETURN_ERRNO(
+      Cleanup mount, Mount("none", mountpoint.path(), "cgroup2", 0, mopts, 0));
+  const std::string mountpath = mountpoint.path();
+  std::cerr << absl::StreamFormat(
+                   "Mount(\"none\", \"%s\", \"cgroup2\", 0, \"%s\", 0) => OK",
                    mountpath, mopts)
             << std::endl;
   Cgroup cg = Cgroup::RootCgroup(mountpath);

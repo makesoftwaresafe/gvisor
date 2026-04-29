@@ -89,6 +89,8 @@ class Cgroup {
 
   PosixErrorOr<absl::flat_hash_set<pid_t>> Tasks() const;
 
+  PosixErrorOr<absl::flat_hash_set<pid_t>> Threads() const;
+
   // ContainsCallingProcess checks whether the calling process is part of the
   // cgroup.
   PosixError ContainsCallingProcess() const;
@@ -122,6 +124,8 @@ class Mounter {
   Mounter(TempPath root) : root_(std::move(root)) {}
 
   PosixErrorOr<Cgroup> MountCgroupfs(std::string mopts);
+
+  PosixErrorOr<Cgroup> MountCgroup2fs(std::string mopts = "");
 
   PosixError Unmount(const Cgroup& c);
 
