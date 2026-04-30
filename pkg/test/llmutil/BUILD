@@ -6,14 +6,15 @@ package(
 )
 
 go_library(
-    name = "triton",
-    testonly = 1,
-    srcs = ["triton.go"],
-    stateify = False,  # Does not support some generics methods.
+    name = "llmutil",
+    testonly = True,
+    srcs = [
+        "llmutil.go",
+    ],
+    stateify = False,
     visibility = ["//:sandbox"],
     deps = [
         "//pkg/test/dockerutil",
-        "//pkg/test/llmutil",
         "//pkg/test/testutil",
     ],
 )
