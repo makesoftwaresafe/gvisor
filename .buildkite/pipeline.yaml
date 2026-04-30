@@ -539,6 +539,13 @@ steps:
     agents:
       cgroup: "v2"
       arch: "amd64"
+  - <<: *common
+    <<: *source_test
+    label: ":golang: runsc go binding tests (arm64)"
+    command: make go-binding-test
+    agents:
+      cgroup: "v2"
+      arch: "arm64"
   # Runtime tests.
   - <<: *common
     <<: *docker
