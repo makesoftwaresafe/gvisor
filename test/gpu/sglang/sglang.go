@@ -110,7 +110,7 @@ func NewDocker(ctx context.Context, cont *dockerutil.Container, logger testutil.
 		Container:   cont,
 		Logger:      logger,
 		Port:        Port,
-		ClientImage: "gpu/sglang/client",
+		ClientImage: "gpu/ollama/client",
 	}
 	return New(ctx, ds, logger)
 }
@@ -126,6 +126,7 @@ func (llm *SGLang) instrumentedRequest(ctx context.Context, method, endpoint str
 			"httpclient",
 			fmt.Sprintf("--method=%s", method),
 			fmt.Sprintf("--url=%s%s", hostPort, endpoint),
+			"--strip_prefix=data: ",
 		}
 		if data != nil {
 			argv = append(argv, fmt.Sprintf("--post_base64=%s", base64.StdEncoding.EncodeToString(data)))

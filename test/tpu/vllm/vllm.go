@@ -108,7 +108,7 @@ func NewDocker(ctx context.Context, cont *dockerutil.Container, logger testutil.
 		Container:   cont,
 		Logger:      logger,
 		Port:        Port,
-		ClientImage: "gpu/sglang/client",
+		ClientImage: "gpu/ollama/client",
 	}
 	return New(ctx, ds, logger)
 }
@@ -119,6 +119,7 @@ func (llm *VLLM) instrumentedRequest(ctx context.Context, method, endpoint, head
 			"httpclient",
 			fmt.Sprintf("--method=%s", method),
 			fmt.Sprintf("--url=%s%s", hostPort, endpoint),
+			"--strip_prefix=data: ",
 		}
 		if header != "" {
 			argv = append(argv, fmt.Sprintf("--header=%s", header))
