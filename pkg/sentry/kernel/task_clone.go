@@ -629,7 +629,7 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		return err
 	}
 
-	if flags&linux.CLONE_NEWPID != 0 {
+	if nss.childPIDNS != nil {
 		if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.childPIDNS.UserNamespace()) || !t.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
@@ -646,25 +646,25 @@ func (t *Task) Setns(fd *vfs.FileDescription, flags int32) error {
 		}
 	}
 
-	if flags&linux.CLONE_NEWNET != 0 {
+	if nss.netNS != nil {
 		if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.netNS.UserNamespace()) || !t.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
 	}
 
-	if flags&linux.CLONE_NEWUTS != 0 {
+	if nss.utsNS != nil {
 		if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.utsNS.UserNamespace()) || !t.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
 	}
 
-	if flags&linux.CLONE_NEWIPC != 0 {
+	if nss.ipcNS != nil {
 		if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.ipcNS.UserNamespace()) || !t.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
 	}
 
-	if flags&linux.CLONE_NEWNS != 0 {
+	if nss.mountNS != nil {
 		if !t.HasCapabilityIn(linux.CAP_SYS_ADMIN, nss.mountNS.UserNamespace()) || !t.HasSelfCapability(linux.CAP_SYS_CHROOT) || !t.HasSelfCapability(linux.CAP_SYS_ADMIN) {
 			return linuxerr.EPERM
 		}
